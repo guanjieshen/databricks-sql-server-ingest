@@ -58,6 +58,19 @@ class ParquetWriter:
         self.row_group_size = row_group_size
 
     @staticmethod
+    def _coerce_column(values: list) -> list:
+        """Convert values that PyArrow can't infer (e.g. UUID) to strings."""
+        import uuid
+
+        for v in values:
+            if v is None:
+                continue
+            if isinstance(v, uuid.UUID):
+                return [str(x) if x is not None else None for x in values]
+            break
+        return values
+
+    @staticmethod
     def _write_file(
         path: str,
         col_names: List[str],
@@ -68,7 +81,7 @@ class ParquetWriter:
         import pyarrow.parquet as pq
 
         columns = {
-            name: [row[i] for row in batch]
+            name: ParquetWriter._coerce_column([row[i] for row in batch])
             for i, name in enumerate(col_names)
         }
         table = pa.table(columns)
