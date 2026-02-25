@@ -62,6 +62,22 @@ def primary_key_columns(cursor: Any, full_table_name: str) -> List[str]:
     return [row[0] for row in cursor.fetchall()]
 
 
+def build_full_query(full_table_name: str) -> str:
+    """Return the SQL for a full-table SELECT with CT metadata columns.
+
+    Produces the same column schema as :func:`build_incremental_query` so
+    that downstream consumers always see a consistent set of columns
+    regardless of sync mode.
+    """
+    return (
+        f"SELECT CHANGE_TRACKING_CURRENT_VERSION() AS SYS_CHANGE_VERSION, "
+        f"CAST(NULL AS BIGINT) AS SYS_CHANGE_CREATION_VERSION, "
+        f"CAST('L' AS NCHAR(1)) AS SYS_CHANGE_OPERATION, "
+        f"t.* "
+        f"FROM {full_table_name} AS t"
+    )
+
+
 def build_incremental_query(full_table_name: str, pk_cols: List[str]) -> str:
     """Return the SQL for an incremental change-tracking SELECT.
 

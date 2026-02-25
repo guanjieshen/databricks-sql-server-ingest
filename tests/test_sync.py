@@ -88,8 +88,8 @@ def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc):
 
 class TestSyncTable:
     def test_full_sync_writes_rows(self, tmp_path):
-        desc = [("id",), ("name",)]
-        rows = [(1, "Alice"), (2, "Bob")]
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",), ("name",)]
+        rows = [(100, None, "L", 1, "Alice"), (100, None, "L", 2, "Bob")]
         cursor = _make_cursor(
             tracked=["dbo.Foo"],
             cur_ver=100,
@@ -133,13 +133,13 @@ class TestSyncTable:
             )
 
     def test_watermark_updated_after_sync(self, tmp_path):
-        desc = [("id",)]
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
         cursor = _make_cursor(
             tracked=["dbo.T"],
             cur_ver=55,
             min_ver=0,
             pk_cols=None,
-            rows=[(1,)],
+            rows=[(55, None, "L", 1)],
             desc=desc,
         )
         conn = MagicMock()
@@ -258,8 +258,8 @@ class TestSyncTable:
 
     def test_full_incremental_does_full_when_no_watermark(self, tmp_path):
         """full_incremental should do a full load on first run."""
-        desc = [("id",), ("name",)]
-        rows = [(1, "Alice")]
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",), ("name",)]
+        rows = [(50, None, "L", 1, "Alice")]
         cursor = _make_cursor(
             tracked=["dbo.T"],
             cur_ver=50,

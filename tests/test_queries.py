@@ -62,6 +62,22 @@ class TestPrimaryKeyColumns:
         assert queries.primary_key_columns(cur, "dbo.T") == []
 
 
+class TestBuildFullQuery:
+    def test_includes_ct_metadata_columns(self):
+        sql = queries.build_full_query("dbo.Orders")
+        assert "SYS_CHANGE_VERSION" in sql
+        assert "SYS_CHANGE_CREATION_VERSION" in sql
+        assert "SYS_CHANGE_OPERATION" in sql
+
+    def test_uses_table_alias(self):
+        sql = queries.build_full_query("dbo.Orders")
+        assert "FROM dbo.Orders AS t" in sql
+
+    def test_operation_is_L(self):
+        sql = queries.build_full_query("dbo.Orders")
+        assert "'L'" in sql
+
+
 class TestBuildIncrementalQuery:
     def test_single_pk(self):
         sql = queries.build_incremental_query("dbo.Orders", ["id"])

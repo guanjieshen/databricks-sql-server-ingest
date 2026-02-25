@@ -139,7 +139,8 @@ def sync_table(
 
     if do_full:
         logger.info("Full sync for %s.%s (version %d)", database, full_name, cur_ver)
-        cur.execute(f"SELECT * FROM {full_name}")
+        sql = queries.build_full_query(full_name)
+        cur.execute(sql)
         actual_mode = "full"
     else:
         pk_cols = queries.primary_key_columns(cur, full_name)

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from typing import Any, List, Optional, Tuple
 from unittest.mock import MagicMock
+
+if "mssql_python" not in sys.modules:
+    sys.modules["mssql_python"] = types.ModuleType("mssql_python")
 
 import pytest
 
