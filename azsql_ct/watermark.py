@@ -123,16 +123,20 @@ def save(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # overwrite latest watermark
     data = load_all(output_dir)
     watermark_entry = {k: v for k, v in entry.items() if k != "table"}
     data[table_name] = watermark_entry
     p = _path(output_dir)
-    with open(p, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    with open(p, "wb") as f:
+        f.write(json.dumps(data, indent=2).encode("utf-8"))
+        f.write(b"\n")
 
-    # append to history log
     hp = _history_path(output_dir)
-    with open(hp, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    existing = b""
+    if os.path.isfile(hp):
+        with open(hp, "rb") as f:
+            existing = f.read()
+    with open(hp, "wb") as f:
+        f.write(existing)
+        f.write(json.dumps(entry).encode("utf-8"))
+        f.write(b"\n")

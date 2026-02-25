@@ -49,7 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
 from .connection import AzureSQLConnection, load_dotenv
 from .sync import sync_table
-from .writer import CsvWriter, OutputWriter
+from .writer import CsvWriter, OutputWriter, ParquetWriter
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,7 @@ class ChangeTracker:
         self._password = password
         self.output_dir = output_dir
         self.watermark_dir = watermark_dir
-        self.writer: OutputWriter = writer or CsvWriter()
+        self.writer: OutputWriter = writer or ParquetWriter()
         self.max_workers = max(1, max_workers)
         self.batch_size = batch_size
 

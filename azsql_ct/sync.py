@@ -25,11 +25,11 @@ from typing import Any, Generator, List, Optional, Tuple
 
 from . import queries, watermark
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
-from .writer import CsvWriter, OutputWriter
+from .writer import OutputWriter, ParquetWriter
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_WRITER: OutputWriter = CsvWriter()
+_DEFAULT_WRITER: OutputWriter = ParquetWriter()
 
 
 def _iter_cursor(

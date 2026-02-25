@@ -1,7 +1,7 @@
 """Output writers for sync results.
 
-Defines the ``OutputWriter`` protocol and a ``CsvWriter`` implementation that
-splits output into files of roughly ``max_bytes`` each.
+Defines the ``OutputWriter`` protocol with ``ParquetWriter`` (default) and
+``CsvWriter`` implementations.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import Iterable, List, Protocol, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # ~50 MB
+DEFAULT_ROW_GROUP_SIZE = 500_000
 
 WriteResult = Tuple[List[str], int]
 
@@ -35,6 +36,76 @@ class OutputWriter(Protocol):
         Returns ``(file_paths, row_count)``.
         """
         ...  # pragma: no cover
+
+
+class ParquetWriter:
+    """Write query results to Parquet files.
+
+    Splits output into multiple files when *max_rows_per_file* is exceeded.
+    Uses *row_group_size* to control the row-group granularity inside each
+    Parquet file.
+
+    Requires ``pyarrow`` (pre-installed on Databricks; install separately
+    elsewhere with ``pip install pyarrow``).
+    """
+
+    def __init__(
+        self,
+        max_rows_per_file: int = 1_000_000,
+        row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+    ) -> None:
+        self.max_rows_per_file = max_rows_per_file
+        self.row_group_size = row_group_size
+
+    @staticmethod
+    def _write_file(
+        path: str,
+        col_names: List[str],
+        batch: List[tuple],
+        row_group_size: int,
+    ) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        columns = {
+            name: [row[i] for row in batch]
+            for i, name in enumerate(col_names)
+        }
+        table = pa.table(columns)
+        pq.write_table(table, path, row_group_size=row_group_size)
+
+    def write(
+        self,
+        rows: Iterable,
+        description: Sequence[Tuple[str, ...]],
+        dir_path: str,
+        prefix: str,
+    ) -> WriteResult:
+        col_names = [col[0] for col in description]
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        files: List[str] = []
+        row_count = 0
+        part = 1
+        batch: List[tuple] = []
+
+        for row in rows:
+            batch.append(tuple(row))
+            row_count += 1
+
+            if len(batch) >= self.max_rows_per_file:
+                path = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
+                self._write_file(path, col_names, batch, self.row_group_size)
+                files.append(path)
+                batch = []
+                part += 1
+
+        if batch or row_count == 0:
+            path = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
+            self._write_file(path, col_names, batch, self.row_group_size)
+            files.append(path)
+
+        logger.debug("Wrote %d file(s) (%d rows) to %s", len(files), row_count, dir_path)
+        return files, row_count
 
 
 class CsvWriter:
