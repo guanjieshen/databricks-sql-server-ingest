@@ -15,7 +15,7 @@ Supports three sync modes per table:
 ```bash
 pip install -e .
 
-# For YAML config support (used by examples):
+# For YAML config support (recommended):
 pip install -e ".[yaml]"
 
 # For development / tests:
@@ -25,6 +25,8 @@ pip install -e ".[dev]"
 Uses [mssql-python](https://github.com/microsoft/mssql-python) -- Microsoft's official driver that bundles its own TDS layer, so no system ODBC driver is needed.
 
 ## Configuration
+
+### 1. Set up credentials
 
 Copy `.env.example` to `.env` and fill in your credentials:
 
@@ -36,60 +38,78 @@ cp .env.example .env
 SERVER=your-server.database.windows.net
 ADMIN_USER=sqladmin
 ADMIN_PASSWORD=<your-password>
-TEST_USER=test
-TEST_PASSWORD=<your-password>
 ```
 
-The library resolves configuration in order: **explicit arguments > environment variables > defaults**.
+Credentials are resolved in order: **explicit arguments > `${VAR}` expansion > environment variables > defaults**.
+
+### 2. Create a config file
+
+**YAML (recommended):** see `examples/tables.yaml`
+
+```yaml
+connection:
+  server: your-server.database.windows.net
+  sql_login: sqladmin
+  password: ${ADMIN_PASSWORD}
+
+storage:
+  data_dir: ./data
+  watermark_dir: ./watermarks
+
+max_workers: 8
+
+databases:
+  my_database:
+    dbo:
+      orders: full_incremental
+      customers: full
+      audit_log: incremental
+```
+
+**JSON** is also supported (see `sync_config.json`).
 
 ## Quick Start
+
+### CLI
+
+```bash
+# Sync using a YAML config:
+azsql-ct --config examples/tables.yaml
+
+# Override workers and enable verbose logging:
+azsql-ct --config examples/tables.yaml --workers 8 -v
+
+# JSON config works too:
+azsql-ct --config sync_config.json
+```
+
+### SDK
+
+```python
+from azsql_ct import ChangeTracker
+
+# Load from a config file (YAML or JSON):
+ct = ChangeTracker.from_config("examples/tables.yaml")
+results = ct.sync()
+
+# Or configure programmatically:
+ct = ChangeTracker("your-server.database.windows.net", "sqladmin", "secret")
+ct.tables = {
+    "my_database": {
+        "dbo": {
+            "orders": "full_incremental",
+            "customers": "full",
+        }
+    }
+}
+results = ct.sync()
+```
 
 ### Verify connectivity
 
 ```bash
 python examples/connect.py
 ```
-
-### SDK usage
-
-```python
-from azsql_ct import ChangeTracker
-
-ct = ChangeTracker("your-server.database.windows.net", "sqladmin", "secret")
-
-# Configure tables -- list format (all default to full_incremental):
-ct.tables = {"my_database": {"dbo": ["orders", "customers"]}}
-
-# Or dict format with per-table modes:
-ct.tables = {
-    "my_database": {
-        "dbo": {
-            "orders": "full_incremental",
-            "customers": "full",
-            "audit_log": "incremental",
-        }
-    }
-}
-
-results = ct.sync()
-```
-
-### Parallel sync
-
-```python
-ct = ChangeTracker("server", "user", "pw", max_workers=8)
-ct.tables = {"db": {"dbo": ["t1", "t2", "t3"]}}
-ct.sync()
-```
-
-### CLI
-
-```bash
-python -m azsql_ct --config sync_config.json
-python -m azsql_ct --config sync_config.json --output-dir ./data --watermark-dir ./watermarks -v
-```
-
-See `sync_config.json` for the config format.
 
 ## Change Tracking Permissions
 
@@ -104,7 +124,7 @@ GRANT VIEW CHANGE TRACKING ON SCHEMA::dbo TO <user>;
 
 ```
 azsql_ct/           Core package
-  client.py           ChangeTracker SDK facade
+  client.py           ChangeTracker SDK facade + from_config()
   connection.py       AzureSQLConnection wrapper
   queries.py          SQL query builders
   sync.py             Sync engine (full / incremental)

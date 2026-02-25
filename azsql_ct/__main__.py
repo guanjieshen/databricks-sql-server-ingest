@@ -1,8 +1,8 @@
 """CLI entry-point:  python -m azsql_ct [OPTIONS]
 
 Examples:
-    python -m azsql_ct --config sync_config.json
-    python -m azsql_ct --config sync_config.json --output-dir ./data --watermark-dir ./watermarks
+    python -m azsql_ct --config tables.yaml
+    python -m azsql_ct --config tables.yaml --workers 8 -v
 """
 
 import argparse
@@ -10,9 +10,52 @@ import json
 import logging
 import sys
 
-from .sync import sync_from_config
+from .client import ChangeTracker
 
 logger = logging.getLogger(__name__)
+
+
+def _log_summary(results: list) -> None:
+    """Print a human-readable summary of sync results."""
+    total_rows = 0
+    total_files = 0
+    errors = []
+
+    logger.info("=" * 72)
+    logger.info("SYNC SUMMARY")
+    logger.info("=" * 72)
+
+    for r in results:
+        table_fqn = f"{r['database']}.{r['table']}"
+
+        if r.get("status") == "error":
+            errors.append(r)
+            logger.error(
+                "  %-40s  ERROR: %s", table_fqn, r.get("error", "unknown"),
+            )
+            continue
+
+        rows = r["rows_written"]
+        files = r.get("files", [])
+        since = r.get("since_version")
+        total_rows += rows
+        total_files += len(files)
+
+        since_str = f" (since v{since})" if since is not None else ""
+        logger.info(
+            "  %-40s  %8d rows | %-12s | v%-8d | %6.1fs | %d file(s)%s",
+            table_fqn, rows, r["mode"], r["current_version"],
+            r.get("duration_seconds", 0), len(files), since_str,
+        )
+
+    logger.info("-" * 72)
+    logger.info(
+        "Completed: %d table(s) | %d total rows | %d file(s)",
+        len(results) - len(errors), total_rows, total_files,
+    )
+    if errors:
+        logger.warning("Failed: %d table(s)", len(errors))
+    logger.info("=" * 72)
 
 
 def main() -> None:
@@ -23,21 +66,26 @@ def main() -> None:
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to JSON config file listing databases/tables to sync",
+        help="Path to YAML or JSON config file",
     )
     parser.add_argument(
         "--output-dir",
-        default="./data",
-        help="Root directory for CSV data files (default: ./data)",
+        default=None,
+        help="Root directory for CSV data files (overrides config)",
     )
     parser.add_argument(
         "--watermark-dir",
-        default="./watermarks",
-        help="Root directory for watermark files (default: ./watermarks)",
+        default=None,
+        help="Root directory for watermark files (overrides config)",
     )
     parser.add_argument(
-        "--verbose",
-        "-v",
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of tables to sync in parallel (overrides config)",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
         action="store_true",
         help="Enable debug-level logging",
     )
@@ -50,19 +98,25 @@ def main() -> None:
     )
 
     try:
-        with open(args.config) as f:
-            config = json.load(f)
+        ct = ChangeTracker.from_config(
+            args.config,
+            max_workers=args.workers,
+            output_dir=args.output_dir,
+            watermark_dir=args.watermark_dir,
+        )
     except Exception as exc:
         logger.error("Failed to load config: %s", exc)
         sys.exit(1)
 
+    logger.info("Tracker: %s", ct)
+
     try:
-        results = sync_from_config(
-            config, output_dir=args.output_dir, watermark_dir=args.watermark_dir
-        )
+        results = ct.sync()
     except Exception as exc:
         logger.error("Sync failed: %s", exc)
         sys.exit(1)
+
+    _log_summary(results)
 
     for r in results:
         print(json.dumps(r, indent=2))

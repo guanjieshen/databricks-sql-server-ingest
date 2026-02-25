@@ -62,14 +62,3 @@ def mock_conn():
     return conn
 
 
-@pytest.fixture()
-def sample_config():
-    """Minimal sync config dict."""
-    return {
-        "server": "test.database.windows.net",
-        "user": "testadmin",
-        "password": "secret",
-        "tables": [
-            {"database": "db1", "table": "dbo.Foo", "mode": "full"},
-        ],
-    }

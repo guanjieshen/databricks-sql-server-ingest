@@ -21,11 +21,10 @@ import glob
 import logging
 import os
 import time
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Generator, List, Optional, Tuple
 
 from . import queries, watermark
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
-from .connection import get_connection
 from .writer import CsvWriter, OutputWriter
 
 logger = logging.getLogger(__name__)
@@ -193,61 +192,3 @@ def sync_table(
         "files": output_files,
         "duration_seconds": round(elapsed, 2),
     }
-
-
-def sync_from_config(
-    config: dict,
-    output_dir: str = "./data",
-    watermark_dir: str = "./watermarks",
-    writer: Optional[OutputWriter] = None,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-) -> List[dict]:
-    """Run sync for every table listed in *config*.
-
-    Config schema::
-
-        {
-          "server": "myserver.database.windows.net",
-          "user": "sqladmin",
-          "password": "...",
-          "tables": [
-            {"database": "db1", "table": "dbo.Foo", "mode": "incremental"},
-            {"database": "db2", "table": "dbo.Bar", "mode": "full"},
-          ]
-        }
-    """
-    server = config.get("server")
-    user = config.get("user")
-    password = config.get("password")
-
-    results: List[dict] = []
-    conns: Dict[str, Any] = {}
-
-    try:
-        for entry in config["tables"]:
-            db = entry["database"]
-            tbl = entry["table"]
-            mode = entry.get("mode", "full_incremental")
-
-            if db not in conns:
-                conns[db] = get_connection(
-                    server=server, database=db, user=user, password=password
-                )
-
-            results.append(
-                sync_table(
-                    conns[db],
-                    tbl,
-                    database=db,
-                    output_dir=output_dir,
-                    watermark_dir=watermark_dir,
-                    mode=mode,
-                    writer=writer,
-                    batch_size=batch_size,
-                )
-            )
-    finally:
-        for c in conns.values():
-            c.close()
-
-    return results

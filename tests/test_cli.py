@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -34,25 +34,61 @@ class TestCli:
                 main()
             assert exc_info.value.code == 1
 
-    @patch("azsql_ct.__main__.sync_from_config")
-    def test_valid_config_calls_sync(self, mock_sync, tmp_path, capsys):
+    @patch("azsql_ct.__main__.ChangeTracker")
+    def test_valid_config_calls_sync(self, MockCT, tmp_path, capsys):
         cfg = tmp_path / "cfg.json"
-        cfg.write_text(json.dumps({"tables": []}))
-        mock_sync.return_value = [{"table": "dbo.T", "rows_written": 0}]
+        cfg.write_text(json.dumps({
+            "server": "srv", "user": "u", "password": "p",
+            "tables": [{"database": "db1", "table": "dbo.T", "mode": "full"}],
+        }))
+
+        mock_ct = MagicMock()
+        mock_ct.sync.return_value = [
+            {"database": "db1", "table": "dbo.T", "mode": "full",
+             "rows_written": 0, "current_version": 1, "files": [],
+             "duration_seconds": 0.1, "since_version": None},
+        ]
+        MockCT.from_config.return_value = mock_ct
 
         with patch.object(sys, "argv", ["azsql_ct", "--config", str(cfg)]):
             main()
 
-        mock_sync.assert_called_once()
+        MockCT.from_config.assert_called_once()
+        mock_ct.sync.assert_called_once()
         captured = capsys.readouterr()
         assert "dbo.T" in captured.out
 
-    @patch("azsql_ct.__main__.sync_from_config", side_effect=RuntimeError("db error"))
-    def test_sync_failure_exits(self, mock_sync, tmp_path):
+    @patch("azsql_ct.__main__.ChangeTracker")
+    def test_sync_failure_exits(self, MockCT, tmp_path):
         cfg = tmp_path / "cfg.json"
-        cfg.write_text(json.dumps({"tables": []}))
+        cfg.write_text(json.dumps({
+            "server": "srv", "user": "u", "password": "p", "tables": [],
+        }))
+
+        mock_ct = MagicMock()
+        mock_ct.sync.side_effect = RuntimeError("db error")
+        MockCT.from_config.return_value = mock_ct
 
         with patch.object(sys, "argv", ["azsql_ct", "--config", str(cfg)]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1
+
+    @patch("azsql_ct.__main__.ChangeTracker")
+    def test_workers_flag_passed(self, MockCT, tmp_path, capsys):
+        cfg = tmp_path / "cfg.json"
+        cfg.write_text(json.dumps({
+            "server": "srv", "user": "u", "password": "p", "tables": [],
+        }))
+
+        mock_ct = MagicMock()
+        mock_ct.sync.return_value = []
+        MockCT.from_config.return_value = mock_ct
+
+        with patch.object(
+            sys, "argv", ["azsql_ct", "--config", str(cfg), "--workers", "4"]
+        ):
+            main()
+
+        call_kwargs = MockCT.from_config.call_args
+        assert call_kwargs.kwargs.get("max_workers") == 4

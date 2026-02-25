@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from azsql_ct import watermark
-from azsql_ct.sync import sync_from_config, sync_table
+from azsql_ct.sync import sync_table
 
 
 class StubWriter:
@@ -325,41 +325,98 @@ class TestSyncTable:
             )
 
 
-class TestSyncFromConfig:
-    @patch("azsql_ct.sync.get_connection")
-    def test_calls_sync_for_each_table(self, mock_get_conn, tmp_path, sample_config):
-        desc = [("id",)]
-        cursor = _make_cursor(
-            tracked=["dbo.Foo"],
-            cur_ver=10, min_ver=0, pk_cols=None,
-            rows=[(1,)], desc=desc,
+class TestFromConfig:
+    """Tests for ChangeTracker.from_config() factory method."""
+
+    def test_loads_flat_json_config(self, tmp_path):
+        from azsql_ct.client import ChangeTracker
+
+        cfg = tmp_path / "cfg.json"
+        cfg.write_text(json.dumps({
+            "server": "srv.database.windows.net",
+            "user": "admin",
+            "password": "secret",
+            "tables": [
+                {"database": "db1", "table": "dbo.Foo", "mode": "full"},
+                {"database": "db1", "table": "dbo.Bar", "mode": "incremental"},
+            ],
+        }))
+
+        ct = ChangeTracker.from_config(str(cfg))
+        assert ct.server == "srv.database.windows.net"
+        assert ct.user == "admin"
+        assert len(ct._flat_tables) == 2
+
+    def test_loads_dict_config(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "server": "srv",
+            "user": "u",
+            "password": "p",
+            "tables": [
+                {"database": "db1", "table": "dbo.T", "mode": "full"},
+            ],
+        })
+        assert ct.server == "srv"
+        assert len(ct._flat_tables) == 1
+
+    def test_loads_nested_dict_config(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {
+                "server": "myserver",
+                "sql_login": "admin",
+                "password": "pw",
+            },
+            "databases": {
+                "db1": {"dbo": {"t1": "full", "t2": "incremental"}},
+            },
+        })
+        assert ct.server == "myserver"
+        assert ct.user == "admin"
+        assert len(ct._flat_tables) == 2
+
+    def test_cli_overrides_take_precedence(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config(
+            {
+                "connection": {
+                    "server": "srv", "sql_login": "u", "password": "p",
+                },
+                "storage": {"data_dir": "/default"},
+                "max_workers": 2,
+                "databases": {"db1": {"dbo": ["t"]}},
+            },
+            max_workers=8,
+            output_dir="/override",
         )
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        mock_get_conn.return_value = conn
+        assert ct.max_workers == 8
+        assert ct.output_dir == "/override"
 
-        results = sync_from_config(
-            sample_config,
-            output_dir=str(tmp_path / "data"),
-            watermark_dir=str(tmp_path / "wm"),
-            writer=StubWriter(),
-        )
+    def test_env_var_expansion(self, monkeypatch):
+        from azsql_ct.client import ChangeTracker
 
-        assert len(results) == 1
-        assert results[0]["table"] == "dbo.Foo"
-        conn.close.assert_called_once()
+        monkeypatch.setenv("TEST_SERVER", "expanded.database.windows.net")
+        monkeypatch.setenv("TEST_PW", "secret123")
 
-    @patch("azsql_ct.sync.get_connection")
-    def test_connections_are_closed_on_error(self, mock_get_conn, tmp_path, sample_config):
-        conn = MagicMock()
-        conn.cursor.side_effect = RuntimeError("boom")
-        mock_get_conn.return_value = conn
+        ct = ChangeTracker.from_config({
+            "server": "${TEST_SERVER}",
+            "user": "admin",
+            "password": "${TEST_PW}",
+            "tables": [],
+        })
+        assert ct.server == "expanded.database.windows.net"
 
-        with pytest.raises(RuntimeError):
-            sync_from_config(
-                sample_config,
-                output_dir=str(tmp_path / "data"),
-                watermark_dir=str(tmp_path / "wm"),
-            )
+    def test_storage_section_applied(self):
+        from azsql_ct.client import ChangeTracker
 
-        conn.close.assert_called_once()
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "storage": {"data_dir": "/mydata", "watermark_dir": "/mywm"},
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.output_dir == "/mydata"
+        assert ct.watermark_dir == "/mywm"

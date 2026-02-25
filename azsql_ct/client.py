@@ -37,17 +37,59 @@ Modes:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
-from .connection import AzureSQLConnection
+from .connection import AzureSQLConnection, load_dotenv
 from .sync import sync_table
 from .writer import CsvWriter, OutputWriter
 
 logger = logging.getLogger(__name__)
+
+
+def expand_env(value: str) -> str:
+    """Expand ``${VAR}`` references in *value* with environment variables."""
+    return re.sub(r"\$\{(\w+)}", lambda m: os.environ[m.group(1)], str(value))
+
+
+def _load_config_file(path: Union[str, Path]) -> dict:
+    """Load a YAML or JSON config file, chosen by extension."""
+    p = Path(path)
+    text = p.read_text()
+    if p.suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError(
+                "PyYAML is required for YAML config files. "
+                "Install it with: pip install azsql_ct[yaml]"
+            )
+        return yaml.safe_load(text)
+    return json.loads(text)
+
+
+def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[str, str]]]:
+    """Convert a flat ``[{"database": ..., "table": ..., "mode": ...}]`` list
+    into the nested ``{db: {schema: {table: mode}}}`` format."""
+    result: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for entry in tables:
+        db = entry["database"]
+        full_name = entry["table"]
+        mode = entry.get("mode", "full_incremental")
+        if "." in full_name:
+            schema, table = full_name.split(".", 1)
+        else:
+            schema, table = "dbo", full_name
+        result.setdefault(db, {}).setdefault(schema, {})[table] = mode
+    return result
+
 
 TableSpec = Union[List[str], Dict[str, str]]
 TableMap = Dict[str, Dict[str, TableSpec]]
@@ -160,6 +202,97 @@ class ChangeTracker:
 
         self._table_map: TableMap = {}
         self._flat_tables: List[FlatEntry] = []
+
+    # -- factory ------------------------------------------------------------
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Union[str, Path, dict],
+        *,
+        max_workers: Optional[int] = None,
+        output_dir: Optional[str] = None,
+        watermark_dir: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ) -> "ChangeTracker":
+        """Create a fully configured ``ChangeTracker`` from a config file or dict.
+
+        Accepts either a file path (YAML/JSON) or an already-parsed dict.
+        Loads ``.env`` automatically and expands ``${VAR}`` references in
+        string values.
+
+        Supports two config layouts:
+
+        **Nested (YAML-style):**
+
+        .. code-block:: yaml
+
+            connection:
+              server: myserver.database.windows.net
+              sql_login: sqladmin
+              password: ${ADMIN_PASSWORD}
+            storage:          # optional
+              data_dir: ./data
+              watermark_dir: ./watermarks
+            max_workers: 8    # optional
+            databases:
+              db1:
+                dbo:
+                  orders: full_incremental
+
+        **Flat (JSON-style, for backward compatibility):**
+
+        .. code-block:: json
+
+            {
+              "server": "myserver.database.windows.net",
+              "user": "sqladmin",
+              "password": "secret",
+              "tables": [
+                {"database": "db1", "table": "dbo.orders", "mode": "full"}
+              ]
+            }
+        """
+        load_dotenv()
+
+        if isinstance(config, (str, Path)):
+            config = _load_config_file(config)
+
+        is_flat = "tables" in config and isinstance(config.get("tables"), list)
+
+        if is_flat:
+            server = expand_env(config.get("server", ""))
+            user = expand_env(config.get("user", ""))
+            password = expand_env(config.get("password", ""))
+            table_map = _flat_config_to_table_map(config["tables"])
+            cfg_output = config.get("output_dir")
+            cfg_watermark = config.get("watermark_dir")
+            cfg_workers = config.get("max_workers")
+        else:
+            conn_cfg = config.get("connection", {})
+            server = expand_env(conn_cfg.get("server", ""))
+            user = expand_env(
+                conn_cfg.get("sql_login", conn_cfg.get("user", ""))
+            )
+            password = expand_env(conn_cfg.get("password", ""))
+            table_map = config.get("databases", {})
+            storage = config.get("storage", {})
+            cfg_output = storage.get("data_dir")
+            cfg_watermark = storage.get("watermark_dir")
+            cfg_workers = config.get("max_workers")
+
+        ct = cls(
+            server=server,
+            user=user,
+            password=password,
+            output_dir=output_dir or cfg_output or "./data",
+            watermark_dir=watermark_dir or cfg_watermark or "./watermarks",
+            max_workers=max_workers if max_workers is not None else (cfg_workers or 1),
+            batch_size=batch_size if batch_size is not None else DEFAULT_BATCH_SIZE,
+        )
+        if table_map:
+            ct.tables = table_map
+        return ct
 
     # -- table configuration ------------------------------------------------
 
