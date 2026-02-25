@@ -3,6 +3,10 @@
 Provides :class:`AzureSQLConnection`, a configurable connection wrapper with
 context-manager support, and a :func:`get_connection` convenience function.
 
+Uses **mssql-python** -- Microsoft's official driver that bundles its own TDS
+layer so no system ODBC driver is needed.  Works out of the box on Databricks
+serverless.
+
 Configuration is resolved in order: explicit arguments > environment variables >
 built-in defaults.  A ``.env`` file is loaded automatically (if present) via
 :func:`load_dotenv`.
@@ -12,25 +16,26 @@ Env vars:
     DATABASE        -- Target database (default: database_1)
     ADMIN_USER      -- SQL login (default: sqladmin)
     ADMIN_PASSWORD  -- SQL login password (**required** unless passed explicitly)
-    ODBC_DRIVER     -- ODBC driver name (default: ODBC Driver 18 for SQL Server)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import Any, Optional, Type
 from types import TracebackType
-from typing import Optional, Type
 
-import pyodbc
+import mssql_python as _mssql  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SERVER = "guanjiesqldb.database.windows.net"
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SERVER = os.environ.get("SERVER", "localhost")
 _DEFAULT_DATABASE = "database_1"
 _DEFAULT_USER = "sqladmin"
-_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
-
 
 _dotenv_loaded: set = set()
 
@@ -80,7 +85,6 @@ class AzureSQLConnection:
         database: Optional[str] = None,
         user: Optional[str] = None,
         password: Optional[str] = None,
-        driver: Optional[str] = None,
         *,
         dotenv_path: Optional[str] = None,
     ) -> None:
@@ -89,34 +93,34 @@ class AzureSQLConnection:
         self.server = server or os.environ.get("SERVER", _DEFAULT_SERVER)
         self.database = database or os.environ.get("DATABASE", _DEFAULT_DATABASE)
         self.user = user or os.environ.get("ADMIN_USER", _DEFAULT_USER)
-        self.driver = driver or os.environ.get("ODBC_DRIVER", _DEFAULT_DRIVER)
         self._password = password or os.environ.get("ADMIN_PASSWORD")
-        self._conn: Optional[pyodbc.Connection] = None
+        self._conn: Any = None
 
-    @property
-    def connection_string(self) -> str:
-        """Build the ODBC connection string (raises if no password)."""
-        if not self._password:
-            raise ValueError(
-                "No password supplied. Set ADMIN_PASSWORD in your environment "
-                "or .env file, or pass it to the constructor."
-            )
-        return (
-            f"Driver={{{self.driver}}};Server={self.server};"
-            f"Database={self.database};Uid={self.user};Pwd={self._password};"
-            "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
-        )
-
-    def connect(self) -> pyodbc.Connection:
-        """Open and return a ``pyodbc.Connection``.
+    def connect(self) -> Any:
+        """Open and return a DB-API 2.0 connection.
 
         Subsequent calls return the same connection unless :meth:`close` has
         been called.
         """
         if self._conn is not None:
             return self._conn
-        logger.debug("Connecting to %s/%s as %s", self.server, self.database, self.user)
-        self._conn = pyodbc.connect(self.connection_string)
+        if not self._password:
+            raise ValueError(
+                "No password supplied. Set ADMIN_PASSWORD in your environment "
+                "or .env file, or pass it to the constructor."
+            )
+        logger.debug(
+            "Connecting to %s/%s as %s via mssql-python",
+            self.server, self.database, self.user,
+        )
+        self._conn = _mssql.connect(
+            server=self.server,
+            uid=self.user,
+            pwd=self._password,
+            database=self.database,
+            encrypt="yes",
+            TrustServerCertificate="no",
+        )
         return self._conn
 
     def close(self) -> None:
@@ -136,7 +140,7 @@ class AzureSQLConnection:
         except Exception:
             return False
 
-    def __enter__(self) -> pyodbc.Connection:
+    def __enter__(self) -> Any:
         return self.connect()
 
     def __exit__(
@@ -159,12 +163,11 @@ def get_connection(
     database: Optional[str] = None,
     user: Optional[str] = None,
     password: Optional[str] = None,
-    driver: Optional[str] = None,
     *,
     dotenv_path: Optional[str] = None,
-) -> pyodbc.Connection:
+) -> Any:
     """Convenience wrapper: create an :class:`AzureSQLConnection` and return
-    the open ``pyodbc.Connection``.
+    the open connection.
 
     Parameters fall back to environment variables, then to sensible defaults.
     Raises ``ValueError`` if *password* cannot be resolved.
@@ -174,7 +177,6 @@ def get_connection(
         database=database,
         user=user,
         password=password,
-        driver=driver,
         dotenv_path=dotenv_path,
     )
     return az.connect()

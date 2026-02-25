@@ -8,10 +8,13 @@ version = "0.1.0"
 description = "Incremental Azure SQL change-tracking sync to CSV"
 requires-python = ">=3.8"
 dependencies = [
-    "pyodbc>=4.0.39",
+    "mssql-python>=1.0.0",
 ]
 
 [project.optional-dependencies]
+yaml = [
+    "pyyaml>=6.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

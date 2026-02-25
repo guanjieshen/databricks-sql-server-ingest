@@ -9,7 +9,7 @@ import pytest
 
 
 class FakeCursor:
-    """Lightweight stand-in for ``pyodbc.Cursor``.
+    """Lightweight stand-in for a DB-API 2.0 cursor.
 
     Supply ``results`` as a list of lists -- each inner list is a set of rows
     returned by one successive ``execute()`` call.
@@ -57,7 +57,7 @@ def fake_cursor():
 
 @pytest.fixture()
 def mock_conn():
-    """Return a ``MagicMock`` that looks like a ``pyodbc.Connection``."""
+    """Return a ``MagicMock`` that looks like a DB-API 2.0 connection."""
     conn = MagicMock()
     return conn
 

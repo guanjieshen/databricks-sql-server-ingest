@@ -1,90 +1,130 @@
-# Azure SQL restricted login setup
+# azsql_ct -- Azure SQL Change Tracking Sync
 
-Azure SQL Server: **guanjiesqldb.database.windows.net**
+Incrementally sync change-tracked tables from Azure SQL Server to local CSV files.
 
-- **sqladmin** -- Admin SQL login used to run setup. Set `ADMIN_PASSWORD` in `.env`.
-- **test** -- Restricted login created by setup; access only to `master` and `database_1`, list via `dbo.AllowedDatabases`.
+Supports three sync modes per table:
 
-## Connection config
+| Mode | Behaviour |
+|---|---|
+| `full` | Reload the entire table every run |
+| `incremental` | Only fetch rows changed since the last watermark (requires a prior sync) |
+| `full_incremental` | Full load on first run, incremental on subsequent runs *(default)* |
 
-Copy `.env.example` to `.env` and set passwords (do not commit `.env`):
+## Installation
+
+```bash
+pip install -e .
+
+# For YAML config support (used by examples):
+pip install -e ".[yaml]"
+
+# For development / tests:
+pip install -e ".[dev]"
+```
+
+Uses [mssql-python](https://github.com/microsoft/mssql-python) -- Microsoft's official driver that bundles its own TDS layer, so no system ODBC driver is needed.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in your credentials:
 
 ```bash
 cp .env.example .env
-# Edit .env: set ADMIN_PASSWORD and TEST_PASSWORD
 ```
 
-## 1. Connect (do this first)
+```
+SERVER=your-server.database.windows.net
+ADMIN_USER=sqladmin
+ADMIN_PASSWORD=<your-password>
+TEST_USER=test
+TEST_PASSWORD=<your-password>
+```
 
-Use the **mssql-python** conda env (or set `PYTHON_CMD` / `PIP_CMD`). Verify you can reach the server and that admin credentials work:
+The library resolves configuration in order: **explicit arguments > environment variables > defaults**.
+
+## Quick Start
+
+### Verify connectivity
 
 ```bash
-conda activate mssql-python
-pip install -r requirements.txt
 python examples/connect.py
 ```
 
-If this fails, fix firewall (Azure Portal -> SQL server -> Networking -> add your IP) or credentials before continuing.
-
-## 2. Setup (run as sqladmin)
-
-Run the full setup and validation:
-
-```bash
-./run_setup_and_test.sh
-```
-
-Or run manually:
-
-1. **master** -- Run [create-login-master.sql](create-login-master.sql) in `master`.
-2. **database_1** -- Run [create-user-database_1.sql](create-user-database_1.sql) in `database_1`.
-
-The script uses the **mssql-python** conda env for Python (override with `PYTHON_CMD` and `PIP_CMD`) and `SERVER`, `ADMIN_USER`, `ADMIN_PASSWORD`, and `TEST_PASSWORD` from the environment.
-
-## 3. Validation test
-
-After setup, confirm the restricted login sees only the allowed databases:
-
-```bash
-pytest tests/test_integration.py -m integration -v
-```
-
-Uses `TEST_PASSWORD` (and optionally `SERVER`, `DATABASE`, `TEST_USER`) from env or `.env`.
-
-## 4. Package usage
-
-The `azsql_ct` package exposes an `AzureSQLConnection` class and sync utilities.
-See `examples/` for runnable scripts.
+### SDK usage
 
 ```python
-from azsql_ct import AzureSQLConnection
+from azsql_ct import ChangeTracker
 
-with AzureSQLConnection(database="master") as conn:
-    cur = conn.cursor()
-    cur.execute("SELECT 1 AS ok")
-    print(cur.fetchone()[0])
+ct = ChangeTracker("your-server.database.windows.net", "sqladmin", "secret")
+
+# Configure tables -- list format (all default to full_incremental):
+ct.tables = {"my_database": {"dbo": ["orders", "customers"]}}
+
+# Or dict format with per-table modes:
+ct.tables = {
+    "my_database": {
+        "dbo": {
+            "orders": "full_incremental",
+            "customers": "full",
+            "audit_log": "incremental",
+        }
+    }
+}
+
+results = ct.sync()
 ```
 
-## 5. Change tracking (database_1)
+### Parallel sync
 
-If change tracking is enabled on tables in **database_1**, the **test** user can read change tracking details after an admin grants permission once:
+```python
+ct = ChangeTracker("server", "user", "pw", max_workers=8)
+ct.tables = {"db": {"dbo": ["t1", "t2", "t3"]}}
+ct.sync()
+```
 
-1. **Grant permission** (run in `database_1` as sqladmin):
+### CLI
 
-   ```sql
-   GRANT VIEW CHANGE TRACKING ON SCHEMA::dbo TO test;
-   ```
+```bash
+python -m azsql_ct --config sync_config.json
+python -m azsql_ct --config sync_config.json --output-dir ./data --watermark-dir ./watermarks -v
+```
 
-2. **Get change tracking details** as **test**:
+See `sync_config.json` for the config format.
 
-   ```bash
-   python examples/get_change_tracking.py
-   python examples/get_change_tracking.py MyTable           # changes since version 0
-   python examples/get_change_tracking.py MyTable 12345    # changes since version 12345
-   ```
+## Change Tracking Permissions
 
-3. **Full sync** to CSV:
+If change tracking is enabled on tables in your database, the read-only user needs permission granted once by an admin:
 
-   ```bash
-   python -m azsql_ct --config sync_config.json
-   ```
+```sql
+-- Run in the target database as admin
+GRANT VIEW CHANGE TRACKING ON SCHEMA::dbo TO <user>;
+```
+
+## Project Structure
+
+```
+azsql_ct/           Core package
+  client.py           ChangeTracker SDK facade
+  connection.py       AzureSQLConnection wrapper
+  queries.py          SQL query builders
+  sync.py             Sync engine (full / incremental)
+  watermark.py        JSON watermark store
+  writer.py           Pluggable CSV output writer
+  __main__.py         CLI entry point
+examples/           Runnable example scripts
+tests/              Unit and integration tests
+```
+
+## Testing
+
+```bash
+# Unit tests (no database required):
+pytest
+
+# Integration tests (requires a live Azure SQL database):
+pytest -m integration -v
+```
+
+## License
+
+Private.

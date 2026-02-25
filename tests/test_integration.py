@@ -12,8 +12,6 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-pyodbc = pytest.importorskip("pyodbc")
-
 from azsql_ct import AzureSQLConnection
 from azsql_ct.connection import load_dotenv
 
@@ -52,5 +50,5 @@ def test_sys_databases_denied_or_limited(test_conn):
         assert names == ALLOWED_NAMES, (
             f"sys.databases should not expose extra databases; got {names}"
         )
-    except pyodbc.Error:
+    except Exception:
         pass

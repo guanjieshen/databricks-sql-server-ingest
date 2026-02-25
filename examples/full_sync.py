@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 load_dotenv()
 
 ct = ChangeTracker(
-    os.environ.get("SERVER", "guanjiesqldb.database.windows.net"),
+    os.environ["SERVER"],
     os.environ.get("ADMIN_USER", "sqladmin"),
     os.environ["ADMIN_PASSWORD"],
     max_workers=8,

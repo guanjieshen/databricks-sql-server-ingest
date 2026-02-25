@@ -6,13 +6,10 @@ independently from the sync orchestration and I/O layers.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
-
-if TYPE_CHECKING:
-    import pyodbc
+from typing import Any, List, Optional
 
 
-def list_tracked_tables(cursor: "pyodbc.Cursor") -> List[str]:
+def list_tracked_tables(cursor: Any) -> List[str]:
     """Return fully-qualified names of all change-tracked tables."""
     cursor.execute(
         "SELECT OBJECT_SCHEMA_NAME(t.object_id) + '.' + OBJECT_NAME(t.object_id) "
@@ -32,13 +29,13 @@ def resolve_table(name: str, tracked: List[str]) -> Optional[str]:
     return None
 
 
-def current_version(cursor: "pyodbc.Cursor") -> int:
+def current_version(cursor: Any) -> int:
     """Return the current change-tracking version for the database."""
     cursor.execute("SELECT CHANGE_TRACKING_CURRENT_VERSION()")
     return cursor.fetchone()[0]
 
 
-def min_valid_version_for_table(cursor: "pyodbc.Cursor", full_table_name: str) -> int:
+def min_valid_version_for_table(cursor: Any, full_table_name: str) -> int:
     """Return the minimum valid change-tracking version for *full_table_name*."""
     cursor.execute(
         "SELECT CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(?))",
@@ -48,7 +45,7 @@ def min_valid_version_for_table(cursor: "pyodbc.Cursor", full_table_name: str) -
     return row[0] if row and row[0] is not None else 0
 
 
-def primary_key_columns(cursor: "pyodbc.Cursor", full_table_name: str) -> List[str]:
+def primary_key_columns(cursor: Any, full_table_name: str) -> List[str]:
     """Return the primary-key column names for *full_table_name*."""
     cursor.execute(
         """

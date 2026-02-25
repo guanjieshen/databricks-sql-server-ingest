@@ -51,12 +51,11 @@ class TestAzureSQLConnection:
         env_file.write_text("")
         az = AzureSQLConnection(
             server="srv", database="db", user="u", password="p",
-            driver="Driver X", dotenv_path=str(env_file),
+            dotenv_path=str(env_file),
         )
         assert az.server == "srv"
         assert az.database == "db"
         assert az.user == "u"
-        assert az.driver == "Driver X"
 
     def test_falls_back_to_env(self, tmp_path):
         env_file = tmp_path / ".env"
@@ -66,51 +65,39 @@ class TestAzureSQLConnection:
         assert az.server == "envhost"
         assert az.user == "envuser"
 
-    def test_connection_string_raises_without_password(self, tmp_path):
+    def test_connect_raises_without_password(self, tmp_path):
         env_file = tmp_path / ".env"
         env_file.write_text("")
         with patch.dict(os.environ, {}, clear=True):
             az = AzureSQLConnection(dotenv_path=str(env_file))
             with pytest.raises(ValueError, match="No password supplied"):
-                _ = az.connection_string
+                az.connect()
 
-    def test_connection_string_format(self, tmp_path):
-        env_file = tmp_path / ".env"
-        env_file.write_text("")
-        az = AzureSQLConnection(
-            server="s", database="d", user="u", password="p",
-            driver="ODBC 18", dotenv_path=str(env_file),
-        )
-        cs = az.connection_string
-        assert "Server=s" in cs
-        assert "Database=d" in cs
-        assert "Uid=u" in cs
-        assert "Pwd=p" in cs
-
-    @patch("azsql_ct.connection.pyodbc")
-    def test_connect_returns_pyodbc_conn(self, mock_pyodbc, tmp_path):
-        mock_pyodbc.connect.return_value = MagicMock()
+    @patch("azsql_ct.connection._mssql")
+    def test_connect_returns_mssql_conn(self, mock_mssql, tmp_path):
+        mock_mssql.connect.return_value = MagicMock()
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
         conn = az.connect()
-        assert conn is mock_pyodbc.connect.return_value
+        assert conn is mock_mssql.connect.return_value
+        mock_mssql.connect.assert_called_once()
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_connect_reuses_existing(self, mock_pyodbc, tmp_path):
-        mock_pyodbc.connect.return_value = MagicMock()
+    @patch("azsql_ct.connection._mssql")
+    def test_connect_reuses_existing(self, mock_mssql, tmp_path):
+        mock_mssql.connect.return_value = MagicMock()
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
         c1 = az.connect()
         c2 = az.connect()
         assert c1 is c2
-        mock_pyodbc.connect.assert_called_once()
+        mock_mssql.connect.assert_called_once()
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_close_closes_connection(self, mock_pyodbc, tmp_path):
+    @patch("azsql_ct.connection._mssql")
+    def test_close_closes_connection(self, mock_mssql, tmp_path):
         mock_conn = MagicMock()
-        mock_pyodbc.connect.return_value = mock_conn
+        mock_mssql.connect.return_value = mock_conn
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
@@ -118,9 +105,9 @@ class TestAzureSQLConnection:
         az.close()
         mock_conn.close.assert_called_once()
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_close_is_idempotent(self, mock_pyodbc, tmp_path):
-        mock_pyodbc.connect.return_value = MagicMock()
+    @patch("azsql_ct.connection._mssql")
+    def test_close_is_idempotent(self, mock_mssql, tmp_path):
+        mock_mssql.connect.return_value = MagicMock()
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
@@ -128,10 +115,10 @@ class TestAzureSQLConnection:
         az.close()
         az.close()
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_context_manager(self, mock_pyodbc, tmp_path):
+    @patch("azsql_ct.connection._mssql")
+    def test_context_manager(self, mock_mssql, tmp_path):
         mock_conn = MagicMock()
-        mock_pyodbc.connect.return_value = mock_conn
+        mock_mssql.connect.return_value = mock_conn
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
@@ -139,18 +126,18 @@ class TestAzureSQLConnection:
             assert conn is mock_conn
         mock_conn.close.assert_called_once()
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_test_connectivity_success(self, mock_pyodbc, tmp_path):
+    @patch("azsql_ct.connection._mssql")
+    def test_test_connectivity_success(self, mock_mssql, tmp_path):
         mock_conn = MagicMock()
-        mock_pyodbc.connect.return_value = mock_conn
+        mock_mssql.connect.return_value = mock_conn
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
         assert az.test_connectivity() is True
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_test_connectivity_failure(self, mock_pyodbc, tmp_path):
-        mock_pyodbc.connect.side_effect = Exception("cannot connect")
+    @patch("azsql_ct.connection._mssql")
+    def test_test_connectivity_failure(self, mock_mssql, tmp_path):
+        mock_mssql.connect.side_effect = Exception("cannot connect")
         env_file = tmp_path / ".env"
         env_file.write_text("")
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
@@ -171,22 +158,22 @@ class TestAzureSQLConnection:
 
 
 class TestGetConnection:
-    @patch("azsql_ct.connection.pyodbc")
-    def test_returns_connection(self, mock_pyodbc, tmp_path):
+    @patch("azsql_ct.connection._mssql")
+    def test_returns_connection(self, mock_mssql, tmp_path):
         mock_conn = MagicMock()
-        mock_pyodbc.connect.return_value = mock_conn
+        mock_mssql.connect.return_value = mock_conn
         env_file = tmp_path / ".env"
         env_file.write_text("ADMIN_PASSWORD=secret\n")
 
         conn = get_connection(dotenv_path=str(env_file))
         assert conn is mock_conn
-        mock_pyodbc.connect.assert_called_once()
-        call_str = mock_pyodbc.connect.call_args[0][0]
-        assert "Pwd=secret" in call_str
+        mock_mssql.connect.assert_called_once()
+        kwargs = mock_mssql.connect.call_args[1]
+        assert kwargs["pwd"] == "secret"
 
-    @patch("azsql_ct.connection.pyodbc")
-    def test_explicit_params_override_env(self, mock_pyodbc, tmp_path):
-        mock_pyodbc.connect.return_value = MagicMock()
+    @patch("azsql_ct.connection._mssql")
+    def test_explicit_params_override_env(self, mock_mssql, tmp_path):
+        mock_mssql.connect.return_value = MagicMock()
         env_file = tmp_path / ".env"
         env_file.write_text("ADMIN_PASSWORD=fromenv\n")
 
@@ -195,11 +182,11 @@ class TestGetConnection:
             dotenv_path=str(env_file),
         )
 
-        call_str = mock_pyodbc.connect.call_args[0][0]
-        assert "Server=myhost" in call_str
-        assert "Database=mydb" in call_str
-        assert "Uid=myuser" in call_str
-        assert "Pwd=mypass" in call_str
+        kwargs = mock_mssql.connect.call_args[1]
+        assert kwargs["server"] == "myhost"
+        assert kwargs["database"] == "mydb"
+        assert kwargs["uid"] == "myuser"
+        assert kwargs["pwd"] == "mypass"
 
     def test_raises_when_no_password(self, tmp_path):
         env_file = tmp_path / ".env"

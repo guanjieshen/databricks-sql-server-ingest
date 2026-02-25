@@ -1,5 +1,5 @@
 {
-  "server": "guanjiesqldb.database.windows.net",
+  "server": "your-server.database.windows.net",
   "tables": [
     {"database": "database_1", "table": "dbo.table_1", "mode": "incremental"},
     {"database": "database_1", "table": "dbo.table_2", "mode": "full"}

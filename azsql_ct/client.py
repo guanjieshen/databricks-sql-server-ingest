@@ -40,15 +40,12 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import TracebackType
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
 from .connection import AzureSQLConnection
 from .sync import sync_table
 from .writer import CsvWriter, OutputWriter
-
-if TYPE_CHECKING:
-    import pyodbc
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +131,7 @@ class ChangeTracker:
                        (default ``CsvWriter()``).
         max_workers:   Number of tables to sync in parallel (default ``1`` =
                        sequential).  Each worker opens its own database
-                       connection, so this is safe with pyodbc.
+                       connection, so this is safe with both backends.
         batch_size:    Number of rows fetched from the database at a time
                        (default ``10_000``).  Controls peak memory usage for
                        large tables.
@@ -251,7 +248,7 @@ class ChangeTracker:
     # -- sequential (max_workers=1) -----------------------------------------
 
     def _run_sync_sequential(self, mode_override: Optional[str]) -> List[dict]:
-        conns: Dict[str, "pyodbc.Connection"] = {}
+        conns: Dict[str, Any] = {}
         results: List[dict] = []
 
         try:

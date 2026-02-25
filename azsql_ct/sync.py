@@ -21,15 +21,12 @@ import glob
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from . import queries, watermark
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
 from .connection import get_connection
 from .writer import CsvWriter, OutputWriter
-
-if TYPE_CHECKING:
-    import pyodbc
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +34,7 @@ _DEFAULT_WRITER: OutputWriter = CsvWriter()
 
 
 def _iter_cursor(
-    cursor: "pyodbc.Cursor", batch_size: int
+    cursor: Any, batch_size: int
 ) -> Generator[Tuple, None, None]:
     """Yield rows from *cursor* in batches of *batch_size* without
     materialising the entire result set in memory."""
@@ -72,7 +69,7 @@ def _clear_data_files(data_dir: str) -> int:
 
 
 def sync_table(
-    conn: "pyodbc.Connection",
+    conn: Any,
     table_name: str,
     database: str,
     output_dir: str = "./data",
@@ -84,7 +81,7 @@ def sync_table(
     """Sync one change-tracked table.
 
     Args:
-        conn:          Open pyodbc connection to the target *database*.
+        conn:          Open DB-API connection to the target *database*.
         table_name:    Fully-qualified table name (e.g. ``dbo.table_1``).
         database:      Database name (used for directory layout).
         output_dir:    Root directory for data files.
@@ -224,7 +221,7 @@ def sync_from_config(
     password = config.get("password")
 
     results: List[dict] = []
-    conns: Dict[str, "pyodbc.Connection"] = {}
+    conns: Dict[str, Any] = {}
 
     try:
         for entry in config["tables"]:
