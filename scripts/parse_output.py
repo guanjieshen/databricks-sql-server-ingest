@@ -2,7 +2,7 @@
 """Parse output.yaml (manifest of synced tables) into a flat list of table records.
 
 Usage:
-    python examples/parse_output.py [path_to_output.yaml]
+    python scripts/parse_output.py [path_to_output.yaml]
 """
 
 from __future__ import annotations

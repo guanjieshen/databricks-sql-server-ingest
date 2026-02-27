@@ -2,12 +2,12 @@
 """Verify connectivity to the Azure SQL server.
 
 Usage:
-    python examples/connect.py
+    python scripts/connect.py
 """
 
 from azsql_ct import ChangeTracker
 
-ct = ChangeTracker.from_config("examples/tables.yaml")
+ct = ChangeTracker.from_config("pipelines/pipeline_1.yaml")
 
 if ct.test_connectivity():
     print(f"Connected to {ct.server} as {ct.user}.")

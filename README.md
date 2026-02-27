@@ -44,7 +44,7 @@ Credentials are resolved in order: **explicit arguments > `${VAR}` expansion > e
 
 ### 2. Create a config file
 
-**YAML (recommended):** see `examples/tables.yaml`
+**YAML (recommended):** see `pipelines/pipeline_1.yaml`
 
 ```yaml
 connection:
@@ -76,10 +76,10 @@ When using `ingest_pipeline`, the manifest is written to `{ingest_pipeline}/outp
 
 ```bash
 # Sync using a YAML config:
-azsql-ct --config examples/tables.yaml
+azsql-ct --config pipelines/pipeline_1.yaml
 
 # Override workers and enable verbose logging:
-azsql-ct --config examples/tables.yaml --workers 8 -v
+azsql-ct --config pipelines/pipeline_1.yaml --workers 8 -v
 
 # JSON config works too:
 azsql-ct --config sync_config.json
@@ -91,7 +91,7 @@ azsql-ct --config sync_config.json
 from azsql_ct import ChangeTracker
 
 # Load from a config file (YAML or JSON):
-ct = ChangeTracker.from_config("examples/tables.yaml")
+ct = ChangeTracker.from_config("pipelines/pipeline_1.yaml")
 results = ct.sync()
 
 # Or configure programmatically:
@@ -110,7 +110,7 @@ results = ct.sync()
 ### Verify connectivity
 
 ```bash
-python examples/connect.py
+python scripts/connect.py
 ```
 
 ## Change Tracking Permissions
@@ -133,7 +133,7 @@ azsql_ct/           Core package
   watermark.py        JSON watermark store
   writer.py           Pluggable Parquet output writer
   __main__.py         CLI entry point
-examples/           Runnable example scripts
+scripts/            Runnable utility scripts
 tests/              Unit and integration tests
 ```
 

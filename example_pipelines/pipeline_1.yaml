@@ -1,7 +1,7 @@
 connection:
-  server: guanjiesqldb.database.windows.net
-  sql_login: sqladmin
-  password: ${ADMIN_PASSWORD}
+  server: INSERT_SERVERNAME_HERE
+  sql_login: INSERT_LOGIN_HERE
+  password: INSERT_PASSWORD_HERE
 
 
 # Number of tables to sync in parallel (default: 1 = sequential).
@@ -9,7 +9,7 @@ parallelism: 4
 
 # Single directory for this pipeline: data, watermarks, and output manifest are written under it.
 storage:
-  ingest_pipeline: ./peloton_1
+  ingest_pipeline: INSERT_UC_VOLUME_PATH_HERE
 
 databases:
   database_1:

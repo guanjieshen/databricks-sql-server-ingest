@@ -3,14 +3,14 @@ description: Install mssql-python and run azsql_ct / sync (Python 3.10+ and PYTH
 alwaysApply: true
 ---
 
-# Running azsql_ct and examples/sync.py
+# Running azsql_ct and scripts/sync.py
 
 ## Python version
 
 - **mssql-python** requires **Python 3.10+**. PyPI has no wheel for 3.8, so `pip install mssql-python` will fail on 3.8.
 - Use **Python 3.11** (or 3.10+) when installing deps and running sync/scripts:
   - `python3.11 -m pip install ...`
-  - `python3.11 examples/sync.py`
+  - `python3.11 scripts/sync.py`
 
 ## Install dependencies
 
@@ -22,19 +22,19 @@ python3.11 -m pip install mssql-python pyarrow pyyaml
 
 Optional: install the project (may fail due to flat-layout / multiple top-level packages). Prefer using `PYTHONPATH` to run against the local package.
 
-## Run examples/sync.py
+## Run scripts/sync.py
 
 Set `PYTHONPATH` to the project root so the local `azsql_ct` package is used (avoids needing an editable install):
 
 ```bash
 cd /Users/guanjie.shen/sql_server_permissions
-PYTHONPATH=/Users/guanjie.shen/sql_server_permissions python3.11 examples/sync.py
+PYTHONPATH=/Users/guanjie.shen/sql_server_permissions python3.11 scripts/sync.py
 ```
 
 Or from any directory:
 
 ```bash
-PYTHONPATH=<project_root> python3.11 <project_root>/examples/sync.py
+PYTHONPATH=<project_root> python3.11 <project_root>/scripts/sync.py
 ```
 
 ## Common errors
