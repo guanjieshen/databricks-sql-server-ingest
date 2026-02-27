@@ -49,6 +49,15 @@ def _is_success_result(result: dict) -> bool:
     return True
 
 
+def _has_output_files(result: dict) -> bool:
+    """True if the sync result produced at least one output file."""
+    if "files" in result:
+        return bool(result["files"])
+    if "rows_written" in result:
+        return result["rows_written"] > 0
+    return True
+
+
 def merge_add(
     manifest: Dict[str, Any],
     sync_results: List[dict],
@@ -73,6 +82,8 @@ def merge_add(
 
     for result in sync_results:
         if not _is_success_result(result):
+            continue
+        if not _has_output_files(result):
             continue
         database = result["database"]
         full_table = result["table"]
