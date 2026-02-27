@@ -27,7 +27,7 @@ from datetime import date
 from typing import Any, Generator, List, Optional, Tuple
 
 from . import queries, watermark
-from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
+from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES
 from .writer import OutputWriter, ParquetWriter
 
 logger = logging.getLogger(__name__)
@@ -148,6 +148,7 @@ def sync_table(
     writer: Optional[OutputWriter] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     snapshot_isolation: bool = False,
+    scd_type: int = DEFAULT_SCD_TYPE,
 ) -> dict:
     """Sync one change-tracked table.
 
@@ -166,6 +167,9 @@ def sync_table(
                             ``SNAPSHOT`` isolation for point-in-time
                             consistent reads.  Requires the database to have
                             ``ALLOW_SNAPSHOT_ISOLATION ON``.
+        scd_type:           SCD type for this table (``1`` = overwrite,
+                            ``2`` = historical tracking).  Passed through to
+                            the result dict and output manifest.
 
     Returns:
         Summary dict.
@@ -195,6 +199,7 @@ def sync_table(
             cur, full_name, database, data_dir, wm_dir,
             mode=mode, writer=writer, batch_size=batch_size,
             snapshot_isolation=snapshot_isolation,
+            scd_type=scd_type,
         )
 
 
@@ -209,6 +214,7 @@ def _sync_table_locked(
     writer: OutputWriter,
     batch_size: int,
     snapshot_isolation: bool = False,
+    scd_type: int = DEFAULT_SCD_TYPE,
 ) -> dict:
     """Inner sync logic, called while holding the per-table lock."""
     cur_ver = queries.current_version(cur)
@@ -295,6 +301,7 @@ def _sync_table_locked(
         "database": database,
         "table": full_name,
         "mode": actual_mode,
+        "scd_type": scd_type,
         "since_version": since_ver,
         "current_version": cur_ver,
         "rows_written": row_count,

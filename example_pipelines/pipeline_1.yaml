@@ -18,5 +18,7 @@ databases:
       dbo:
         uc_schema: INSERT_SCHEMA_NAME_HERE  # Databricks Unity Catalog schema (not used by sync)
         tables:
-          table_1: full_incremental
-          table_59: full_incremental
+          table_1: full_incremental          # string shorthand: defaults to scd_type 1
+          table_59:
+            mode: full_incremental
+            scd_type: 2                      # SCD Type II: track historical changes
