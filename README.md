@@ -53,18 +53,24 @@ connection:
   password: ${ADMIN_PASSWORD}
 
 storage:
-  ingest_pipeline: ./ingest_pipeline   # data, watermarks, and output manifest go under this dir; or set data_dir, watermark_dir, output_manifest explicitly to override
+  ingest_pipeline: ./ingest_pipeline   # data, watermarks, and output manifest go under this dir
 
 # Tables to sync in parallel (optional; also supports key "max_workers")
 parallelism: 8
 
 databases:
   my_database:
-    dbo:
-      orders: full_incremental
-      customers: full
-      audit_log: incremental
+    uc_catalog: my_unity_catalog        # Databricks Unity Catalog name (not used by sync)
+    schemas:
+      dbo:
+        uc_schema: my_unity_schema      # Databricks Unity Catalog schema (not used by sync)
+        tables:
+          orders: full_incremental
+          customers: full
+          audit_log: incremental
 ```
+
+The `uc_catalog` and `uc_schema` fields are informational metadata for Databricks Unity Catalog mapping; they are **not** consumed by the sync engine. The legacy flat format (schemas and tables directly under the database key) is still supported.
 
 When using `ingest_pipeline`, the manifest is written to `{ingest_pipeline}/output.yaml`. When `output_manifest` is set under `storage` (or derived from `ingest_pipeline`), sync updates that YAML file with the path and type of each table's output. Fields `uc_catalog_name`, `uc_schema_name`, and `uc_table_name` are left blank for you to fill (e.g. for Unity Catalog). The manifest is updated only when new databases, schemas, or tables are added; existing entries are never overwritten.
 

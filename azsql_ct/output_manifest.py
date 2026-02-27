@@ -1,8 +1,8 @@
 """Output manifest: record where synced files are written.
 
 The manifest is a YAML file listing each synced table with its output
-directory (file_path), file type, and user-fillable UC fields
-(uc_catalog_name, uc_schema_name, uc_table_name) left blank.
+directory (file_path), file type, and UC catalog/schema names populated
+from pipeline config metadata.
 
 Update semantics: only new databases, schemas, or tables are added;
 existing entries are never overwritten so user-filled values are preserved.
@@ -54,17 +54,22 @@ def merge_add(
     sync_results: List[dict],
     output_dir: str,
     file_type: str,
+    *,
+    uc_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """Add new tables from sync results to manifest (in place).
 
     Only successful results are considered. For each (database, schema, table)
     that does not already exist in the manifest, add an entry with
-    uc_catalog_name, uc_schema_name, uc_table_name left blank and
-    file_path, file_type set. Existing entries are never overwritten.
+    file_path and file_type set.  ``uc_catalog_name`` and ``uc_schema_name``
+    are populated from *uc_metadata* when available, otherwise ``None``.
+    Existing entries are never overwritten.
     """
     databases = manifest.setdefault("databases", {})
     if not isinstance(databases, dict):
         manifest["databases"] = databases = {}
+
+    uc = uc_metadata or {}
 
     for result in sync_results:
         if not _is_success_result(result):
@@ -85,24 +90,28 @@ def merge_add(
 
         file_path = os.path.join(output_dir, database, schema, table)
 
+        db_uc = uc.get(database, {})
+        catalog_value = db_uc.get("uc_catalog")
+        schema_value = db_uc.get("schemas", {}).get(schema)
+
         if database not in databases:
-            databases[database] = {"uc_catalog_name": None}
+            databases[database] = {"uc_catalog_name": catalog_value}
         db_node = databases[database]
         if not isinstance(db_node, dict):
-            db_node = {"uc_catalog_name": None}
+            db_node = {"uc_catalog_name": catalog_value}
             databases[database] = db_node
         if "uc_catalog_name" not in db_node:
-            db_node = {"uc_catalog_name": None, **db_node}
+            db_node = {"uc_catalog_name": catalog_value, **db_node}
             databases[database] = db_node
 
         if schema not in db_node:
-            db_node[schema] = {"uc_schema_name": None}
+            db_node[schema] = {"uc_schema_name": schema_value}
         schema_node = db_node[schema]
         if not isinstance(schema_node, dict):
-            schema_node = {"uc_schema_name": None}
+            schema_node = {"uc_schema_name": schema_value}
             db_node[schema] = schema_node
         if "uc_schema_name" not in schema_node:
-            schema_node = {"uc_schema_name": None, **schema_node}
+            schema_node = {"uc_schema_name": schema_value, **schema_node}
             db_node[schema] = schema_node
 
         if table in schema_node:
@@ -116,9 +125,8 @@ def _table_entry(
     file_type: str,
     primary_key: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build table node with uc_table_name, file_path, file_type, and optional primary_key."""
+    """Build table node with file_path, file_type, and optional primary_key."""
     entry: Dict[str, Any] = {
-        "uc_table_name": None,
         "file_path": file_path,
         "file_type": file_type,
     }

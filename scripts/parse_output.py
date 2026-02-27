@@ -24,14 +24,14 @@ def parse_yaml_to_table_dict(yaml_file_path: str | Path) -> List[Dict[str, Any]]
 
     Expects the structure produced by the sync output manifest:
     databases -> database_name -> uc_catalog_name, schema_name -> uc_schema_name,
-    table_name -> uc_table_name, file_path, file_type.
+    table_name -> file_path, file_type.
 
     Args:
         yaml_file_path: Path to the YAML file (e.g. output.yaml).
 
     Returns:
         List of dicts with keys: database_name, schema_name, table_name,
-        file_path, file_type, uc_catalog_name, uc_schema_name, uc_table_name,
+        file_path, file_type, uc_catalog_name, uc_schema_name,
         primary_key (list of column names, if present in manifest).
     """
     path = Path(yaml_file_path)
@@ -72,7 +72,6 @@ def parse_yaml_to_table_dict(yaml_file_path: str | Path) -> List[Dict[str, Any]]
                     "file_type": table_info.get("file_type"),
                     "uc_catalog_name": uc_catalog_name,
                     "uc_schema_name": uc_schema_name,
-                    "uc_table_name": table_info.get("uc_table_name"),
                     "primary_key": table_info.get("primary_key"),
                 })
 

@@ -36,9 +36,26 @@ class TestMergeAdd:
         assert manifest["databases"]["db1"]["uc_catalog_name"] is None
         assert manifest["databases"]["db1"]["dbo"]["uc_schema_name"] is None
         tbl = manifest["databases"]["db1"]["dbo"]["orders"]
-        assert tbl["uc_table_name"] is None
+        assert "uc_table_name" not in tbl
         assert tbl["file_path"] == "/data/db1/dbo/orders"
         assert tbl["file_type"] == "parquet"
+
+    def test_adds_new_table_with_uc_metadata(self):
+        manifest = {"databases": {}}
+        results = [
+            {"database": "db1", "table": "dbo.orders", "rows_written": 10},
+        ]
+        uc_metadata = {
+            "db1": {
+                "uc_catalog": "gshen_catalog",
+                "schemas": {"dbo": "my_schema"},
+            },
+        }
+        merge_add(manifest, results, "/data", "parquet", uc_metadata=uc_metadata)
+        assert manifest["databases"]["db1"]["uc_catalog_name"] == "gshen_catalog"
+        assert manifest["databases"]["db1"]["dbo"]["uc_schema_name"] == "my_schema"
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["file_path"] == "/data/db1/dbo/orders"
 
     def test_skips_error_results(self):
         manifest = {"databases": {}}
@@ -56,7 +73,6 @@ class TestMergeAdd:
                     "dbo": {
                         "uc_schema_name": "my_schema",
                         "orders": {
-                            "uc_table_name": "my_table",
                             "file_path": "/old/path",
                             "file_type": "parquet",
                         },
@@ -69,7 +85,6 @@ class TestMergeAdd:
         ]
         merge_add(manifest, results, "/new/data", "csv")
         tbl = manifest["databases"]["db1"]["dbo"]["orders"]
-        assert tbl["uc_table_name"] == "my_table"
         assert tbl["file_path"] == "/old/path"
         assert tbl["file_type"] == "parquet"
 
@@ -120,7 +135,7 @@ class TestSave:
                     "uc_catalog_name": None,
                     "dbo": {
                         "uc_schema_name": None,
-                        "t1": {"uc_table_name": None, "file_path": "/d/db1/dbo/t1", "file_type": "parquet"},
+                        "t1": {"file_path": "/d/db1/dbo/t1", "file_type": "parquet"},
                     },
                 },
             },
@@ -140,7 +155,6 @@ class TestSave:
                     "dbo": {
                         "uc_schema_name": None,
                         "t1": {
-                            "uc_table_name": None,
                             "file_path": "/d/db1/dbo/t1",
                             "file_type": "parquet",
                             "primary_key": ["id"],
@@ -151,7 +165,6 @@ class TestSave:
         }
         save(str(path), manifest)
         raw = path.read_text()
-        # Avoid indentless style: list items must be indented under primary_key (not "primary_key:\n- id")
         assert "primary_key:\n- " not in raw
         assert "primary_key:" in raw and "  - " in raw
         data = load(str(path))

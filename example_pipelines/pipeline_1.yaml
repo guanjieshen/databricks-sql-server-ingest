@@ -13,6 +13,10 @@ storage:
 
 databases:
   database_1:
-    dbo:
-      table_1: full_incremental
-      table_59: full_incremental
+    uc_catalog: INSERT_CATALOG_NAME_HERE    # Databricks Unity Catalog name (not used by sync)
+    schemas:
+      dbo:
+        uc_schema: INSERT_SCHEMA_NAME_HERE  # Databricks Unity Catalog schema (not used by sync)
+        tables:
+          table_1: full_incremental
+          table_59: full_incremental

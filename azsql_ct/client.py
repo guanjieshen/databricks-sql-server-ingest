@@ -86,6 +86,85 @@ def _load_config_file(path: Union[str, Path]) -> dict:
     return json.loads(text)
 
 
+# Keys at the database level that are metadata, not schema names.
+_DB_META_KEYS = frozenset({"uc_catalog", "schemas"})
+# Keys at the schema level that are metadata, not table names.
+_SCHEMA_META_KEYS = frozenset({"uc_schema", "tables"})
+
+
+def _normalize_table_map(raw: dict) -> dict:
+    """Normalise a ``databases`` dict into the internal table-map format.
+
+    Accepts both the **structured** layout (with ``schemas``/``tables`` keys
+    and optional ``uc_catalog``/``uc_schema`` metadata) and the **legacy**
+    flat layout where database keys map directly to schema dicts.
+
+    Returns ``{db: {schema: {table: mode}}}`` (or list variant) with all
+    metadata keys stripped.
+    """
+    result: dict = {}
+    for db_name, db_value in raw.items():
+        if not isinstance(db_value, dict):
+            result[db_name] = db_value
+            continue
+
+        if "schemas" in db_value:
+            schemas_section = db_value["schemas"]
+            if not isinstance(schemas_section, dict):
+                raise TypeError(
+                    f"'schemas' for database '{db_name}' must be a dict, "
+                    f"got {type(schemas_section).__name__}"
+                )
+            normalised_schemas: dict = {}
+            for schema_name, schema_value in schemas_section.items():
+                if not isinstance(schema_value, dict):
+                    raise TypeError(
+                        f"schema '{schema_name}' in database '{db_name}' "
+                        f"must be a dict, got {type(schema_value).__name__}"
+                    )
+                if "tables" in schema_value:
+                    normalised_schemas[schema_name] = schema_value["tables"]
+                else:
+                    normalised_schemas[schema_name] = {
+                        k: v
+                        for k, v in schema_value.items()
+                        if k not in _SCHEMA_META_KEYS
+                    }
+            result[db_name] = normalised_schemas
+        else:
+            result[db_name] = db_value
+    return result
+
+
+def _extract_uc_metadata(raw: dict) -> Dict[str, Dict[str, Any]]:
+    """Extract Unity Catalog metadata from a raw ``databases`` config dict.
+
+    Returns ``{db: {"uc_catalog": value, "schemas": {schema: uc_schema_value}}}``
+    for databases that use the structured format.  Returns an empty dict for
+    legacy-format configs or databases without UC fields.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    for db_name, db_value in raw.items():
+        if not isinstance(db_value, dict):
+            continue
+        uc_catalog = db_value.get("uc_catalog")
+        schemas_section = db_value.get("schemas")
+        if uc_catalog is None and schemas_section is None:
+            continue
+        schema_map: Dict[str, Any] = {}
+        if isinstance(schemas_section, dict):
+            for schema_name, schema_value in schemas_section.items():
+                if isinstance(schema_value, dict):
+                    uc_schema = schema_value.get("uc_schema")
+                    if uc_schema is not None:
+                        schema_map[schema_name] = uc_schema
+        entry: Dict[str, Any] = {"schemas": schema_map}
+        if uc_catalog is not None:
+            entry["uc_catalog"] = uc_catalog
+        result[db_name] = entry
+    return result
+
+
 def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Convert a flat ``[{"database": ..., "table": ..., "mode": ...}]`` list
     into the nested ``{db: {schema: {table: mode}}}`` format."""
@@ -218,6 +297,7 @@ class ChangeTracker:
         self.snapshot_isolation = snapshot_isolation
         self.output_manifest = output_manifest
         self.ingest_pipeline: Optional[str] = None
+        self._uc_metadata: Dict[str, Dict[str, Any]] = {}
 
         self._table_map: TableMap = {}
         self._flat_tables: List[FlatEntry] = []
@@ -242,9 +322,9 @@ class ChangeTracker:
         Loads ``.env`` automatically and expands ``${VAR}`` references in
         string values.
 
-        Supports two config layouts:
+        Supports three config layouts:
 
-        **Nested (YAML-style):**
+        **Structured (recommended YAML):**
 
         .. code-block:: yaml
 
@@ -252,11 +332,22 @@ class ChangeTracker:
               server: myserver.database.windows.net
               sql_login: sqladmin
               password: ${ADMIN_PASSWORD}
-            storage:          # optional
-              ingest_pipeline: ./ingest_pipeline   # or set data_dir, watermark_dir, output_manifest explicitly
-              data_dir: ./data
-              watermark_dir: ./watermarks
-            max_workers: 8    # optional
+            storage:
+              ingest_pipeline: ./ingest_pipeline
+            max_workers: 8
+            databases:
+              db1:
+                uc_catalog: my_catalog    # informational, not used by sync
+                schemas:
+                  dbo:
+                    uc_schema: my_schema  # informational, not used by sync
+                    tables:
+                      orders: full_incremental
+
+        **Legacy nested (still supported):**
+
+        .. code-block:: yaml
+
             databases:
               db1:
                 dbo:
@@ -300,7 +391,9 @@ class ChangeTracker:
                 conn_cfg.get("sql_login", conn_cfg.get("user", ""))
             )
             password = expand_env(conn_cfg.get("password", ""))
-            table_map = config.get("databases", {})
+            raw_databases = config.get("databases", {})
+            uc_metadata = _extract_uc_metadata(raw_databases)
+            table_map = _normalize_table_map(raw_databases)
             storage = config.get("storage", {})
             base = storage.get("ingest_pipeline")
             if base:
@@ -330,6 +423,8 @@ class ChangeTracker:
         )
         if not is_flat and base:
             ct.ingest_pipeline = base
+        if not is_flat:
+            ct._uc_metadata = uc_metadata
         if table_map:
             ct.tables = table_map
         return ct
@@ -419,7 +514,7 @@ class ChangeTracker:
         try:
             manifest = manifest_load(self.output_manifest)
             file_type = getattr(self.writer, "file_type", "parquet")
-            manifest_merge_add(manifest, results, self.output_dir, file_type)
+            manifest_merge_add(manifest, results, self.output_dir, file_type, uc_metadata=self._uc_metadata)
             if self.ingest_pipeline is not None:
                 manifest["ingest_pipeline"] = self.ingest_pipeline
             manifest_save(self.output_manifest, manifest)

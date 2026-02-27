@@ -385,6 +385,38 @@ class TestFromConfig:
         assert ct.user == "admin"
         assert len(ct._flat_tables) == 2
 
+    def test_loads_structured_format_with_uc_metadata(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {
+                "server": "myserver",
+                "sql_login": "admin",
+                "password": "pw",
+            },
+            "databases": {
+                "db1": {
+                    "uc_catalog": "my_catalog",
+                    "schemas": {
+                        "dbo": {
+                            "uc_schema": "my_schema",
+                            "tables": {
+                                "t1": "full",
+                                "t2": "incremental",
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        assert ct.server == "myserver"
+        assert len(ct._flat_tables) == 2
+        tables = {t[1] for t in ct._flat_tables}
+        assert tables == {"dbo.t1", "dbo.t2"}
+        assert ct._uc_metadata == {
+            "db1": {"uc_catalog": "my_catalog", "schemas": {"dbo": "my_schema"}},
+        }
+
     def test_cli_overrides_take_precedence(self):
         from azsql_ct.client import ChangeTracker
 

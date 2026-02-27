@@ -7,7 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from azsql_ct.client import ChangeTracker, _flatten_table_map, _validate_table_map
+from azsql_ct.client import (
+    ChangeTracker,
+    _extract_uc_metadata,
+    _flatten_table_map,
+    _normalize_table_map,
+    _validate_table_map,
+)
 
 
 # -- helpers / validation ---------------------------------------------------
@@ -95,6 +101,135 @@ class TestValidateTableMap:
     def test_rejects_non_str_table_name_in_dict(self):
         with pytest.raises(TypeError, match="table name must be str"):
             _validate_table_map({"db1": {"dbo": {99: "full"}}})
+
+
+class TestNormalizeTableMap:
+    """Tests for _normalize_table_map -- structured format support."""
+
+    def test_passthrough_legacy_format(self):
+        legacy = {"db1": {"dbo": {"t1": "full", "t2": "incremental"}}}
+        assert _normalize_table_map(legacy) == legacy
+
+    def test_passthrough_legacy_list_format(self):
+        legacy = {"db1": {"dbo": ["t1", "t2"]}}
+        assert _normalize_table_map(legacy) == legacy
+
+    def test_structured_format_with_tables_key(self):
+        raw = {
+            "db1": {
+                "uc_catalog": "my_catalog",
+                "schemas": {
+                    "dbo": {
+                        "uc_schema": "my_schema",
+                        "tables": {"t1": "full", "t2": "incremental"},
+                    }
+                },
+            }
+        }
+        expected = {"db1": {"dbo": {"t1": "full", "t2": "incremental"}}}
+        assert _normalize_table_map(raw) == expected
+
+    def test_structured_format_strips_uc_schema_without_tables_key(self):
+        raw = {
+            "db1": {
+                "schemas": {
+                    "dbo": {
+                        "uc_schema": "my_schema",
+                        "t1": "full",
+                    }
+                },
+            }
+        }
+        expected = {"db1": {"dbo": {"t1": "full"}}}
+        assert _normalize_table_map(raw) == expected
+
+    def test_multiple_schemas(self):
+        raw = {
+            "db1": {
+                "uc_catalog": "cat",
+                "schemas": {
+                    "dbo": {"tables": {"t1": "full"}},
+                    "staging": {"tables": {"t2": "incremental"}},
+                },
+            }
+        }
+        result = _normalize_table_map(raw)
+        assert result == {
+            "db1": {
+                "dbo": {"t1": "full"},
+                "staging": {"t2": "incremental"},
+            }
+        }
+
+    def test_mixed_databases(self):
+        """One database uses structured format, another uses legacy."""
+        raw = {
+            "db1": {
+                "uc_catalog": "cat",
+                "schemas": {"dbo": {"tables": {"t1": "full"}}},
+            },
+            "db2": {"dbo": {"t2": "incremental"}},
+        }
+        result = _normalize_table_map(raw)
+        assert result == {
+            "db1": {"dbo": {"t1": "full"}},
+            "db2": {"dbo": {"t2": "incremental"}},
+        }
+
+    def test_empty_map(self):
+        assert _normalize_table_map({}) == {}
+
+    def test_rejects_non_dict_schemas_section(self):
+        with pytest.raises(TypeError, match="'schemas' for database"):
+            _normalize_table_map({"db1": {"schemas": "bad"}})
+
+    def test_rejects_non_dict_schema_value(self):
+        with pytest.raises(TypeError, match="schema 'dbo' in database"):
+            _normalize_table_map({"db1": {"schemas": {"dbo": "bad"}}})
+
+
+class TestExtractUcMetadata:
+    """Tests for _extract_uc_metadata -- UC field extraction."""
+
+    def test_extracts_catalog_and_schema(self):
+        raw = {
+            "db1": {
+                "uc_catalog": "my_catalog",
+                "schemas": {
+                    "dbo": {"uc_schema": "my_schema", "tables": {"t1": "full"}},
+                },
+            },
+        }
+        result = _extract_uc_metadata(raw)
+        assert result == {
+            "db1": {"uc_catalog": "my_catalog", "schemas": {"dbo": "my_schema"}},
+        }
+
+    def test_empty_for_legacy_format(self):
+        raw = {"db1": {"dbo": {"t1": "full"}}}
+        assert _extract_uc_metadata(raw) == {}
+
+    def test_empty_dict(self):
+        assert _extract_uc_metadata({}) == {}
+
+    def test_catalog_only_no_schemas(self):
+        raw = {"db1": {"uc_catalog": "cat", "dbo": {"t1": "full"}}}
+        result = _extract_uc_metadata(raw)
+        assert result == {"db1": {"uc_catalog": "cat", "schemas": {}}}
+
+    def test_multiple_databases(self):
+        raw = {
+            "db1": {
+                "uc_catalog": "cat1",
+                "schemas": {"dbo": {"uc_schema": "s1", "tables": {"t": "full"}}},
+            },
+            "db2": {"dbo": {"t": "full"}},
+        }
+        result = _extract_uc_metadata(raw)
+        assert "db1" in result
+        assert "db2" not in result
+        assert result["db1"]["uc_catalog"] == "cat1"
+        assert result["db1"]["schemas"]["dbo"] == "s1"
 
 
 # -- ChangeTracker ----------------------------------------------------------
@@ -659,3 +794,42 @@ class TestOutputManifest:
         manifest = load(str(manifest_path))
         assert manifest.get("ingest_pipeline") == base
         assert "databases" in manifest
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_uc_metadata_propagated_to_manifest(self, MockAz, mock_sync, tmp_path):
+        from azsql_ct.output_manifest import load
+
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {
+            "database": "db1",
+            "table": "dbo.orders",
+            "mode": "full",
+            "rows_written": 10,
+        }
+
+        base = str(tmp_path / "pipeline")
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "srv", "sql_login": "u", "password": "p"},
+            "storage": {"ingest_pipeline": base},
+            "databases": {
+                "db1": {
+                    "uc_catalog": "gshen_catalog",
+                    "schemas": {
+                        "dbo": {
+                            "uc_schema": "my_schema",
+                            "tables": {"orders": "full"},
+                        },
+                    },
+                },
+            },
+        })
+        ct.sync()
+
+        manifest_path = tmp_path / "pipeline" / "output.yaml"
+        assert manifest_path.exists()
+        manifest = load(str(manifest_path))
+        assert manifest["databases"]["db1"]["uc_catalog_name"] == "gshen_catalog"
+        assert manifest["databases"]["db1"]["dbo"]["uc_schema_name"] == "my_schema"
+        assert "uc_table_name" not in manifest["databases"]["db1"]["dbo"]["orders"]

@@ -13,3 +13,4 @@ htmlcov/
 .coverage
 .DS_Store
 pipelines/
+pipeline_1/
