@@ -1,9 +1,0 @@
-{
-  "server": "your-server.database.windows.net",
-  "user": "sqladmin",
-  "password": "${ADMIN_PASSWORD}",
-  "tables": [
-    {"database": "database_1", "table": "dbo.table_1", "mode": "incremental"},
-    {"database": "database_1", "table": "dbo.table_2", "mode": "full"}
-  ]
-}
