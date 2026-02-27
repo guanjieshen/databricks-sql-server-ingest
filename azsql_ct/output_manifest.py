@@ -117,7 +117,11 @@ def merge_add(
         if table in schema_node:
             continue
         primary_key = result.get("primary_key")
-        schema_node[table] = _table_entry(file_path, file_type, primary_key=primary_key, uc_table_name=table)
+        scd_type = result.get("scd_type")
+        schema_node[table] = _table_entry(
+            file_path, file_type, primary_key=primary_key,
+            uc_table_name=table, scd_type=scd_type,
+        )
 
 
 def _table_entry(
@@ -125,13 +129,16 @@ def _table_entry(
     file_type: str,
     primary_key: Optional[List[str]] = None,
     uc_table_name: Optional[str] = None,
+    scd_type: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Build table node with file_path, file_type, and optional primary_key."""
+    """Build table node with file_path, file_type, scd_type, and optional primary_key."""
     entry: Dict[str, Any] = {
         "uc_table_name": uc_table_name,
         "file_path": file_path,
         "file_type": file_type,
     }
+    if scd_type is not None:
+        entry["scd_type"] = scd_type
     if primary_key is not None:
         entry["primary_key"] = primary_key
     return entry

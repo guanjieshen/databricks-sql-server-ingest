@@ -23,27 +23,41 @@ class TestFlattenTableMap:
     def test_list_format(self):
         m = {"db1": {"dbo": ["t1", "t2"]}}
         assert _flatten_table_map(m) == [
-            ("db1", "dbo.t1", None),
-            ("db1", "dbo.t2", None),
+            ("db1", "dbo.t1", None, 1),
+            ("db1", "dbo.t2", None, 1),
         ]
 
     def test_dict_format(self):
         m = {"db1": {"dbo": {"t1": "full", "t2": "incremental"}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", "full") in flat
-        assert ("db1", "dbo.t2", "incremental") in flat
+        assert ("db1", "dbo.t1", "full", 1) in flat
+        assert ("db1", "dbo.t2", "incremental", 1) in flat
+
+    def test_dict_format_with_scd_type(self):
+        m = {"db1": {"dbo": {
+            "t1": {"mode": "full_incremental", "scd_type": 2},
+            "t2": "full",
+        }}}
+        flat = _flatten_table_map(m)
+        assert ("db1", "dbo.t1", "full_incremental", 2) in flat
+        assert ("db1", "dbo.t2", "full", 1) in flat
+
+    def test_dict_format_scd_type_defaults_to_1(self):
+        m = {"db1": {"dbo": {"t1": {"mode": "full"}}}}
+        flat = _flatten_table_map(m)
+        assert ("db1", "dbo.t1", "full", 1) in flat
 
     def test_multiple_dbs(self):
         m = {"db1": {"dbo": ["a"]}, "db2": {"sales": {"b": "full"}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.a", None) in flat
-        assert ("db2", "sales.b", "full") in flat
+        assert ("db1", "dbo.a", None, 1) in flat
+        assert ("db2", "sales.b", "full", 1) in flat
 
     def test_multiple_schemas(self):
         m = {"db1": {"dbo": ["t1"], "staging": {"t2": "full"}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", None) in flat
-        assert ("db1", "staging.t2", "full") in flat
+        assert ("db1", "dbo.t1", None, 1) in flat
+        assert ("db1", "staging.t2", "full", 1) in flat
 
     def test_empty_map(self):
         assert _flatten_table_map({}) == []
@@ -97,6 +111,26 @@ class TestValidateTableMap:
     def test_accepts_full_incremental_mode(self):
         m = {"db1": {"dbo": {"t1": "full_incremental"}}}
         assert _validate_table_map(m) == m
+
+    def test_accepts_dict_table_config_with_scd_type(self):
+        m = {"db1": {"dbo": {"t1": {"mode": "full_incremental", "scd_type": 2}}}}
+        assert _validate_table_map(m) == m
+
+    def test_accepts_dict_table_config_without_scd_type(self):
+        m = {"db1": {"dbo": {"t1": {"mode": "full"}}}}
+        assert _validate_table_map(m) == m
+
+    def test_rejects_dict_table_config_invalid_mode(self):
+        with pytest.raises(ValueError, match="must be one of"):
+            _validate_table_map({"db1": {"dbo": {"t1": {"mode": "snapshot"}}}})
+
+    def test_rejects_dict_table_config_invalid_scd_type(self):
+        with pytest.raises(ValueError, match="scd_type"):
+            _validate_table_map({"db1": {"dbo": {"t1": {"mode": "full", "scd_type": 3}}}})
+
+    def test_rejects_non_str_non_dict_table_config(self):
+        with pytest.raises(TypeError, match="table config for"):
+            _validate_table_map({"db1": {"dbo": {"t1": 42}}})
 
     def test_rejects_non_str_table_name_in_dict(self):
         with pytest.raises(TypeError, match="table name must be str"):
@@ -351,6 +385,29 @@ class TestSync:
         ct.sync()
 
         assert mock_sync.call_args.kwargs["mode"] == "full_incremental"
+        assert mock_sync.call_args.kwargs["scd_type"] == 1
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_passes_scd_type_to_sync_table(self, MockAz, mock_sync):
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {"ok": True}
+
+        ct = ChangeTracker("srv", "usr", "pw")
+        ct.tables = {"db1": {"dbo": {
+            "t1": {"mode": "full_incremental", "scd_type": 2},
+            "t2": "full",
+        }}}
+        ct.sync()
+
+        assert mock_sync.call_count == 2
+        scd_types = {
+            call.args[1]: call.kwargs["scd_type"]
+            for call in mock_sync.call_args_list
+        }
+        assert scd_types["dbo.t1"] == 2
+        assert scd_types["dbo.t2"] == 1
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")

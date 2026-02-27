@@ -125,6 +125,35 @@ class TestMergeAdd:
         assert tbl["primary_key"] == ["id"]
         assert tbl["file_path"] == "/data/db1/dbo/orders"
 
+    def test_adds_scd_type_when_in_result(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [
+                {
+                    "database": "db1",
+                    "table": "dbo.orders",
+                    "rows_written": 10,
+                    "scd_type": 2,
+                },
+            ],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["scd_type"] == 2
+
+    def test_scd_type_omitted_when_not_in_result(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 10}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "scd_type" not in tbl
+
 
 class TestSave:
     def test_writes_yaml(self, tmp_path):

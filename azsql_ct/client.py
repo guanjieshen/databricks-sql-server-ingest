@@ -22,6 +22,17 @@
     }
     ct.sync()
 
+    # Dict format with SCD type per table:
+    ct.tables = {
+        "database_1": {
+            "dbo": {
+                "table_1": {"mode": "full_incremental", "scd_type": 1},
+                "table_2": {"mode": "full_incremental", "scd_type": 2},
+            }
+        }
+    }
+    ct.sync()
+
     # Parallel sync (4 tables at a time):
     ct = ChangeTracker("server", "user", "pw", max_workers=4)
     ct.tables = {"db1": {"dbo": [f"table_{i}" for i in range(1, 101)]}}
@@ -46,7 +57,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
-from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
+from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES, VALID_SCD_TYPES
 from .connection import AzureSQLConnection, load_dotenv
 from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
@@ -181,25 +192,31 @@ def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[st
     return result
 
 
-TableSpec = Union[List[str], Dict[str, str]]
+TableSpec = Union[List[str], Dict[str, Any]]
 TableMap = Dict[str, Dict[str, TableSpec]]
-FlatEntry = Tuple[str, str, Optional[str]]
+FlatEntry = Tuple[str, str, Optional[str], int]
 
 
 def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
-    """Convert a table map to ``[(db, "schema.table", mode_or_none), ...]``.
+    """Convert a table map to ``[(db, "schema.table", mode_or_none, scd_type), ...]``.
 
     *mode_or_none* is ``None`` for list-format entries (no per-table mode).
+    *scd_type* defaults to ``DEFAULT_SCD_TYPE`` (1) when not specified.
     """
     entries: List[FlatEntry] = []
     for database, schemas in table_map.items():
         for schema, tables in schemas.items():
             if isinstance(tables, dict):
-                for table, mode in tables.items():
-                    entries.append((database, f"{schema}.{table}", mode))
+                for table, tbl_cfg in tables.items():
+                    if isinstance(tbl_cfg, dict):
+                        mode = tbl_cfg.get("mode")
+                        scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
+                        entries.append((database, f"{schema}.{table}", mode, scd_type))
+                    else:
+                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE))
             else:
                 for table in tables:
-                    entries.append((database, f"{schema}.{table}", None))
+                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE))
     return entries
 
 
@@ -225,15 +242,34 @@ def _validate_table_map(value: object) -> TableMap:
                     raise ValueError(
                         f"table dict for '{db}'.'{schema}' must not be empty"
                     )
-                for tbl, mode in tables.items():
+                for tbl, tbl_cfg in tables.items():
                     if not isinstance(tbl, str):
                         raise TypeError(
                             f"table name must be str, got {type(tbl).__name__}"
                         )
-                    if mode not in VALID_MODES:
-                        raise ValueError(
-                            f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
-                            f"of {sorted(VALID_MODES)}, got {mode!r}"
+                    if isinstance(tbl_cfg, str):
+                        if tbl_cfg not in VALID_MODES:
+                            raise ValueError(
+                                f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
+                                f"of {sorted(VALID_MODES)}, got {tbl_cfg!r}"
+                            )
+                    elif isinstance(tbl_cfg, dict):
+                        mode = tbl_cfg.get("mode")
+                        if mode not in VALID_MODES:
+                            raise ValueError(
+                                f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
+                                f"of {sorted(VALID_MODES)}, got {mode!r}"
+                            )
+                        scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
+                        if scd_type not in VALID_SCD_TYPES:
+                            raise ValueError(
+                                f"scd_type for '{db}'.'{schema}'.'{tbl}' must be one "
+                                f"of {sorted(VALID_SCD_TYPES)}, got {scd_type!r}"
+                            )
+                    else:
+                        raise TypeError(
+                            f"table config for '{db}'.'{schema}'.'{tbl}' must be "
+                            f"a mode string or a dict, got {type(tbl_cfg).__name__}"
                         )
             elif isinstance(tables, list):
                 if not tables:
@@ -540,7 +576,7 @@ class ChangeTracker:
         results: List[dict] = []
 
         try:
-            for database, full_table_name, table_mode in self._flat_tables:
+            for database, full_table_name, table_mode, scd_type in self._flat_tables:
                 if database not in conns:
                     try:
                         az = AzureSQLConnection(
@@ -568,6 +604,7 @@ class ChangeTracker:
                             writer=self.writer,
                             batch_size=self.batch_size,
                             snapshot_isolation=self.snapshot_isolation,
+                            scd_type=scd_type,
                         )
                     )
                 except Exception as exc:
@@ -584,7 +621,7 @@ class ChangeTracker:
     # -- parallel (max_workers>1) -------------------------------------------
 
     def _sync_one_table(
-        self, database: str, full_table_name: str, mode: str,
+        self, database: str, full_table_name: str, mode: str, scd_type: int,
     ) -> dict:
         """Sync a single table with its own connection. Thread-safe."""
         try:
@@ -608,6 +645,7 @@ class ChangeTracker:
                 writer=self.writer,
                 batch_size=self.batch_size,
                 snapshot_isolation=self.snapshot_isolation,
+                scd_type=scd_type,
             )
         except Exception as exc:
             logger.error("Failed to sync %s.%s: %s", database, full_table_name, exc)
@@ -618,20 +656,19 @@ class ChangeTracker:
     def _run_sync_parallel(self, mode_override: Optional[str]) -> List[dict]:
         logger.info("Parallel sync with max_workers=%d", self.max_workers)
 
-        # Build (database, table, mode) work items preserving input order
-        work: List[Tuple[int, str, str, str]] = []
-        for idx, (database, full_table_name, table_mode) in enumerate(
+        work: List[Tuple[int, str, str, str, int]] = []
+        for idx, (database, full_table_name, table_mode, scd_type) in enumerate(
             self._flat_tables
         ):
             mode = mode_override or table_mode or "full_incremental"
-            work.append((idx, database, full_table_name, mode))
+            work.append((idx, database, full_table_name, mode, scd_type))
 
         results: List[Optional[dict]] = [None] * len(work)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             future_to_idx = {
-                pool.submit(self._sync_one_table, db, tbl, mode): idx
-                for idx, db, tbl, mode in work
+                pool.submit(self._sync_one_table, db, tbl, mode, scd): idx
+                for idx, db, tbl, mode, scd in work
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]

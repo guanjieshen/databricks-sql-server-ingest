@@ -115,7 +115,26 @@ class TestSyncTable:
         assert result["mode"] == "full"
         assert result["rows_written"] == 2
         assert result["current_version"] == 100
+        assert result["scd_type"] == 1
         assert len(writer.calls) == 1
+
+    def test_scd_type_passed_through_to_result(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"],
+            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full", writer=StubWriter(), scd_type=2,
+        )
+        assert result["scd_type"] == 2
 
     def test_raises_for_untracked_table(self, tmp_path):
         cursor = _make_cursor(
@@ -506,3 +525,28 @@ class TestFromConfig:
         assert ct.output_dir == "/custom/data"
         assert ct.watermark_dir == "/some/base/watermarks"
         assert ct.output_manifest == "/some/base/output.yaml"
+
+    def test_structured_config_with_scd_type(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {
+                "db1": {
+                    "schemas": {
+                        "dbo": {
+                            "tables": {
+                                "t1": {"mode": "full_incremental", "scd_type": 2},
+                                "t2": "full",
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        assert len(ct._flat_tables) == 2
+        by_table = {t[1]: t for t in ct._flat_tables}
+        assert by_table["dbo.t1"][2] == "full_incremental"
+        assert by_table["dbo.t1"][3] == 2
+        assert by_table["dbo.t2"][2] == "full"
+        assert by_table["dbo.t2"][3] == 1
