@@ -154,6 +154,40 @@ class TestMergeAdd:
         tbl = manifest["databases"]["db1"]["dbo"]["orders"]
         assert "scd_type" not in tbl
 
+    def test_skips_table_with_zero_rows_written(self):
+        manifest = {"databases": {}}
+        results = [
+            {"database": "db1", "table": "dbo.empty_table", "rows_written": 0, "files": []},
+        ]
+        merge_add(manifest, results, "/data", "parquet")
+        assert manifest["databases"] == {}
+
+    def test_skips_table_with_empty_files_list(self):
+        manifest = {"databases": {}}
+        results = [
+            {"database": "db1", "table": "dbo.empty_table", "files": []},
+        ]
+        merge_add(manifest, results, "/data", "parquet")
+        assert manifest["databases"] == {}
+
+    def test_skips_table_with_rows_written_zero_no_files_key(self):
+        manifest = {"databases": {}}
+        results = [
+            {"database": "db1", "table": "dbo.empty_table", "rows_written": 0},
+        ]
+        merge_add(manifest, results, "/data", "parquet")
+        assert manifest["databases"] == {}
+
+    def test_only_empty_table_excluded_from_mixed_results(self):
+        manifest = {"databases": {}}
+        results = [
+            {"database": "db1", "table": "dbo.orders", "rows_written": 10, "files": ["/data/db1/dbo/orders/f1.parquet"]},
+            {"database": "db1", "table": "dbo.empty_table", "rows_written": 0, "files": []},
+        ]
+        merge_add(manifest, results, "/data", "parquet")
+        assert "orders" in manifest["databases"]["db1"]["dbo"]
+        assert "empty_table" not in manifest["databases"]["db1"]["dbo"]
+
 
 class TestSave:
     def test_writes_yaml(self, tmp_path):
