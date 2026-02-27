@@ -1,7 +1,7 @@
 connection:
   server: guanjiesqldb.database.windows.net
   sql_login: sqladmin
-  password: ${ADMIN_PASSWORD}
+  password: example_password
 
 
 # Number of tables to sync in parallel (default: 1 = sequential).
