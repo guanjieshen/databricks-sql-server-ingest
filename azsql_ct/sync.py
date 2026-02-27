@@ -17,6 +17,8 @@ mirroring the data directory structure but in a separate root.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import glob
 import logging
 import os
@@ -30,6 +32,42 @@ from .writer import OutputWriter, ParquetWriter
 logger = logging.getLogger(__name__)
 
 _DEFAULT_WRITER: OutputWriter = ParquetWriter()
+_LOCK_FILENAME = ".sync.lock"
+
+
+class _TableLock:
+    """Per-table advisory file lock to prevent concurrent syncs.
+
+    Uses ``fcntl.flock`` (POSIX) with ``LOCK_EX | LOCK_NB`` so a second
+    process attempting to sync the same table will fail fast rather than
+    block indefinitely.
+    """
+
+    def __init__(self, lock_dir: str) -> None:
+        os.makedirs(lock_dir, exist_ok=True)
+        self._path = os.path.join(lock_dir, _LOCK_FILENAME)
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "_TableLock":
+        self._fd = os.open(self._path, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(self._fd)
+            self._fd = None
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise RuntimeError(
+                    f"Another sync is already running for this table "
+                    f"(lock file: {self._path})"
+                ) from exc
+            raise
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
 
 
 def _iter_cursor(
@@ -52,18 +90,39 @@ def _sub_dir(root: str, database: str, full_table_name: str) -> str:
     return d
 
 
-def _clear_data_files(data_dir: str) -> int:
-    """Remove all writer-produced files from *data_dir*.
+def _clear_data_files(data_dir: str, *, keep: Optional[set] = None) -> int:
+    """Remove writer-produced files from *data_dir*, skipping *keep*.
 
     Returns the number of files deleted.
     """
+    keep = keep or set()
     removed = 0
     for path in glob.glob(os.path.join(data_dir, "*")):
-        if os.path.isfile(path):
+        if os.path.isfile(path) and path not in keep:
             os.remove(path)
             removed += 1
     if removed:
         logger.info("Cleared %d existing file(s) from %s", removed, data_dir)
+    return removed
+
+
+_TEMP_SUFFIX = ".tmp"
+
+
+def _clean_temp_files(data_dir: str) -> int:
+    """Remove leftover temp files from a previous crashed write.
+
+    Returns the number of files cleaned up.
+    """
+    removed = 0
+    for path in glob.glob(os.path.join(data_dir, f"*{_TEMP_SUFFIX}")):
+        if os.path.isfile(path):
+            os.remove(path)
+            removed += 1
+    if removed:
+        logger.info(
+            "Cleaned up %d orphaned temp file(s) from %s", removed, data_dir,
+        )
     return removed
 
 
@@ -76,20 +135,25 @@ def sync_table(
     mode: str = "full_incremental",
     writer: Optional[OutputWriter] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    snapshot_isolation: bool = False,
 ) -> dict:
     """Sync one change-tracked table.
 
     Args:
-        conn:          Open DB-API connection to the target *database*.
-        table_name:    Fully-qualified table name (e.g. ``dbo.table_1``).
-        database:      Database name (used for directory layout).
-        output_dir:    Root directory for data files.
-        watermark_dir: Root directory for watermark files (mirrors data layout).
-        mode:          ``"full_incremental"`` (default), ``"full"``, or
-                       ``"incremental"``.
-        writer:        An ``OutputWriter`` instance; defaults to ``CsvWriter()``.
-        batch_size:    Number of rows fetched from the database at a time
-                       (default ``10_000``).  Controls peak memory usage.
+        conn:               Open DB-API connection to the target *database*.
+        table_name:         Fully-qualified table name (e.g. ``dbo.table_1``).
+        database:           Database name (used for directory layout).
+        output_dir:         Root directory for data files.
+        watermark_dir:      Root directory for watermark files (mirrors data layout).
+        mode:               ``"full_incremental"`` (default), ``"full"``, or
+                            ``"incremental"``.
+        writer:             An ``OutputWriter`` instance; defaults to ``ParquetWriter()``.
+        batch_size:         Number of rows fetched from the database at a time
+                            (default ``10_000``).  Controls peak memory usage.
+        snapshot_isolation: If ``True``, execute the data query under
+                            ``SNAPSHOT`` isolation for point-in-time
+                            consistent reads.  Requires the database to have
+                            ``ALLOW_SNAPSHOT_ISOLATION ON``.
 
     Returns:
         Summary dict.
@@ -114,6 +178,27 @@ def sync_table(
     data_dir = _sub_dir(output_dir, database, full_name)
     wm_dir = _sub_dir(watermark_dir, database, full_name)
 
+    with _TableLock(wm_dir):
+        return _sync_table_locked(
+            cur, full_name, database, data_dir, wm_dir,
+            mode=mode, writer=writer, batch_size=batch_size,
+            snapshot_isolation=snapshot_isolation,
+        )
+
+
+def _sync_table_locked(
+    cur: Any,
+    full_name: str,
+    database: str,
+    data_dir: str,
+    wm_dir: str,
+    *,
+    mode: str,
+    writer: OutputWriter,
+    batch_size: int,
+    snapshot_isolation: bool = False,
+) -> dict:
+    """Inner sync logic, called while holding the per-table lock."""
     cur_ver = queries.current_version(cur)
     min_ver = queries.min_valid_version_for_table(cur, full_name)
     since = watermark.get(wm_dir, full_name)
@@ -128,14 +213,19 @@ def sync_table(
         )
 
     if mode in ("incremental", "full_incremental") and not is_initial and since < min_ver:
-        raise RuntimeError(
-            f"Watermark ({since}) for {database}.{full_name} is older than the "
-            f"minimum valid version ({min_ver}). Use mode='full' or reset the watermark."
+        logger.warning(
+            "Watermark (%d) for %s.%s is older than min valid version (%d); "
+            "falling back to full sync.",
+            since, database, full_name, min_ver,
         )
+        mode = "full"
 
     t0 = time.monotonic()
 
     do_full = mode == "full" or (mode == "full_incremental" and is_initial)
+
+    if snapshot_isolation:
+        cur.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
 
     if do_full:
         logger.info("Full sync for %s.%s (version %d)", database, full_name, cur_ver)
@@ -157,13 +247,15 @@ def sync_table(
         cur.execute(sql, (since,))
         actual_mode = "incremental"
 
-    if do_full:
-        _clear_data_files(data_dir)
+    _clean_temp_files(data_dir)
 
     description = cur.description
     safe_name = full_name.replace(".", "_")
     row_iter = _iter_cursor(cur, batch_size)
     output_files, row_count = writer.write(row_iter, description, data_dir, safe_name)
+
+    if do_full:
+        _clear_data_files(data_dir, keep=set(output_files))
 
     elapsed = time.monotonic() - t0
     since_ver = since if actual_mode == "incremental" else None

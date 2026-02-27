@@ -12,9 +12,13 @@ transparently and upgraded on the next write.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 _FILENAME = "watermarks.json"
 _HISTORY_FILENAME = "sync_history.jsonl"
@@ -100,6 +104,27 @@ def load_history(output_dir: str) -> List[dict]:
 # ── write ────────────────────────────────────────────────────────────────────
 
 
+def _atomic_write(target: str, data: bytes) -> None:
+    """Write *data* to *target* atomically via a temp file + ``os.replace``."""
+    dir_name = os.path.dirname(target)
+    fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    closed = False
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        closed = True
+        os.replace(tmp, target)
+    except BaseException:
+        if not closed:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save(
     output_dir: str,
     table_name: str,
@@ -111,7 +136,12 @@ def save(
     files: Optional[List[str]] = None,
     duration_seconds: Optional[float] = None,
 ) -> None:
-    """Persist watermark metadata for *table_name* and append to history."""
+    """Persist watermark metadata for *table_name* and append to history.
+
+    Both the main watermark file and the history file are written
+    atomically (temp file + ``os.replace``) so a crash mid-write
+    cannot corrupt the existing state.
+    """
     entry = _build_entry(
         table_name, version,
         since_version=since_version,
@@ -126,17 +156,13 @@ def save(
     data = load_all(output_dir)
     watermark_entry = {k: v for k, v in entry.items() if k != "table"}
     data[table_name] = watermark_entry
-    p = _path(output_dir)
-    with open(p, "wb") as f:
-        f.write(json.dumps(data, indent=2).encode("utf-8"))
-        f.write(b"\n")
+    payload = json.dumps(data, indent=2).encode("utf-8") + b"\n"
+    _atomic_write(_path(output_dir), payload)
 
     hp = _history_path(output_dir)
     existing = b""
     if os.path.isfile(hp):
         with open(hp, "rb") as f:
             existing = f.read()
-    with open(hp, "wb") as f:
-        f.write(existing)
-        f.write(json.dumps(entry).encode("utf-8"))
-        f.write(b"\n")
+    history_payload = existing + json.dumps(entry).encode("utf-8") + b"\n"
+    _atomic_write(hp, history_payload)

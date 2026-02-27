@@ -190,6 +190,7 @@ class ChangeTracker:
         writer: Optional[OutputWriter] = None,
         max_workers: int = 1,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        snapshot_isolation: bool = False,
     ) -> None:
         self.server = server
         self.user = user
@@ -199,6 +200,7 @@ class ChangeTracker:
         self.writer: OutputWriter = writer or ParquetWriter()
         self.max_workers = max(1, max_workers)
         self.batch_size = batch_size
+        self.snapshot_isolation = snapshot_isolation
 
         self._table_map: TableMap = {}
         self._flat_tables: List[FlatEntry] = []
@@ -214,6 +216,7 @@ class ChangeTracker:
         output_dir: Optional[str] = None,
         watermark_dir: Optional[str] = None,
         batch_size: Optional[int] = None,
+        snapshot_isolation: Optional[bool] = None,
     ) -> "ChangeTracker":
         """Create a fully configured ``ChangeTracker`` from a config file or dict.
 
@@ -268,6 +271,7 @@ class ChangeTracker:
             cfg_output = config.get("output_dir")
             cfg_watermark = config.get("watermark_dir")
             cfg_workers = config.get("max_workers")
+            cfg_snapshot = config.get("snapshot_isolation")
         else:
             conn_cfg = config.get("connection", {})
             server = expand_env(conn_cfg.get("server", ""))
@@ -280,6 +284,7 @@ class ChangeTracker:
             cfg_output = storage.get("data_dir")
             cfg_watermark = storage.get("watermark_dir")
             cfg_workers = config.get("max_workers")
+            cfg_snapshot = config.get("snapshot_isolation")
 
         ct = cls(
             server=server,
@@ -289,6 +294,10 @@ class ChangeTracker:
             watermark_dir=watermark_dir or cfg_watermark or "./watermarks",
             max_workers=max_workers if max_workers is not None else (cfg_workers or 1),
             batch_size=batch_size if batch_size is not None else DEFAULT_BATCH_SIZE,
+            snapshot_isolation=(
+                snapshot_isolation if snapshot_isolation is not None
+                else bool(cfg_snapshot)
+            ),
         )
         if table_map:
             ct.tables = table_map
@@ -412,6 +421,7 @@ class ChangeTracker:
                             mode=mode,
                             writer=self.writer,
                             batch_size=self.batch_size,
+                            snapshot_isolation=self.snapshot_isolation,
                         )
                     )
                 except Exception as exc:
@@ -451,6 +461,7 @@ class ChangeTracker:
                 mode=mode,
                 writer=self.writer,
                 batch_size=self.batch_size,
+                snapshot_isolation=self.snapshot_isolation,
             )
         except Exception as exc:
             logger.error("Failed to sync %s.%s: %s", database, full_table_name, exc)

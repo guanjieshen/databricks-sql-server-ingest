@@ -156,29 +156,36 @@ class TestSyncTable:
         wm_dir = tmp_path / "wm" / "db1" / "dbo" / "T"
         assert watermark.get(str(wm_dir), "dbo.T") == 55
 
-    def test_stale_watermark_raises(self, tmp_path):
+    def test_stale_watermark_falls_back_to_full(self, tmp_path):
+        """When watermark is below min_valid_version, auto-fallback to full sync."""
         wm_dir = tmp_path / "wm" / "db1" / "dbo" / "T"
         wm_dir.mkdir(parents=True)
         watermark.save(str(wm_dir), "dbo.T", 5)
 
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
         cursor = _make_cursor(
             tracked=["dbo.T"],
             cur_ver=100,
             min_ver=50,
             pk_cols=None,
-            rows=[],
-            desc=None,
+            rows=rows,
+            desc=desc,
         )
         conn = MagicMock()
         conn.cursor.return_value = cursor
 
-        with pytest.raises(RuntimeError, match="older than the minimum valid version"):
-            sync_table(
-                conn, "dbo.T", database="db1",
-                output_dir=str(tmp_path / "data"),
-                watermark_dir=str(tmp_path / "wm"),
-                mode="incremental",
-            )
+        writer = StubWriter()
+        result = sync_table(
+            conn, "dbo.T", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="incremental",
+            writer=writer,
+        )
+
+        assert result["mode"] == "full"
+        assert result["current_version"] == 100
 
     def test_incremental_sync_uses_changetable(self, tmp_path):
         wm_dir = tmp_path / "wm" / "db1" / "dbo" / "T"
