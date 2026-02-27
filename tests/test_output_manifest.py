@@ -129,3 +129,30 @@ class TestSave:
         assert path.exists()
         data = load(str(path))
         assert data["databases"]["db1"]["dbo"]["t1"]["file_type"] == "parquet"
+
+    def test_primary_key_list_is_indented_under_key(self, tmp_path):
+        """List values (e.g. primary_key) are indented under their key for consistent YAML formatting."""
+        path = tmp_path / "out.yaml"
+        manifest = {
+            "databases": {
+                "db1": {
+                    "uc_catalog_name": None,
+                    "dbo": {
+                        "uc_schema_name": None,
+                        "t1": {
+                            "uc_table_name": None,
+                            "file_path": "/d/db1/dbo/t1",
+                            "file_type": "parquet",
+                            "primary_key": ["id"],
+                        },
+                    },
+                },
+            },
+        }
+        save(str(path), manifest)
+        raw = path.read_text()
+        # Avoid indentless style: list items must be indented under primary_key (not "primary_key:\n- id")
+        assert "primary_key:\n- " not in raw
+        assert "primary_key:" in raw and "  - " in raw
+        data = load(str(path))
+        assert data["databases"]["db1"]["dbo"]["t1"]["primary_key"] == ["id"]

@@ -136,6 +136,21 @@ def save(path: str, manifest: Dict[str, Any]) -> None:
             "PyYAML is required for output manifest. "
             "Install it with: pip install azsql_ct[yaml]"
         )
+
+    class _IndentedDumper(yaml.SafeDumper):
+        pass
+
+    def _indented_increase_indent(self, flow=False, indentless=False):
+        return yaml.SafeDumper.increase_indent(self, flow, False)
+
+    _IndentedDumper.increase_indent = _indented_increase_indent
+
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w") as f:
-        yaml.safe_dump(manifest, f, default_flow_style=False, sort_keys=False)
+        yaml.dump(
+            manifest,
+            f,
+            Dumper=_IndentedDumper,
+            default_flow_style=False,
+            sort_keys=False,
+        )

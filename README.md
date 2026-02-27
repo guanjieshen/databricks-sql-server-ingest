@@ -53,9 +53,7 @@ connection:
   password: ${ADMIN_PASSWORD}
 
 storage:
-  data_dir: ./data
-  watermark_dir: ./watermarks
-  output_manifest: ./output.yaml   # optional: record where files are written; uc_* fields left blank for you to fill (updated only when new tables are added)
+  ingest_pipeline: ./ingest_pipeline   # data, watermarks, and output manifest go under this dir; or set data_dir, watermark_dir, output_manifest explicitly to override
 
 # Tables to sync in parallel (optional; also supports key "max_workers")
 parallelism: 8
@@ -68,7 +66,7 @@ databases:
       audit_log: incremental
 ```
 
-When `output_manifest` is set under `storage`, sync updates that YAML file with the path and type of each table's output. Fields `uc_catalog_name`, `uc_schema_name`, and `uc_table_name` are left blank for you to fill (e.g. for Unity Catalog). The manifest is updated only when new databases, schemas, or tables are added; existing entries are never overwritten.
+When using `ingest_pipeline`, the manifest is written to `{ingest_pipeline}/output.yaml`. When `output_manifest` is set under `storage` (or derived from `ingest_pipeline`), sync updates that YAML file with the path and type of each table's output. Fields `uc_catalog_name`, `uc_schema_name`, and `uc_table_name` are left blank for you to fill (e.g. for Unity Catalog). The manifest is updated only when new databases, schemas, or tables are added; existing entries are never overwritten.
 
 **JSON** is also supported (see `sync_config.json`).
 

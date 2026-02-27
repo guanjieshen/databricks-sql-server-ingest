@@ -217,6 +217,7 @@ class ChangeTracker:
         self.batch_size = batch_size
         self.snapshot_isolation = snapshot_isolation
         self.output_manifest = output_manifest
+        self.ingest_pipeline: Optional[str] = None
 
         self._table_map: TableMap = {}
         self._flat_tables: List[FlatEntry] = []
@@ -252,6 +253,7 @@ class ChangeTracker:
               sql_login: sqladmin
               password: ${ADMIN_PASSWORD}
             storage:          # optional
+              ingest_pipeline: ./ingest_pipeline   # or set data_dir, watermark_dir, output_manifest explicitly
               data_dir: ./data
               watermark_dir: ./watermarks
             max_workers: 8    # optional
@@ -279,6 +281,7 @@ class ChangeTracker:
             config = _load_config_file(config)
 
         is_flat = "tables" in config and isinstance(config.get("tables"), list)
+        base: Optional[str] = None
 
         if is_flat:
             server = expand_env(config.get("server", ""))
@@ -299,9 +302,15 @@ class ChangeTracker:
             password = expand_env(conn_cfg.get("password", ""))
             table_map = config.get("databases", {})
             storage = config.get("storage", {})
-            cfg_output = storage.get("data_dir")
-            cfg_watermark = storage.get("watermark_dir")
-            cfg_manifest = storage.get("output_manifest")
+            base = storage.get("ingest_pipeline")
+            if base:
+                cfg_output = storage.get("data_dir") or os.path.join(base, "data")
+                cfg_watermark = storage.get("watermark_dir") or os.path.join(base, "watermarks")
+                cfg_manifest = storage.get("output_manifest") or os.path.join(base, "output.yaml")
+            else:
+                cfg_output = storage.get("data_dir")
+                cfg_watermark = storage.get("watermark_dir")
+                cfg_manifest = storage.get("output_manifest")
             cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
 
@@ -319,6 +328,8 @@ class ChangeTracker:
             ),
             output_manifest=output_manifest or cfg_manifest,
         )
+        if not is_flat and base:
+            ct.ingest_pipeline = base
         if table_map:
             ct.tables = table_map
         return ct
@@ -409,6 +420,8 @@ class ChangeTracker:
             manifest = manifest_load(self.output_manifest)
             file_type = getattr(self.writer, "file_type", "parquet")
             manifest_merge_add(manifest, results, self.output_dir, file_type)
+            if self.ingest_pipeline is not None:
+                manifest["ingest_pipeline"] = self.ingest_pipeline
             manifest_save(self.output_manifest, manifest)
             logger.debug("Updated output manifest %s", self.output_manifest)
         except Exception as exc:

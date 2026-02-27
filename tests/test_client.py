@@ -631,3 +631,31 @@ class TestOutputManifest:
         manifest = load(str(manifest_path))
         assert manifest["databases"]["db1"]["dbo"]["orders"]["file_path"] == str(tmp_path / "data" / "db1" / "dbo" / "orders")
         assert manifest["databases"]["db1"]["dbo"]["orders"]["file_type"] == "parquet"
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_manifest_includes_ingest_pipeline_location_when_configured(self, MockAz, mock_sync, tmp_path):
+        from azsql_ct.output_manifest import load
+
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {
+            "database": "db1",
+            "table": "dbo.orders",
+            "mode": "full",
+            "rows_written": 10,
+        }
+
+        base = str(tmp_path / "ingest_pipeline")
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "srv", "sql_login": "u", "password": "p"},
+            "storage": {"ingest_pipeline": base},
+            "databases": {"db1": {"dbo": ["orders"]}},
+        })
+        ct.sync()
+
+        manifest_path = tmp_path / "ingest_pipeline" / "output.yaml"
+        assert manifest_path.exists()
+        manifest = load(str(manifest_path))
+        assert manifest.get("ingest_pipeline") == base
+        assert "databases" in manifest

@@ -447,3 +447,30 @@ class TestFromConfig:
         })
         assert ct.output_dir == "/mydata"
         assert ct.watermark_dir == "/mywm"
+
+    def test_ingest_pipeline_derives_paths(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "storage": {"ingest_pipeline": "/some/base"},
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.output_dir == "/some/base/data"
+        assert ct.watermark_dir == "/some/base/watermarks"
+        assert ct.output_manifest == "/some/base/output.yaml"
+
+    def test_ingest_pipeline_explicit_data_dir_overrides(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "storage": {
+                "ingest_pipeline": "/some/base",
+                "data_dir": "/custom/data",
+            },
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.output_dir == "/custom/data"
+        assert ct.watermark_dir == "/some/base/watermarks"
+        assert ct.output_manifest == "/some/base/output.yaml"
