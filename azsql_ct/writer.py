@@ -43,6 +43,11 @@ def _finalize_temp_files(temp_to_final: List[Tuple[str, str]]) -> List[str]:
 class OutputWriter(Protocol):
     """Protocol that any output backend must satisfy."""
 
+    @property
+    def file_type(self) -> str:
+        """File extension/type produced by this writer (e.g. ``parquet``, ``csv``)."""
+        ...
+
     def write(
         self,
         rows: Iterable,
@@ -75,6 +80,10 @@ class ParquetWriter:
     ) -> None:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
+
+    @property
+    def file_type(self) -> str:
+        return "parquet"
 
     @staticmethod
     def _coerce_column(values: list) -> list:
@@ -148,6 +157,10 @@ class CsvWriter:
 
     def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
         self.max_bytes = max_bytes
+
+    @property
+    def file_type(self) -> str:
+        return "csv"
 
     @staticmethod
     def _open_part(

@@ -601,3 +601,33 @@ class TestContextManager:
             ct.full_load()
 
         mock_sync.assert_called_once()
+
+
+class TestOutputManifest:
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_sync_updates_output_manifest(self, MockAz, mock_sync, tmp_path):
+        from azsql_ct.output_manifest import load
+
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {
+            "database": "db1",
+            "table": "dbo.orders",
+            "mode": "full",
+            "rows_written": 10,
+        }
+
+        manifest_path = tmp_path / "output.yaml"
+        ct = ChangeTracker(
+            "srv", "usr", "pw",
+            output_dir=str(tmp_path / "data"),
+            output_manifest=str(manifest_path),
+        )
+        ct.tables = {"db1": {"dbo": ["orders"]}}
+        ct.sync()
+
+        assert manifest_path.exists()
+        manifest = load(str(manifest_path))
+        assert manifest["databases"]["db1"]["dbo"]["orders"]["file_path"] == str(tmp_path / "data" / "db1" / "dbo" / "orders")
+        assert manifest["databases"]["db1"]["dbo"]["orders"]["file_type"] == "parquet"

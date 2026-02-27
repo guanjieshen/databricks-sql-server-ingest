@@ -55,8 +55,10 @@ connection:
 storage:
   data_dir: ./data
   watermark_dir: ./watermarks
+  output_manifest: ./output.yaml   # optional: record where files are written; uc_* fields left blank for you to fill (updated only when new tables are added)
 
-max_workers: 8
+# Tables to sync in parallel (optional; also supports key "max_workers")
+parallelism: 8
 
 databases:
   my_database:
@@ -65,6 +67,8 @@ databases:
       customers: full
       audit_log: incremental
 ```
+
+When `output_manifest` is set under `storage`, sync updates that YAML file with the path and type of each table's output. Fields `uc_catalog_name`, `uc_schema_name`, and `uc_table_name` are left blank for you to fill (e.g. for Unity Catalog). The manifest is updated only when new databases, schemas, or tables are added; existing entries are never overwritten.
 
 **JSON** is also supported (see `sync_config.json`).
 

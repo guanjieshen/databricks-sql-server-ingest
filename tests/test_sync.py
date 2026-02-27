@@ -403,6 +403,26 @@ class TestFromConfig:
         assert ct.max_workers == 8
         assert ct.output_dir == "/override"
 
+    def test_parallelism_config_key(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "srv", "sql_login": "u", "password": "p"},
+            "parallelism": 4,
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.max_workers == 4
+
+    def test_output_manifest_from_config(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "srv", "sql_login": "u", "password": "p"},
+            "storage": {"data_dir": "/d", "watermark_dir": "/w", "output_manifest": "/out.yaml"},
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.output_manifest == "/out.yaml"
+
     def test_env_var_expansion(self, monkeypatch):
         from azsql_ct.client import ChangeTracker
 

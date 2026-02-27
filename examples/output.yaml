@@ -9,8 +9,6 @@ parallelism: 4
 storage:
   data_dir: ./data
   watermark_dir: ./watermarks
-  # Optional: path to YAML manifest of where files are written (uc_* fields left blank for you to fill)
-  output_manifest: ./output.yaml
 
 databases:
   database_1:

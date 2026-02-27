@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
 from .connection import AzureSQLConnection, load_dotenv
+from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
 from .writer import CsvWriter, OutputWriter, ParquetWriter
 
@@ -177,6 +178,9 @@ class ChangeTracker:
         batch_size:    Number of rows fetched from the database at a time
                        (default ``10_000``).  Controls peak memory usage for
                        large tables.
+        output_manifest: Optional path to a YAML file to record where synced
+                         files are written; updated only when new tables are
+                         added (user-filled UC fields preserved).
     """
 
     def __init__(
@@ -191,6 +195,7 @@ class ChangeTracker:
         max_workers: int = 1,
         batch_size: int = DEFAULT_BATCH_SIZE,
         snapshot_isolation: bool = False,
+        output_manifest: Optional[str] = None,
     ) -> None:
         self.server = server
         self.user = user
@@ -201,6 +206,7 @@ class ChangeTracker:
         self.max_workers = max(1, max_workers)
         self.batch_size = batch_size
         self.snapshot_isolation = snapshot_isolation
+        self.output_manifest = output_manifest
 
         self._table_map: TableMap = {}
         self._flat_tables: List[FlatEntry] = []
@@ -215,6 +221,7 @@ class ChangeTracker:
         max_workers: Optional[int] = None,
         output_dir: Optional[str] = None,
         watermark_dir: Optional[str] = None,
+        output_manifest: Optional[str] = None,
         batch_size: Optional[int] = None,
         snapshot_isolation: Optional[bool] = None,
     ) -> "ChangeTracker":
@@ -270,7 +277,8 @@ class ChangeTracker:
             table_map = _flat_config_to_table_map(config["tables"])
             cfg_output = config.get("output_dir")
             cfg_watermark = config.get("watermark_dir")
-            cfg_workers = config.get("max_workers")
+            cfg_manifest = config.get("output_manifest")
+            cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
         else:
             conn_cfg = config.get("connection", {})
@@ -283,7 +291,8 @@ class ChangeTracker:
             storage = config.get("storage", {})
             cfg_output = storage.get("data_dir")
             cfg_watermark = storage.get("watermark_dir")
-            cfg_workers = config.get("max_workers")
+            cfg_manifest = storage.get("output_manifest")
+            cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
 
         ct = cls(
@@ -298,6 +307,7 @@ class ChangeTracker:
                 snapshot_isolation if snapshot_isolation is not None
                 else bool(cfg_snapshot)
             ),
+            output_manifest=output_manifest or cfg_manifest,
         )
         if table_map:
             ct.tables = table_map
@@ -373,8 +383,26 @@ class ChangeTracker:
             )
 
         if self.max_workers > 1:
-            return self._run_sync_parallel(mode_override)
-        return self._run_sync_sequential(mode_override)
+            results = self._run_sync_parallel(mode_override)
+        else:
+            results = self._run_sync_sequential(mode_override)
+
+        if self.output_manifest:
+            self._update_output_manifest(results)
+        return results
+
+    def _update_output_manifest(self, results: List[dict]) -> None:
+        """Update output manifest with sync results (add new tables only)."""
+        if not self.output_manifest:
+            return
+        try:
+            manifest = manifest_load(self.output_manifest)
+            file_type = getattr(self.writer, "file_type", "parquet")
+            manifest_merge_add(manifest, results, self.output_dir, file_type)
+            manifest_save(self.output_manifest, manifest)
+            logger.debug("Updated output manifest %s", self.output_manifest)
+        except Exception as exc:
+            logger.warning("Failed to update output manifest %s: %s", self.output_manifest, exc)
 
     # -- helpers ------------------------------------------------------------
 
