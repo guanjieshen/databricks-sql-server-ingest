@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -107,16 +107,24 @@ def merge_add(
 
         if table in schema_node:
             continue
-        schema_node[table] = _table_entry(file_path, file_type)
+        primary_key = result.get("primary_key")
+        schema_node[table] = _table_entry(file_path, file_type, primary_key=primary_key)
 
 
-def _table_entry(file_path: str, file_type: str) -> Dict[str, Any]:
-    """Build table node with uc_table_name first, then file_path, file_type."""
-    return {
+def _table_entry(
+    file_path: str,
+    file_type: str,
+    primary_key: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build table node with uc_table_name, file_path, file_type, and optional primary_key."""
+    entry: Dict[str, Any] = {
         "uc_table_name": None,
         "file_path": file_path,
         "file_type": file_type,
     }
+    if primary_key is not None:
+        entry["primary_key"] = primary_key
+    return entry
 
 
 def save(path: str, manifest: Dict[str, Any]) -> None:

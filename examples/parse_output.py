@@ -31,7 +31,8 @@ def parse_yaml_to_table_dict(yaml_file_path: str | Path) -> List[Dict[str, Any]]
 
     Returns:
         List of dicts with keys: database_name, schema_name, table_name,
-        file_path, file_type, uc_catalog_name, uc_schema_name, uc_table_name.
+        file_path, file_type, uc_catalog_name, uc_schema_name, uc_table_name,
+        primary_key (list of column names, if present in manifest).
     """
     path = Path(yaml_file_path)
     with path.open() as f:
@@ -72,19 +73,9 @@ def parse_yaml_to_table_dict(yaml_file_path: str | Path) -> List[Dict[str, Any]]
                     "uc_catalog_name": uc_catalog_name,
                     "uc_schema_name": uc_schema_name,
                     "uc_table_name": table_info.get("uc_table_name"),
+                    "primary_key": table_info.get("primary_key"),
                 })
 
     return table_list
 
 
-def main() -> None:
-    manifest_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "output.yaml"
-    if not manifest_path.exists():
-        print(f"File not found: {manifest_path}", file=sys.stderr)
-        sys.exit(1)
-    tables = parse_yaml_to_table_dict(manifest_path)
-    print(json.dumps(tables, indent=2))
-
-
-if __name__ == "__main__":
-    main()

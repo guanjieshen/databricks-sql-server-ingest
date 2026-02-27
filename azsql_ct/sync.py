@@ -222,6 +222,8 @@ def _sync_table_locked(
 
     t0 = time.monotonic()
 
+    pk_cols = queries.primary_key_columns(cur, full_name)
+
     do_full = mode == "full" or (mode == "full_incremental" and is_initial)
 
     if snapshot_isolation:
@@ -233,7 +235,6 @@ def _sync_table_locked(
         cur.execute(sql)
         actual_mode = "full"
     else:
-        pk_cols = queries.primary_key_columns(cur, full_name)
         if not pk_cols:
             raise RuntimeError(
                 f"Could not determine primary key for {full_name}. "
@@ -284,4 +285,5 @@ def _sync_table_locked(
         "rows_written": row_count,
         "files": output_files,
         "duration_seconds": round(elapsed, 2),
+        "primary_key": pk_cols,
     }

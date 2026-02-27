@@ -91,6 +91,25 @@ class TestMergeAdd:
         assert "customers" in manifest["databases"]["db1"]["dbo"]
         assert manifest["databases"]["db1"]["dbo"]["customers"]["file_path"] == "/data/db1/dbo/customers"
 
+    def test_adds_primary_key_when_in_result(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [
+                {
+                    "database": "db1",
+                    "table": "dbo.orders",
+                    "rows_written": 10,
+                    "primary_key": ["id"],
+                },
+            ],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["primary_key"] == ["id"]
+        assert tbl["file_path"] == "/data/db1/dbo/orders"
+
 
 class TestSave:
     def test_writes_yaml(self, tmp_path):
