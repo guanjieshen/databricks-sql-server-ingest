@@ -1,26 +1,22 @@
 """Output writers for sync results.
 
-Defines the ``OutputWriter`` protocol with ``ParquetWriter`` (default) and
-``CsvWriter`` implementations.
+Defines the ``OutputWriter`` protocol and the ``ParquetWriter`` implementation.
 
-Both writers follow a **write-then-rename** strategy: each file is written
-to a ``.tmp`` suffix first and only renamed to its final name after the
-full write completes successfully.  This prevents downstream consumers from
+Both follow a **write-then-rename** strategy: each file is written to a
+``.tmp`` suffix first and only renamed to its final name after the full
+write completes successfully.  This prevents downstream consumers from
 reading partial files and makes cleanup of crash leftovers trivial.
 """
 
 from __future__ import annotations
 
-import csv
-import io
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Iterable, List, Protocol, Sequence, Tuple
+from datetime import date, datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # ~50 MB
 DEFAULT_ROW_GROUP_SIZE = 500_000
 _TEMP_SUFFIX = ".tmp"
 
@@ -40,12 +36,32 @@ def _finalize_temp_files(temp_to_final: List[Tuple[str, str]]) -> List[str]:
     return finals
 
 
+def _value_to_partition_date(value: Any) -> str:
+    """Return YYYY-MM-DD for partitioning, or '_unknown' for None/invalid."""
+    if value is None:
+        return "_unknown"
+    if isinstance(value, datetime):
+        d = value.date() if hasattr(value, "date") else value
+        return d.isoformat()
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        try:
+            # Try YYYY-MM-DD or datetime string
+            if "T" in value or " " in value:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+            return value[:10] if len(value) >= 10 else "_unknown"
+        except Exception:
+            return "_unknown"
+    return "_unknown"
+
+
 class OutputWriter(Protocol):
     """Protocol that any output backend must satisfy."""
 
     @property
     def file_type(self) -> str:
-        """File extension/type produced by this writer (e.g. ``parquet``, ``csv``)."""
+        """File extension/type produced by this writer (e.g. ``parquet``)."""
         ...
 
     def write(
@@ -69,6 +85,10 @@ class ParquetWriter:
     Uses *row_group_size* to control the row-group granularity inside each
     Parquet file.
 
+    If *partition_column* is set, files are written under *dir_path* in
+    day subdirectories (YYYY-MM-DD) based on that column's value. Rows
+    with null/invalid values go under ``_unknown``.
+
     Requires ``pyarrow`` (pre-installed on Databricks; install separately
     elsewhere with ``pip install pyarrow``).
     """
@@ -77,9 +97,11 @@ class ParquetWriter:
         self,
         max_rows_per_file: int = 1_000_000,
         row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+        partition_column: Optional[str] = None,
     ) -> None:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
+        self.partition_column = partition_column
 
     @property
     def file_type(self) -> str:
@@ -113,6 +135,21 @@ class ParquetWriter:
             for i, name in enumerate(col_names)
         }
         table = pa.table(columns)
+
+        # When every value in a column is None, PyArrow infers type `null`.
+        # Cast these to int64 so the Parquet schema stays consistent across
+        # full (all-NULL metadata cols) and incremental writes.
+        null_cols = [
+            f for f in table.schema if pa.types.is_null(f.type)
+        ]
+        if null_cols:
+            table = table.cast(
+                pa.schema(
+                    f.with_type(pa.int64()) if pa.types.is_null(f.type) else f
+                    for f in table.schema
+                )
+            )
+
         pq.write_table(table, path, row_group_size=row_group_size)
 
     def write(
@@ -126,9 +163,17 @@ class ParquetWriter:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         pending: List[Tuple[str, str]] = []
         row_count = 0
+
+        partition_idx: Optional[int] = None
+        if self.partition_column and self.partition_column in col_names:
+            partition_idx = col_names.index(self.partition_column)
+        if partition_idx is not None:
+            return self._write_partitioned(
+                rows, col_names, dir_path, prefix, ts, pending, partition_idx,
+            )
+
         part = 1
         batch: List[tuple] = []
-
         for row in rows:
             batch.append(tuple(row))
             row_count += 1
@@ -141,7 +186,7 @@ class ParquetWriter:
                 batch = []
                 part += 1
 
-        if batch or row_count == 0:
+        if batch:
             final = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
             tmp = final + _TEMP_SUFFIX
             self._write_file(tmp, col_names, batch, self.row_group_size)
@@ -151,68 +196,43 @@ class ParquetWriter:
         logger.debug("Wrote %d file(s) (%d rows) to %s", len(files), row_count, dir_path)
         return files, row_count
 
-
-class CsvWriter:
-    """Write query results to one or more CSV files, each <= *max_bytes*."""
-
-    def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
-        self.max_bytes = max_bytes
-
-    @property
-    def file_type(self) -> str:
-        return "csv"
-
-    @staticmethod
-    def _open_part(
-        dir_path: str, prefix: str, ts: str, part: int, col_names: List[str],
-    ) -> Tuple[io.TextIOWrapper, str, str, int]:
-        """Open a new CSV temp file, write the header.
-
-        Returns ``(handle, tmp_path, final_path, header_bytes)``.
-        """
-        final = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.csv")
-        tmp = final + _TEMP_SUFFIX
-        fh = open(tmp, "w", newline="")
-        header_buf = io.StringIO()
-        csv.writer(header_buf).writerow(col_names)
-        header_line = header_buf.getvalue()
-        fh.write(header_line)
-        return fh, tmp, final, len(header_line.encode("utf-8"))
-
-    def write(
+    def _write_partitioned(
         self,
         rows: Iterable,
-        description: Sequence[Tuple[str, ...]],
+        col_names: List[str],
         dir_path: str,
         prefix: str,
+        ts: str,
+        pending: List[Tuple[str, str]],
+        partition_idx: int,
     ) -> WriteResult:
-        col_names = [col[0] for col in description]
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        pending: List[Tuple[str, str]] = []
+        """Buffer rows by partition date, then write one or more files per day."""
+        by_day: Dict[str, List[tuple]] = {}
         row_count = 0
-        part = 1
-
-        f, tmp, final, bytes_written = self._open_part(dir_path, prefix, ts, part, col_names)
-        pending.append((tmp, final))
 
         for row in rows:
-            buf = io.StringIO()
-            csv.writer(buf).writerow(list(row))
-            line = buf.getvalue()
-            line_bytes = len(line.encode("utf-8"))
-
-            if bytes_written + line_bytes > self.max_bytes and bytes_written > len(col_names):
-                f.close()
-                part += 1
-                f, tmp, final, bytes_written = self._open_part(dir_path, prefix, ts, part, col_names)
-                pending.append((tmp, final))
-
-            f.write(line)
-            bytes_written += line_bytes
+            t = tuple(row)
             row_count += 1
+            key = _value_to_partition_date(t[partition_idx] if partition_idx < len(t) else None)
+            by_day.setdefault(key, []).append(t)
 
-        f.close()
+        for part_date, batch in by_day.items():
+            part_dir = os.path.join(dir_path, part_date)
+            os.makedirs(part_dir, exist_ok=True)
+            offset = 0
+            part = 1
+            while offset < len(batch):
+                chunk = batch[offset : offset + self.max_rows_per_file]
+                offset += len(chunk)
+                final = os.path.join(part_dir, f"{prefix}_{ts}_part{part}.parquet")
+                tmp = final + _TEMP_SUFFIX
+                self._write_file(tmp, col_names, chunk, self.row_group_size)
+                pending.append((tmp, final))
+                part += 1
 
         files = _finalize_temp_files(pending)
-        logger.debug("Wrote %d file(s) (%d rows) to %s", len(files), row_count, dir_path)
+        logger.debug(
+            "Wrote %d file(s) (%d rows) to %s (partitioned by day)",
+            len(files), row_count, dir_path,
+        )
         return files, row_count

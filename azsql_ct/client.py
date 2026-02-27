@@ -50,14 +50,24 @@ from ._constants import DEFAULT_BATCH_SIZE, VALID_MODES
 from .connection import AzureSQLConnection, load_dotenv
 from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
-from .writer import CsvWriter, OutputWriter, ParquetWriter
+from .writer import OutputWriter, ParquetWriter
 
 logger = logging.getLogger(__name__)
 
 
 def expand_env(value: str) -> str:
     """Expand ``${VAR}`` references in *value* with environment variables."""
-    return re.sub(r"\$\{(\w+)}", lambda m: os.environ[m.group(1)], str(value))
+
+    def _repl(m):
+        name = m.group(1)
+        if name not in os.environ:
+            raise KeyError(
+                f"Environment variable {name!r} is not set "
+                f"(referenced in config as ${{{name}}})"
+            )
+        return os.environ[name]
+
+    return re.sub(r"\$\{(\w+)}", _repl, str(value))
 
 
 def _load_config_file(path: Union[str, Path]) -> dict:
@@ -171,7 +181,7 @@ class ChangeTracker:
         output_dir:    Root directory for data files (default ``./data``).
         watermark_dir: Root directory for watermark files (default ``./watermarks``).
         writer:        An :class:`~azsql_ct.writer.OutputWriter` instance
-                       (default ``CsvWriter()``).
+                       (default ``ParquetWriter()``).
         max_workers:   Number of tables to sync in parallel (default ``1`` =
                        sequential).  Each worker opens its own database
                        connection, so this is safe with both backends.

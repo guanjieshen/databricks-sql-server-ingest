@@ -1,6 +1,6 @@
 # azsql_ct -- Azure SQL Change Tracking Sync
 
-Incrementally sync change-tracked tables from Azure SQL Server to local CSV files.
+Incrementally sync change-tracked tables from Azure SQL Server to local Parquet files.
 
 Supports three sync modes per table:
 
@@ -133,7 +133,7 @@ azsql_ct/           Core package
   queries.py          SQL query builders
   sync.py             Sync engine (full / incremental)
   watermark.py        JSON watermark store
-  writer.py           Pluggable CSV output writer
+  writer.py           Pluggable Parquet output writer
   __main__.py         CLI entry point
 examples/           Runnable example scripts
 tests/              Unit and integration tests

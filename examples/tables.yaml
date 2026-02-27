@@ -1,7 +1,8 @@
 connection:
-  server: your-server.database.windows.net
+  server: guanjiesqldb.database.windows.net
   sql_login: sqladmin
   password: ${ADMIN_PASSWORD}
+
 
 # Number of tables to sync in parallel (default: 1 = sequential).
 parallelism: 4
@@ -15,8 +16,5 @@ storage:
 databases:
   database_1:
     dbo:
-      orders: full_incremental
-      customers: full_incremental
-      products: full_incremental
-      inventory: full
-      audit_log: incremental
+      table_1: full_incremental
+      table_59: full_incremental

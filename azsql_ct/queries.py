@@ -82,11 +82,16 @@ def build_incremental_query(full_table_name: str, pk_cols: List[str]) -> str:
     """Return the SQL for an incremental change-tracking SELECT.
 
     The query expects a single ``?`` parameter for the *since_version*.
+    Column types are cast to match :func:`build_full_query` so that initial
+    and incremental Parquet outputs have identical schemas (avoids downstream
+    schema merge errors).
     """
     join_cond = " AND ".join(f"t.[{c}] = ct.[{c}]" for c in pk_cols)
     return (
-        f"SELECT ct.SYS_CHANGE_VERSION, ct.SYS_CHANGE_CREATION_VERSION, "
-        f"ct.SYS_CHANGE_OPERATION, t.* "
+        f"SELECT ct.SYS_CHANGE_VERSION, "
+        f"CAST(ct.SYS_CHANGE_CREATION_VERSION AS BIGINT) AS SYS_CHANGE_CREATION_VERSION, "
+        f"CAST(ct.SYS_CHANGE_OPERATION AS NCHAR(1)) AS SYS_CHANGE_OPERATION, "
+        f"t.* "
         f"FROM CHANGETABLE(CHANGES {full_table_name}, ?) AS ct "
         f"LEFT JOIN {full_table_name} AS t ON {join_cond}"
     )

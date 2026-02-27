@@ -88,3 +88,12 @@ class TestBuildIncrementalQuery:
         sql = queries.build_incremental_query("dbo.OrderLines", ["order_id", "line_id"])
         assert "t.[order_id] = ct.[order_id]" in sql
         assert "t.[line_id] = ct.[line_id]" in sql
+
+    def test_ct_columns_cast_to_match_full_query_schema(self):
+        """Incremental query casts CT columns so Parquet schema matches full load."""
+        sql = queries.build_incremental_query("dbo.T", ["id"])
+        assert "CAST(ct.SYS_CHANGE_CREATION_VERSION AS BIGINT)" in sql
+        assert "CAST(ct.SYS_CHANGE_OPERATION AS NCHAR(1))" in sql
+        assert "SYS_CHANGE_VERSION" in sql
+        assert "SYS_CHANGE_CREATION_VERSION" in sql
+        assert "SYS_CHANGE_OPERATION" in sql

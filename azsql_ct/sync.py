@@ -23,6 +23,7 @@ import glob
 import logging
 import os
 import time
+from datetime import date
 from typing import Any, Generator, List, Optional, Tuple
 
 from . import queries, watermark
@@ -91,16 +92,24 @@ def _sub_dir(root: str, database: str, full_table_name: str) -> str:
 
 
 def _clear_data_files(data_dir: str, *, keep: Optional[set] = None) -> int:
-    """Remove writer-produced files from *data_dir*, skipping *keep*.
+    """Remove writer-produced files from *data_dir* (and subdirs), skipping *keep*.
 
+    Supports partitioned layout where files live under day subdirectories.
     Returns the number of files deleted.
     """
     keep = keep or set()
     removed = 0
-    for path in glob.glob(os.path.join(data_dir, "*")):
-        if os.path.isfile(path) and path not in keep:
-            os.remove(path)
-            removed += 1
+    for dirpath, _dirnames, filenames in os.walk(data_dir, topdown=False):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if path not in keep:
+                os.remove(path)
+                removed += 1
+        if dirpath != data_dir:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
     if removed:
         logger.info("Cleared %d existing file(s) from %s", removed, data_dir)
     return removed
@@ -112,13 +121,16 @@ _TEMP_SUFFIX = ".tmp"
 def _clean_temp_files(data_dir: str) -> int:
     """Remove leftover temp files from a previous crashed write.
 
+    Walks subdirectories so partition subdirs are cleaned too.
     Returns the number of files cleaned up.
     """
     removed = 0
-    for path in glob.glob(os.path.join(data_dir, f"*{_TEMP_SUFFIX}")):
-        if os.path.isfile(path):
-            os.remove(path)
-            removed += 1
+    for dirpath, _dirnames, filenames in os.walk(data_dir):
+        for name in filenames:
+            if name.endswith(_TEMP_SUFFIX):
+                path = os.path.join(dirpath, name)
+                os.remove(path)
+                removed += 1
     if removed:
         logger.info(
             "Cleaned up %d orphaned temp file(s) from %s", removed, data_dir,
@@ -248,15 +260,18 @@ def _sync_table_locked(
         cur.execute(sql, (since,))
         actual_mode = "incremental"
 
-    _clean_temp_files(data_dir)
+    day_dir = os.path.join(data_dir, date.today().isoformat())
+    os.makedirs(day_dir, exist_ok=True)
+
+    _clean_temp_files(day_dir)
 
     description = cur.description
     safe_name = full_name.replace(".", "_")
     row_iter = _iter_cursor(cur, batch_size)
-    output_files, row_count = writer.write(row_iter, description, data_dir, safe_name)
+    output_files, row_count = writer.write(row_iter, description, day_dir, safe_name)
 
     if do_full:
-        _clear_data_files(data_dir, keep=set(output_files))
+        _clear_data_files(day_dir, keep=set(output_files))
 
     elapsed = time.monotonic() - t0
     since_ver = since if actual_mode == "incremental" else None
