@@ -1,36 +1,11 @@
-"""Materialized landing ingestion pipeline for the unified bronze schema.
+"""Materialized landing pipeline for the unified bronze schema.
 
-This pipeline ingests unified Parquet files (bronze envelope schema)
-produced by azsql_ct with ``output_format: unified``, then fans out
-to per-table silver Delta tables via AUTO CDC (SCD Type 1 or 2).
+Differs from ingestion_pipeline.py by materializing landing_raw as a
+temporary Delta table instead of a view. Cloud storage is read once;
+downstream views read from Delta with data skipping.
 
-Architecture:
-    Auto Loader -> landing_raw (materialized temp Delta) -> per-table
-    views (filter + from_json) -> silver streaming tables (AUTO CDC)
-
-Key difference from ingestion_pipeline.py:
-    The landing table is materialized as a temporary Delta table instead
-    of a view. Parquet files are read from cloud storage once and written
-    to Delta. Downstream per-table views then read from Delta, which
-    supports data skipping on the table_id struct -- only rows matching
-    each table are scanned.
-
-    In ingestion_pipeline.py the landing is a view, so every per-table
-    staging table re-reads ALL Parquet files from cloud storage and
-    discards non-matching rows. With N tables, the source files are
-    read N times.
-
-Performance:
-    For a small number of tables (< 5), the difference is negligible.
-    For a large number of tables (50+), the materialized approach
-    provides a significant performance improvement because the cloud
-    storage read happens once rather than N times. The tradeoff is one
-    extra Delta write for the landing table.
-
-DAG structure:
-    1 landing_raw (temporary table) + N views + N silver tables = 2N+1
-    nodes. Same node count as ingestion_pipeline.py but different read
-    characteristics.
+For large table counts (50+) this provides a significant performance
+improvement -- ingestion_pipeline.py re-reads all Parquet N times.
 """
 
 from pyspark import pipelines as dp
@@ -93,17 +68,8 @@ def _build_spark_schema(columns):
 input_yaml = spark.conf.get("input_yaml")
 table_configs, data_path = parse_output_yaml(input_yaml)
 
-# ---------------------------------------------------------------------------
-# BRONZE: Materialized landing table (1 DAG node)
-#
-# All unified Parquet files are ingested once via Auto Loader and written
-# to a temporary Delta table. This avoids re-reading cloud storage N times
-# (once per source table). Downstream views read from this Delta table
-# and benefit from data skipping on the table_id struct columns.
-#
-# temporary=True keeps the table internal to the pipeline (not published
-# to Unity Catalog). It is cleaned up when the pipeline is deleted.
-# ---------------------------------------------------------------------------
+# BRONZE: Materialized landing (temporary Delta, not published to UC).
+# Parquet read once; downstream views get Delta data skipping.
 
 @dp.table(
     name="landing_raw",
@@ -122,19 +88,7 @@ def landing_raw():
     )
 
 
-# ---------------------------------------------------------------------------
-# SILVER: Per-table view + AUTO CDC flow (2 DAG nodes per table)
-#
-# Each source table gets:
-#   1. A view that filters landing_raw by table_id and parses the JSON
-#      data column into typed columns using schema.json.
-#   2. A streaming table with create_auto_cdc_flow that applies CDC
-#      (SCD Type 1 or 2), sequenced by cursor.seqNum, with DELETE
-#      support via the operation column.
-#
-# Views are lightweight (no storage) -- the filter + from_json logic
-# is pushed down into the Delta read from landing_raw.
-# ---------------------------------------------------------------------------
+# SILVER: Per-table view (filter + from_json) -> AUTO CDC silver table.
 
 for tc in table_configs:
     schema_name = tc["schema"]
