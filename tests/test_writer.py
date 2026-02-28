@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from datetime import date, datetime
 
+import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -12,6 +13,7 @@ from azsql_ct.writer import (
     ParquetWriter,
     UnifiedParquetWriter,
     _compute_schema_version,
+    _json_dumps,
     _make_uoid,
     OP_MAP,
 )
@@ -313,3 +315,80 @@ class TestHelpers:
         assert OP_MAP["D"] == "DELETE"
         assert OP_MAP["L"] == "LOAD"
         assert len(OP_MAP) == 4
+
+    def test_compute_schema_version_column_order_matters(self):
+        desc_ab = _desc("col_a", "col_b")
+        desc_ba = _desc("col_b", "col_a")
+        assert _compute_schema_version(desc_ab) != _compute_schema_version(desc_ba)
+
+    def test_compute_schema_version_all_ct_columns_only(self):
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION")
+        version = _compute_schema_version(desc)
+        assert isinstance(version, int)
+
+    def test_compute_schema_version_delimiter_no_collision(self):
+        """Column name containing the pipe delimiter must not collide."""
+        desc_pipe = _desc("a|b")
+        desc_two = _desc("a", "b")
+        assert _compute_schema_version(desc_pipe) != _compute_schema_version(desc_two)
+
+    def test_make_uoid_dotted_name_no_collision(self):
+        """Different (db, schema, table) triples must not collide even when
+        the dot-joined key looks the same."""
+        a = _make_uoid("a.b", "c", "d")
+        b = _make_uoid("a", "b.c", "d")
+        assert a != b
+
+
+class TestParquetCompression:
+    """Verify ZSTD compression is applied to Parquet output."""
+
+    def test_per_table_writer_uses_zstd_by_default(self, tmp_path):
+        writer = ParquetWriter()
+        desc = _desc("id", "name")
+        rows = [(1, "a"), (2, "b")]
+        files, _ = writer.write(rows, desc, str(tmp_path), "test")
+        assert len(files) == 1
+        meta = pq.read_metadata(files[0])
+        # Each row group has a column chunk with compression
+        rg0 = meta.row_group(0)
+        assert rg0.column(0).compression == "ZSTD"
+
+    def test_unified_writer_uses_zstd_by_default(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [(1, None, "I", 1)]
+        files, _ = writer.write(rows, desc, str(tmp_path), "test", table_metadata=_sample_metadata())
+        assert len(files) == 1
+        meta = pq.read_metadata(files[0])
+        rg0 = meta.row_group(0)
+        assert rg0.column(0).compression == "ZSTD"
+
+    def test_compression_none_disables_compression(self, tmp_path):
+        writer = ParquetWriter(compression="none")
+        desc = _desc("id")
+        files, _ = writer.write([(1,)], desc, str(tmp_path), "test")
+        meta = pq.read_metadata(files[0])
+        assert meta.row_group(0).column(0).compression == "UNCOMPRESSED"
+
+    def test_invalid_compression_raises(self):
+        with pytest.raises(ValueError, match="Invalid compression"):
+            ParquetWriter(compression="invalid")
+
+
+class TestJsonDumps:
+    """_json_dumps uses orjson when available, else stdlib json; output must be valid."""
+
+    def test_produces_valid_json(self):
+        import json
+        data = {"a": 1, "b": None, "c": "str"}
+        out = _json_dumps(data)
+        assert json.loads(out) == data
+
+    def test_handles_default_str(self):
+        import json
+        from datetime import datetime
+        data = {"dt": datetime(2025, 1, 15, 12, 0, 0)}
+        out = _json_dumps(data)
+        parsed = json.loads(out)
+        assert "dt" in parsed

@@ -132,9 +132,11 @@ def merge_add(
             continue
         primary_key = result.get("primary_key")
         scd_type = result.get("scd_type")
+        soft_delete = result.get("soft_delete")
         schema_node[table] = _table_entry(
             file_path, file_type, primary_key=primary_key,
             uc_table_name=table, scd_type=scd_type,
+            soft_delete=soft_delete,
         )
 
 
@@ -144,6 +146,7 @@ def _table_entry(
     primary_key: Optional[List[str]] = None,
     uc_table_name: Optional[str] = None,
     scd_type: Optional[int] = None,
+    soft_delete: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Build table node with file_path, file_type, scd_type, and optional primary_key."""
     entry: Dict[str, Any] = {
@@ -153,6 +156,8 @@ def _table_entry(
     }
     if scd_type is not None:
         entry["scd_type"] = scd_type
+    if soft_delete:
+        entry["soft_delete"] = True
     if primary_key is not None:
         entry["primary_key"] = primary_key
     return entry

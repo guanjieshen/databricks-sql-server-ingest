@@ -1,6 +1,6 @@
 """Materialized landing pipeline for the unified bronze schema.
 
-Differs from ingestion_pipeline.py by materializing landing_raw as a
+Differs by materializing landing_raw as a
 temporary Delta table instead of a view. Cloud storage is read once;
 downstream views read from Delta with data skipping.
 
@@ -24,7 +24,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from utilities.metadata_helper import parse_output_yaml
+from metadata_helper import parse_output_yaml
 
 # SQL Server type names (from schema.json) -> Spark types
 MSSQL_TO_SPARK = {
@@ -98,6 +98,7 @@ for tc in table_configs:
     uc_table = tc["uc_table"]
     primary_key = tc["primary_key"]
     scd_type = tc["scd_type"]
+    soft_delete = tc.get("soft_delete", False)
     columns = tc["columns"]
 
     uoid = tc["uoid"]
@@ -105,22 +106,29 @@ for tc in table_configs:
     view_name = f"_view_{uc_catalog}_{uc_schema}_{uc_table}"
     spark_schema = _build_spark_schema(columns)
 
-    def create_view(v_name, uoid_val, schema):
+    def create_view(v_name, uoid_val, schema, include_is_deleted):
         @dp.view(name=v_name)
         def _view():
-            return (
+            df = (
                 dp.read_stream("landing_raw")
                 .filter(F.col("table_id.uoid") == uoid_val)
                 .withColumn("parsed", F.from_json("data", schema))
-                .select(
-                    F.col("cursor.seqNum").cast("long").alias("_seq_num"),
-                    "operation",
-                    "parsed.*",
-                )
             )
+            select_cols = [
+                F.col("cursor.seqNum").cast("long").alias("_seq_num"),
+                "operation",
+            ]
+            if include_is_deleted:
+                select_cols.append(
+                    F.when(F.col("operation") == "DELETE", F.lit(True))
+                    .otherwise(F.lit(False))
+                    .alias("_is_deleted")
+                )
+            select_cols.append("parsed.*")
+            return df.select(*select_cols)
         return _view
 
-    create_view(view_name, uoid, spark_schema)
+    create_view(view_name, uoid, spark_schema, soft_delete)
 
     dp.create_streaming_table(
         name=silver_table_name,
@@ -132,13 +140,25 @@ for tc in table_configs:
     )
 
     if primary_key:
-        dp.create_auto_cdc_flow(
-            target=silver_table_name,
-            source=view_name,
-            keys=primary_key if isinstance(primary_key, list) else [primary_key],
-            sequence_by="_seq_num",
-            stored_as_scd_type=scd_type,
-            ignore_null_updates=True,
-            apply_as_deletes=F.expr("operation = 'DELETE'"),
-            except_column_list=["_seq_num", "operation"],
-        )
+        keys = primary_key if isinstance(primary_key, list) else [primary_key]
+        if soft_delete:
+            dp.create_auto_cdc_flow(
+                target=silver_table_name,
+                source=view_name,
+                keys=keys,
+                sequence_by="_seq_num",
+                stored_as_scd_type=scd_type,
+                ignore_null_updates=True,
+                except_column_list=["_seq_num", "operation"],
+            )
+        else:
+            dp.create_auto_cdc_flow(
+                target=silver_table_name,
+                source=view_name,
+                keys=keys,
+                sequence_by="_seq_num",
+                stored_as_scd_type=scd_type,
+                ignore_null_updates=True,
+                apply_as_deletes=F.expr("operation = 'DELETE'"),
+                except_column_list=["_seq_num", "operation"],
+            )

@@ -78,22 +78,118 @@ class TestBuildFullQuery:
         assert "'L'" in sql
 
 
+class TestTableColumns:
+    def test_returns_column_names(self, fake_cursor):
+        cur = fake_cursor(
+            results=[[]],
+            descriptions=[[("id",), ("name",), ("age",)]],
+        )
+        assert queries.table_columns(cur, "dbo.T") == ["id", "name", "age"]
+
+    def test_executes_select_top_0(self, fake_cursor):
+        cur = fake_cursor(
+            results=[[]],
+            descriptions=[[("id",)]],
+        )
+        queries.table_columns(cur, "dbo.T")
+        assert cur.last_sql == "SELECT TOP 0 * FROM dbo.T"
+
+
 class TestBuildIncrementalQuery:
     def test_single_pk(self):
-        sql = queries.build_incremental_query("dbo.Orders", ["id"])
+        sql = queries.build_incremental_query("dbo.Orders", ["id"], ["id", "name", "total"])
         assert "CHANGETABLE(CHANGES dbo.Orders, ?)" in sql
         assert "t.[id] = ct.[id]" in sql
+        assert "COALESCE(t.[id], ct.[id]) AS [id]" in sql
+        assert "t.[name]" in sql
+        assert "t.[total]" in sql
 
     def test_composite_pk(self):
-        sql = queries.build_incremental_query("dbo.OrderLines", ["order_id", "line_id"])
+        sql = queries.build_incremental_query(
+            "dbo.OrderLines", ["order_id", "line_id"], ["order_id", "line_id", "qty"],
+        )
         assert "t.[order_id] = ct.[order_id]" in sql
         assert "t.[line_id] = ct.[line_id]" in sql
+        assert "COALESCE(t.[order_id], ct.[order_id]) AS [order_id]" in sql
+        assert "COALESCE(t.[line_id], ct.[line_id]) AS [line_id]" in sql
+        assert "t.[qty]" in sql
 
     def test_ct_columns_cast_to_match_full_query_schema(self):
         """Incremental query casts CT columns so Parquet schema matches full load."""
-        sql = queries.build_incremental_query("dbo.T", ["id"])
+        sql = queries.build_incremental_query("dbo.T", ["id"], ["id"])
         assert "CAST(ct.SYS_CHANGE_CREATION_VERSION AS BIGINT)" in sql
         assert "CAST(ct.SYS_CHANGE_OPERATION AS NCHAR(1))" in sql
         assert "SYS_CHANGE_VERSION" in sql
         assert "SYS_CHANGE_CREATION_VERSION" in sql
         assert "SYS_CHANGE_OPERATION" in sql
+
+    def test_coalesce_only_on_pk_columns(self):
+        sql = queries.build_incremental_query("dbo.T", ["id"], ["id", "name", "status"])
+        assert "COALESCE(t.[id], ct.[id])" in sql
+        assert "COALESCE" not in sql.split("t.[name]")[0].split("AS [id]")[1]
+        assert "t.[name]" in sql
+        assert "t.[status]" in sql
+
+    def test_no_t_star_in_incremental_query(self):
+        sql = queries.build_incremental_query("dbo.T", ["id"], ["id", "col1"])
+        assert "t.*" not in sql
+
+    def test_pk_case_insensitive_match(self):
+        sql = queries.build_incremental_query("dbo.T", ["Id"], ["id", "name"])
+        assert "COALESCE(t.[id], ct.[id]) AS [id]" in sql
+        assert "t.[name]" in sql
+
+
+class TestSpecialColumnNames:
+    """Edge cases for column names with spaces, dots, reserved words, and brackets."""
+
+    def test_column_with_spaces(self):
+        sql = queries.build_incremental_query(
+            "dbo.T", ["id"], ["id", "first name", "last name"],
+        )
+        assert "t.[first name]" in sql
+        assert "t.[last name]" in sql
+
+    def test_column_with_dots(self):
+        sql = queries.build_incremental_query(
+            "dbo.T", ["id"], ["id", "user.email"],
+        )
+        assert "t.[user.email]" in sql
+
+    def test_reserved_word_columns(self):
+        sql = queries.build_incremental_query(
+            "dbo.T", ["order"], ["order", "select", "from"],
+        )
+        assert "COALESCE(t.[order], ct.[order]) AS [order]" in sql
+        assert "t.[select]" in sql
+        assert "t.[from]" in sql
+
+    def test_column_with_closing_bracket(self):
+        """A ] inside a column name must be escaped as ]] in bracket quoting."""
+        sql = queries.build_incremental_query(
+            "dbo.T", ["id"], ["id", "val]ue"],
+        )
+        assert "t.[val]]ue]" in sql
+
+    def test_pk_column_with_spaces(self):
+        sql = queries.build_incremental_query(
+            "dbo.T", ["order id"], ["order id", "qty"],
+        )
+        assert "COALESCE(t.[order id], ct.[order id]) AS [order id]" in sql
+        assert "t.[order id] = ct.[order id]" in sql
+
+
+class TestSpecialTableNames:
+    """Edge cases for table names passed to query builders."""
+
+    def test_build_full_query_with_bracket_quoted_table(self):
+        sql = queries.build_full_query("dbo.[Order Details]")
+        assert "FROM dbo.[Order Details] AS t" in sql
+
+    def test_resolve_table_non_dbo_schema(self):
+        assert queries.resolve_table("sales.Orders", ["sales.Orders"]) == "sales.Orders"
+
+    def test_resolve_table_three_part_name_not_prefixed(self):
+        """A name containing a dot is never prefixed with 'dbo.'."""
+        result = queries.resolve_table("catalog.dbo.T", ["catalog.dbo.T"])
+        assert result == "catalog.dbo.T"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -28,10 +29,17 @@ class StubWriter:
         return [f"{dir_path}/{prefix}.csv"], len(materialised)
 
 
-def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc):
-    """Build a MagicMock cursor that responds to the queries sync_table makes."""
+def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc, table_cols=None):
+    """Build a MagicMock cursor that responds to the queries sync_table makes.
+
+    *table_cols* is a list of column names returned by ``table_columns()``
+    (the ``SELECT TOP 0`` call added for incremental syncs).  When provided
+    and *pk_cols* is non-empty, an extra execute step is inserted so the
+    mock sets ``cursor.description`` appropriately for that call.
+    """
     cursor = MagicMock()
     call_count = {"n": 0}
+    exec_count = {"n": 0}
 
     results_sequence = [
         [tuple([t]) for t in tracked],  # list_tracked_tables
@@ -45,11 +53,27 @@ def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc):
         results_sequence.append([tuple([c]) for c in pk_cols])
         descs_sequence.append(None)
 
+    # table_columns (SELECT TOP 0) — sets description but no fetch
+    needs_table_cols = pk_cols is not None and len(pk_cols) > 0 and table_cols is not None
+    table_cols_desc = [(c,) for c in table_cols] if table_cols else None
+
     results_sequence.append(rows)
     descs_sequence.append(desc)
 
     def side_effect_execute(sql, params=None):
-        pass
+        idx = exec_count["n"]
+        exec_count["n"] += 1
+        # The table_columns call happens right after primary_key_columns
+        # and before the main data query. It reads cursor.description.
+        if needs_table_cols:
+            tc_exec_idx = 4  # 0=tracked, 1=cur_ver, 2=min_ver, 3=pk, 4=table_cols
+            if idx == tc_exec_idx:
+                cursor.description = table_cols_desc
+                return
+            elif idx == tc_exec_idx + 1:
+                cursor.description = desc
+                return
+        cursor.description = desc
 
     cursor.execute = MagicMock(side_effect=side_effect_execute)
 
@@ -220,6 +244,7 @@ class TestSyncTable:
             pk_cols=["id"],
             rows=rows,
             desc=desc,
+            table_cols=["id", "name"],
         )
         conn = MagicMock()
         conn.cursor.return_value = cursor
@@ -249,6 +274,7 @@ class TestSyncTable:
             pk_cols=[],
             rows=[],
             desc=None,
+            table_cols=[],
         )
         conn = MagicMock()
         conn.cursor.return_value = cursor
@@ -324,6 +350,7 @@ class TestSyncTable:
             pk_cols=["id"],
             rows=rows,
             desc=desc,
+            table_cols=["id"],
         )
         conn = MagicMock()
         conn.cursor.return_value = cursor
@@ -340,6 +367,63 @@ class TestSyncTable:
         assert result["mode"] == "incremental"
         assert result["since_version"] == 20
 
+    def test_soft_delete_passed_through_to_result(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"],
+            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full", writer=StubWriter(), soft_delete=True,
+        )
+        assert result["soft_delete"] is True
+
+    def test_soft_delete_defaults_to_false(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"],
+            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full", writer=StubWriter(),
+        )
+        assert result["soft_delete"] is False
+
+    def test_soft_delete_with_scd_type_2(self, tmp_path):
+        """Both soft_delete and scd_type=2 coexist in the result dict."""
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"],
+            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full", writer=StubWriter(),
+            scd_type=2, soft_delete=True,
+        )
+        assert result["soft_delete"] is True
+        assert result["scd_type"] == 2
+
     def test_invalid_mode_raises(self, tmp_path):
         conn = MagicMock()
         with pytest.raises(ValueError, match="Invalid mode"):
@@ -349,6 +433,35 @@ class TestSyncTable:
                 watermark_dir=str(tmp_path / "wm"),
                 mode="snapshot",
             )
+
+
+class TestSubDir:
+    """Edge cases for the _sub_dir path builder."""
+
+    def test_spaces_in_database_name(self, tmp_path):
+        from azsql_ct.sync import _sub_dir
+        d = _sub_dir(str(tmp_path), "My Database", "dbo.T")
+        assert d == str(tmp_path / "My Database" / "dbo" / "T")
+        assert os.path.isdir(d)
+
+    def test_unicode_database_name(self, tmp_path):
+        from azsql_ct.sync import _sub_dir
+        d = _sub_dir(str(tmp_path), "データベース", "dbo.T")
+        assert "データベース" in d
+        assert os.path.isdir(d)
+
+    def test_hyphenated_names(self, tmp_path):
+        from azsql_ct.sync import _sub_dir
+        d = _sub_dir(str(tmp_path), "my-db", "my-schema.my-table")
+        assert d == str(tmp_path / "my-db" / "my-schema" / "my-table")
+        assert os.path.isdir(d)
+
+    def test_dot_in_table_name_splits_on_first_dot(self, tmp_path):
+        """'dbo.my.table' splits to schema='dbo', table='my.table'."""
+        from azsql_ct.sync import _sub_dir
+        d = _sub_dir(str(tmp_path), "db1", "dbo.my.table")
+        assert d == str(tmp_path / "db1" / "dbo" / "my.table")
+        assert os.path.isdir(d)
 
 
 class TestFromConfig:
@@ -550,6 +663,29 @@ class TestFromConfig:
         assert by_table["dbo.t1"][3] == 2
         assert by_table["dbo.t2"][2] == "full"
         assert by_table["dbo.t2"][3] == 1
+
+    def test_structured_config_with_soft_delete(self):
+        from azsql_ct.client import ChangeTracker
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {
+                "db1": {
+                    "schemas": {
+                        "dbo": {
+                            "tables": {
+                                "t1": {"mode": "full_incremental", "scd_type": 1, "soft_delete": True},
+                                "t2": "full",
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        assert len(ct._flat_tables) == 2
+        by_table = {t[1]: t for t in ct._flat_tables}
+        assert by_table["dbo.t1"][4] is True
+        assert by_table["dbo.t2"][4] is False
 
 
 class TestSyncTableUnifiedWriter:

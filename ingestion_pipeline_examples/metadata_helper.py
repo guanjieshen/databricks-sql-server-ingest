@@ -6,8 +6,12 @@ import yaml
 
 
 def _make_uoid(database: str, schema: str, table: str) -> str:
-    """Deterministic UUID5 matching azsql_ct.writer._make_uoid."""
-    key = f"{database}.{schema}.{table}"
+    """Deterministic UUID5 matching azsql_ct.writer._make_uoid.
+
+    Uses null-byte separator so dotted identifiers like ("a.b", "c", "d")
+    and ("a", "b.c", "d") never collide. Must match writer._make_uoid.
+    """
+    key = f"{database}\x00{schema}\x00{table}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
@@ -86,6 +90,7 @@ def parse_output_yaml(input_yaml_path: str):
                     "uoid": _make_uoid(db_name, schema_name, table_name),
                     "primary_key": table_config.get("primary_key") or [],
                     "scd_type": table_config.get("scd_type", 1),
+                    "soft_delete": bool(table_config.get("soft_delete", False)),
                     "file_path": table_config.get("file_path"),
                     "columns": columns,
                 })

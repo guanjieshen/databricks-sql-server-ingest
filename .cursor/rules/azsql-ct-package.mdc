@@ -1,0 +1,113 @@
+---
+description: Architecture and navigation guide for the azsql_ct package — Azure SQL Change Tracking sync engine
+globs: azsql_ct/**/*.py
+alwaysApply: false
+---
+
+# azsql_ct Package Guide
+
+Azure SQL Change Tracking → Parquet sync engine. Extracts data from SQL Server change tracking and writes Parquet files (per-table or unified bronze envelope), with watermark-based incremental sync.
+
+## Module Map
+
+| Module | Purpose |
+|---|---|
+| `client.py` | **Start here.** `ChangeTracker` facade — config loading, connection pooling, parallel dispatch |
+| `sync.py` | Core sync engine — `sync_table()` orchestrates query → stream → write → watermark per table |
+| `queries.py` | SQL query builders — CT version checks, PK discovery, full/incremental SELECT generation |
+| `connection.py` | `AzureSQLConnection` wrapper around `mssql-python` with context manager support |
+| `writer.py` | `ParquetWriter` (native columns) and `UnifiedParquetWriter` (bronze envelope with JSON `data` column) |
+| `watermark.py` | Persists sync state (`version`, `since_version`, `rows_synced`, `mode`, `files`) as JSON |
+| `schema.py` | Append-only column history — tracks schema evolution across syncs via `schema.json` |
+| `output_manifest.py` | `output.yaml` manifest — records which tables have been synced and their file locations |
+| `_constants.py` | Enums/defaults: `VALID_MODES`, `VALID_SCD_TYPES`, `VALID_OUTPUT_FORMATS`, batch sizes |
+| `__main__.py` | CLI entry point (`python -m azsql_ct --config pipeline.yaml`) |
+
+## Data Flow
+
+```
+YAML config → ChangeTracker.from_config()
+  → ChangeTracker.sync()
+    → _ConnectionPool (per-database connections)
+    → ThreadPoolExecutor (parallel table sync)
+      → sync_table() per table:
+          1. Acquire _TableLock (file-based)
+          2. Load watermark → decide full vs incremental
+          3. queries.py builds SQL (full_query or incremental via CHANGETABLE)
+          4. Stream rows in batches (_iter_cursor)
+          5. writer.write() → Parquet files
+          6. watermark.save() + schema.save()
+    → output_manifest.merge_add() (append new tables to output.yaml)
+```
+
+## Key Types
+
+- **TableMap**: `Dict[database, Dict[schema, List[table] | Dict[table, mode_or_config]]]`
+- **FlatEntry**: `Tuple[database, "schema.table", mode, scd_type, soft_delete]`
+- **WriteResult**: `Tuple[List[file_paths], row_count]`
+- **OutputWriter protocol**: must implement `file_type` property and `write(rows, description, dir_path, prefix, **kw) → WriteResult`
+
+## Sync Modes
+
+- `full` — reload entire table every time
+- `incremental` — strict incremental via `CHANGETABLE(CHANGES ...)`, fails without existing watermark
+- `full_incremental` — full load on first run, incremental thereafter (recommended default)
+
+## Output Formats
+
+- **`per_table`** (`ParquetWriter`): native columns + CT metadata columns (`SYS_CHANGE_VERSION`, `SYS_CHANGE_OPERATION`, etc.)
+- **`unified`** (`UnifiedParquetWriter`): bronze envelope schema — `table_id` (UOID dict), `cursor`, `operation`, `schemaVersion`, `data` (JSON string)
+
+## File Layout on Disk
+
+```
+<ingest_pipeline>/
+├── data/<database>/<schema>/<table>/<date>/<prefix>_<timestamp>_part<N>.parquet
+├── watermarks/<database>/<schema>/<table>/
+│   ├── watermarks.json      # current sync state
+│   ├── sync_history.jsonl   # append-only sync log
+│   └── schema.json          # column history
+└── output.yaml              # manifest of synced tables
+```
+
+## Configuration (YAML)
+
+```yaml
+connection:
+  server: myserver.database.windows.net
+  sql_login: sqladmin
+  password: ${ADMIN_PASSWORD}        # env var expansion via expand_env()
+
+parallelism: 4
+storage:
+  ingest_pipeline: ./pipeline_1      # base dir (data/ and watermarks/ created under here)
+  output_format: unified             # "per_table" | "unified"
+
+databases:
+  my_db:
+    uc_catalog: catalog_name         # informational (Unity Catalog mapping)
+    schemas:
+      dbo:
+        tables:
+          orders:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: false
+```
+
+## Concurrency & Safety
+
+- `_ConnectionPool`: one `mssql-python` connection per database, reused across tables in that DB
+- `_TableLock`: per-table file lock prevents concurrent syncs of the same table
+- Atomic writes: temp files (`.tmp` suffix) renamed on completion
+- `ThreadPoolExecutor` with configurable `max_workers`
+
+## Testing
+
+Tests live in `tests/` and use pytest. Key fixtures are in `conftest.py` — most tests mock the database connection and exercise the query builders, writers, watermark logic, and schema tracking independently.
+
+## Integration with Downstream Pipelines
+
+See `ingestion_pipeline_examples/` for Databricks integration patterns:
+- `ingestion_pipeline_materialized.py` reads `output.yaml` + `schema.json` to create bronze Delta tables and per-table silver views with auto CDC (SCD Type 1/2)
+- `metadata_helper.py` provides helpers for reading manifest and schema metadata

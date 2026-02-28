@@ -6,6 +6,8 @@ import json
 import sys
 import types
 
+import pytest
+
 if "mssql_python" not in sys.modules:
     sys.modules["mssql_python"] = types.ModuleType("mssql_python")
 
@@ -68,6 +70,42 @@ class TestSchemaSave:
         assert data["schema_version"] == 300
 
 
+    def test_type_change_preserves_original_type(self, tmp_path):
+        """Append-only merge matches by name; the original type is kept."""
+        save(str(tmp_path), [{"name": "id", "type": "int"}], 100)
+        save(str(tmp_path), [{"name": "id", "type": "bigint"}], 200)
+        data = load(str(tmp_path))
+        assert len(data["columns"]) == 1
+        assert data["columns"][0]["type"] == "int"
+        assert data["schema_version"] == 200
+
+    def test_column_name_case_sensitivity(self, tmp_path):
+        """Names differing only in case are treated as distinct columns."""
+        save(str(tmp_path), [{"name": "Name", "type": "nvarchar"}], 100)
+        save(str(tmp_path), [{"name": "name", "type": "nvarchar"}], 200)
+        data = load(str(tmp_path))
+        col_names = [c["name"] for c in data["columns"]]
+        assert col_names == ["Name", "name"]
+
+    def test_many_sequential_evolutions(self, tmp_path):
+        """Cumulative schema after many add/drop cycles is correct."""
+        save(str(tmp_path), [{"name": "a", "type": "int"}], 1)
+        save(str(tmp_path), [{"name": "a", "type": "int"}, {"name": "b", "type": "int"}], 2)
+        save(str(tmp_path), [{"name": "b", "type": "int"}, {"name": "c", "type": "int"}], 3)
+        save(str(tmp_path), [{"name": "c", "type": "int"}, {"name": "d", "type": "int"}], 4)
+        save(str(tmp_path), [{"name": "a", "type": "int"}, {"name": "d", "type": "int"}, {"name": "e", "type": "int"}], 5)
+        data = load(str(tmp_path))
+        col_names = [c["name"] for c in data["columns"]]
+        assert col_names == ["a", "b", "c", "d", "e"]
+        assert data["schema_version"] == 5
+
+    def test_corrupted_schema_json_raises(self, tmp_path):
+        """Invalid JSON in schema.json surfaces a JSONDecodeError."""
+        (tmp_path / "schema.json").write_text("{bad json!!!")
+        with pytest.raises(json.JSONDecodeError):
+            load(str(tmp_path))
+
+
 class TestColumnsFromDescription:
     def test_maps_python_types_to_sql_server_names(self):
         desc = [("id", int), ("name", str), ("active", bool)]
@@ -91,3 +129,16 @@ class TestColumnsFromDescription:
         assert "SYS_CHANGE_CREATION_VERSION" not in col_names
         assert "SYS_CHANGE_OPERATION" not in col_names
         assert col_names == ["id", "name"]
+
+    def test_empty_description_returns_empty(self):
+        assert columns_from_description([]) == []
+
+    def test_description_tuple_with_no_type(self):
+        """Single-element tuples (name only) map type to 'unknown'."""
+        cols = columns_from_description([("col1",)])
+        assert cols == [{"name": "col1", "type": "unknown"}]
+
+    def test_unmapped_python_type_uses_str_repr(self):
+        cols = columns_from_description([("data", memoryview)])
+        assert cols[0]["name"] == "data"
+        assert cols[0]["type"] == str(memoryview)

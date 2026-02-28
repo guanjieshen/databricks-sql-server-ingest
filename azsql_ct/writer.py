@@ -28,13 +28,34 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
+from ._constants import (
+    DEFAULT_PARQUET_COMPRESSION,
+    DEFAULT_ROW_GROUP_SIZE,
+    VALID_PARQUET_COMPRESSION,
+)
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROW_GROUP_SIZE = 500_000
+try:
+    import orjson
+    def _json_dumps(obj: dict) -> str:
+        return orjson.dumps(obj, default=str).decode()
+except ImportError:
+    def _json_dumps(obj: dict) -> str:
+        return json.dumps(obj, default=str)
+
 _PARTITION_BUFFER_CAP = 10_000
 _TEMP_SUFFIX = ".tmp"
 
 WriteResult = Tuple[List[str], int]
+
+
+def _parquet_writer_kwargs(compression: str, compression_level: Optional[int]) -> Dict[str, Any]:
+    """Build kwargs for pq.ParquetWriter (compression must be uppercase)."""
+    kw: Dict[str, Any] = {"compression": (compression or "zstd").upper()}
+    if compression_level is not None:
+        kw["compression_level"] = compression_level
+    return kw
 
 
 def _finalize_temp_files(temp_to_final: List[Tuple[str, str]]) -> List[str]:
@@ -119,10 +140,20 @@ class ParquetWriter:
         max_rows_per_file: int = 1_000_000,
         row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
         partition_column: Optional[str] = None,
+        compression: str = DEFAULT_PARQUET_COMPRESSION,
+        compression_level: Optional[int] = None,
     ) -> None:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
         self.partition_column = partition_column
+        _comp = (compression or "").lower()
+        if _comp and _comp not in VALID_PARQUET_COMPRESSION:
+            raise ValueError(
+                f"Invalid compression {compression!r}; must be one of "
+                f"{sorted(VALID_PARQUET_COMPRESSION)}"
+            )
+        self.compression = _comp or DEFAULT_PARQUET_COMPRESSION
+        self.compression_level = compression_level
 
     @property
     def file_type(self) -> str:
@@ -213,7 +244,11 @@ class ParquetWriter:
             if pq_writer is None:
                 final = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
                 tmp = final + _TEMP_SUFFIX
-                pq_writer = pq.ParquetWriter(tmp, schema)
+                pq_writer = pq.ParquetWriter(
+                    tmp, schema, **_parquet_writer_kwargs(
+                        self.compression, self.compression_level,
+                    )
+                )
                 pending.append((tmp, final))
             pq_writer.write_batch(batch)
             buf.clear()
@@ -293,7 +328,10 @@ class ParquetWriter:
                     part_dir, f"{prefix}_{ts}_part{ps['part_num']}.parquet",
                 )
                 tmp = final + _TEMP_SUFFIX
-                ps["writer"] = pq.ParquetWriter(tmp, ps["schema"])
+                ps["writer"] = pq.ParquetWriter(
+                    tmp, ps["schema"],
+                    **_parquet_writer_kwargs(self.compression, self.compression_level),
+                )
                 pending.append((tmp, final))
             ps["writer"].write_batch(batch)
             ps["buf"].clear()
@@ -354,8 +392,12 @@ OP_MAP: Dict[str, str] = {
 
 
 def _make_uoid(database: str, schema: str, table: str) -> str:
-    """Deterministic UUID5 from the (database, schema, table) triple."""
-    key = f"{database}.{schema}.{table}"
+    """Deterministic UUID5 from the (database, schema, table) triple.
+
+    Uses a null-byte separator so that dotted identifiers like
+    ``("a.b", "c", "d")`` and ``("a", "b.c", "d")`` never collide.
+    """
+    key = f"{database}\x00{schema}\x00{table}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
@@ -421,9 +463,19 @@ class UnifiedParquetWriter:
         self,
         max_rows_per_file: int = 1_000_000,
         row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+        compression: str = DEFAULT_PARQUET_COMPRESSION,
+        compression_level: Optional[int] = None,
     ) -> None:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
+        _comp = (compression or "").lower()
+        if _comp and _comp not in VALID_PARQUET_COMPRESSION:
+            raise ValueError(
+                f"Invalid compression {compression!r}; must be one of "
+                f"{sorted(VALID_PARQUET_COMPRESSION)}"
+            )
+        self.compression = _comp or DEFAULT_PARQUET_COMPRESSION
+        self.compression_level = compression_level
 
     @property
     def file_type(self) -> str:
@@ -500,7 +552,10 @@ class UnifiedParquetWriter:
             if pq_writer is None:
                 final = os.path.join(dir_path, f"{prefix}_{ts_str}_part{part}.parquet")
                 tmp = final + _TEMP_SUFFIX
-                pq_writer = pq.ParquetWriter(tmp, arrow_schema)
+                pq_writer = pq.ParquetWriter(
+                    tmp, arrow_schema,
+                    **_parquet_writer_kwargs(self.compression, self.compression_level),
+                )
                 pending.append((tmp, final))
             pq_writer.write_batch(batch)
             buf_data.clear()
@@ -527,7 +582,7 @@ class UnifiedParquetWriter:
             for j, idx in enumerate(data_indices):
                 val = t[idx] if idx < len(t) else None
                 data_dict[data_col_names[j]] = val
-            buf_data.append(json.dumps(data_dict, default=str))
+            buf_data.append(_json_dumps(data_dict))
 
             buf_table_id.append(table_id_val)
 

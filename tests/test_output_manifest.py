@@ -154,6 +154,39 @@ class TestMergeAdd:
         tbl = manifest["databases"]["db1"]["dbo"]["orders"]
         assert "scd_type" not in tbl
 
+    def test_adds_soft_delete_when_true_in_result(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 10, "soft_delete": True}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["soft_delete"] is True
+
+    def test_soft_delete_omitted_when_false_in_result(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 10, "soft_delete": False}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "soft_delete" not in tbl
+
+    def test_soft_delete_omitted_when_not_in_result(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 10}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "soft_delete" not in tbl
+
     def test_skips_table_with_zero_rows_written(self):
         manifest = {"databases": {}}
         results = [
@@ -187,6 +220,38 @@ class TestMergeAdd:
         merge_add(manifest, results, "/data", "parquet")
         assert "orders" in manifest["databases"]["db1"]["dbo"]
         assert "empty_table" not in manifest["databases"]["db1"]["dbo"]
+
+    def test_soft_delete_true_with_scd_type_2(self):
+        """Both soft_delete and scd_type are stored when present."""
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5,
+              "scd_type": 2, "soft_delete": True}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["scd_type"] == 2
+        assert tbl["soft_delete"] is True
+
+    def test_manifest_preserves_soft_delete_on_second_merge(self):
+        """Adding a second table does not clobber an existing table's soft_delete flag."""
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5, "soft_delete": True}],
+            "/data",
+            "parquet",
+        )
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.customers", "rows_written": 3}],
+            "/data",
+            "parquet",
+        )
+        assert manifest["databases"]["db1"]["dbo"]["orders"]["soft_delete"] is True
+        assert "customers" in manifest["databases"]["db1"]["dbo"]
 
 
 class TestSave:

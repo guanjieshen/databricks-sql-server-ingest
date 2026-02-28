@@ -60,7 +60,8 @@ from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from ._constants import (
-    DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_SCD_TYPE,
+    DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PARQUET_COMPRESSION,
+    DEFAULT_ROW_GROUP_SIZE, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE,
     VALID_MODES, VALID_OUTPUT_FORMATS, VALID_SCD_TYPES,
 )
 from .connection import AzureSQLConnection, load_dotenv
@@ -257,10 +258,11 @@ class _ConnectionPool:
 
 
 def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
-    """Convert a table map to ``[(db, "schema.table", mode_or_none, scd_type), ...]``.
+    """Convert a table map to ``[(db, "schema.table", mode, scd_type, soft_delete), ...]``.
 
     *mode_or_none* is ``None`` for list-format entries (no per-table mode).
     *scd_type* defaults to ``DEFAULT_SCD_TYPE`` (1) when not specified.
+    *soft_delete* defaults to ``DEFAULT_SOFT_DELETE`` (False) when not specified.
     """
     entries: List[FlatEntry] = []
     for database, schemas in table_map.items():
@@ -270,12 +272,13 @@ def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
                     if isinstance(tbl_cfg, dict):
                         mode = tbl_cfg.get("mode")
                         scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
-                        entries.append((database, f"{schema}.{table}", mode, scd_type))
+                        soft_delete = tbl_cfg.get("soft_delete", DEFAULT_SOFT_DELETE)
+                        entries.append((database, f"{schema}.{table}", mode, scd_type, soft_delete))
                     else:
-                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE))
+                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE))
             else:
                 for table in tables:
-                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE))
+                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE))
     return entries
 
 
@@ -324,6 +327,12 @@ def _validate_table_map(value: object) -> TableMap:
                             raise ValueError(
                                 f"scd_type for '{db}'.'{schema}'.'{tbl}' must be one "
                                 f"of {sorted(VALID_SCD_TYPES)}, got {scd_type!r}"
+                            )
+                        soft_delete = tbl_cfg.get("soft_delete", DEFAULT_SOFT_DELETE)
+                        if not isinstance(soft_delete, bool):
+                            raise ValueError(
+                                f"soft_delete for '{db}'.'{schema}'.'{tbl}' must be "
+                                f"a bool, got {soft_delete!r}"
                             )
                     else:
                         raise TypeError(
@@ -381,6 +390,9 @@ class ChangeTracker:
         snapshot_isolation: bool = False,
         output_manifest: Optional[str] = None,
         output_format: str = DEFAULT_OUTPUT_FORMAT,
+        parquet_compression: str = DEFAULT_PARQUET_COMPRESSION,
+        parquet_compression_level: Optional[int] = None,
+        row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
     ) -> None:
         self.server = server
         self.user = user
@@ -391,9 +403,17 @@ class ChangeTracker:
         if writer is not None:
             self.writer: OutputWriter = writer
         elif output_format == "unified":
-            self.writer = UnifiedParquetWriter()
+            self.writer = UnifiedParquetWriter(
+                compression=parquet_compression,
+                compression_level=parquet_compression_level,
+                row_group_size=row_group_size,
+            )
         else:
-            self.writer = ParquetWriter()
+            self.writer = ParquetWriter(
+                compression=parquet_compression,
+                compression_level=parquet_compression_level,
+                row_group_size=row_group_size,
+            )
         self.max_workers = max(1, max_workers)
         self.batch_size = batch_size
         self.snapshot_isolation = snapshot_isolation
@@ -475,6 +495,9 @@ class ChangeTracker:
 
         is_flat = "tables" in config and isinstance(config.get("tables"), list)
         base: Optional[str] = None
+        cfg_parquet_compression: Optional[str] = None
+        cfg_parquet_compression_level: Optional[int] = None
+        cfg_row_group_size: Optional[int] = None
 
         if is_flat:
             server = expand_env(config.get("server", ""))
@@ -510,6 +533,9 @@ class ChangeTracker:
             cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
             cfg_output_format = storage.get("output_format")
+            cfg_parquet_compression = storage.get("parquet_compression")
+            cfg_parquet_compression_level = storage.get("parquet_compression_level")
+            cfg_row_group_size = storage.get("row_group_size")
 
         ct = cls(
             server=server,
@@ -525,6 +551,9 @@ class ChangeTracker:
             ),
             output_manifest=output_manifest or cfg_manifest,
             output_format=cfg_output_format or DEFAULT_OUTPUT_FORMAT,
+            parquet_compression=cfg_parquet_compression or DEFAULT_PARQUET_COMPRESSION,
+            parquet_compression_level=cfg_parquet_compression_level,
+            row_group_size=cfg_row_group_size if cfg_row_group_size is not None else DEFAULT_ROW_GROUP_SIZE,
         )
         if not is_flat and base:
             ct.ingest_pipeline = base
@@ -645,7 +674,7 @@ class ChangeTracker:
         results: List[dict] = []
 
         try:
-            for database, full_table_name, table_mode, scd_type in self._flat_tables:
+            for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
                 if database not in conns:
                     try:
                         az = AzureSQLConnection(
@@ -676,6 +705,7 @@ class ChangeTracker:
                             snapshot_isolation=self.snapshot_isolation,
                             scd_type=scd_type,
                             uc_catalog=uc_catalog,
+                            soft_delete=soft_delete,
                         )
                     )
                 except Exception as exc:
@@ -698,6 +728,7 @@ class ChangeTracker:
         full_table_name: str,
         mode: str,
         scd_type: int,
+        soft_delete: bool = False,
     ) -> dict:
         """Sync a single table using a connection from *pool*. Thread-safe."""
         try:
@@ -720,6 +751,7 @@ class ChangeTracker:
                 snapshot_isolation=self.snapshot_isolation,
                 scd_type=scd_type,
                 uc_catalog=uc_catalog,
+                soft_delete=soft_delete,
             )
             pool.release(database, az)
             return result
@@ -731,12 +763,12 @@ class ChangeTracker:
     def _run_sync_parallel(self, mode_override: Optional[str]) -> List[dict]:
         logger.info("Parallel sync with max_workers=%d", self.max_workers)
 
-        work: List[Tuple[int, str, str, str, int]] = []
-        for idx, (database, full_table_name, table_mode, scd_type) in enumerate(
+        work: List[Tuple[int, str, str, str, int, bool]] = []
+        for idx, (database, full_table_name, table_mode, scd_type, soft_delete) in enumerate(
             self._flat_tables
         ):
             mode = mode_override or table_mode or "full_incremental"
-            work.append((idx, database, full_table_name, mode, scd_type))
+            work.append((idx, database, full_table_name, mode, scd_type, soft_delete))
 
         results: List[Optional[dict]] = [None] * len(work)
         conn_pool = _ConnectionPool(self.server, self.user, self._password)
@@ -745,9 +777,9 @@ class ChangeTracker:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_idx = {
                     executor.submit(
-                        self._sync_one_table, conn_pool, db, tbl, mode, scd,
+                        self._sync_one_table, conn_pool, db, tbl, mode, scd, sd,
                     ): idx
-                    for idx, db, tbl, mode, scd in work
+                    for idx, db, tbl, mode, scd, sd in work
                 }
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]

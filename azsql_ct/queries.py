@@ -78,20 +78,48 @@ def build_full_query(full_table_name: str) -> str:
     )
 
 
-def build_incremental_query(full_table_name: str, pk_cols: List[str]) -> str:
+def table_columns(cursor: Any, full_table_name: str) -> List[str]:
+    """Return the column names for *full_table_name* (in table-definition order)."""
+    cursor.execute(f"SELECT TOP 0 * FROM {full_table_name}")
+    return [col[0] for col in cursor.description]
+
+
+def _bracket_quote(name: str) -> str:
+    """Bracket-quote a SQL Server identifier, escaping embedded ``]``."""
+    return f"[{name.replace(']', ']]')}]"
+
+
+def build_incremental_query(
+    full_table_name: str, pk_cols: List[str], all_cols: List[str],
+) -> str:
     """Return the SQL for an incremental change-tracking SELECT.
 
     The query expects a single ``?`` parameter for the *since_version*.
     Column types are cast to match :func:`build_full_query` so that initial
     and incremental Parquet outputs have identical schemas (avoids downstream
     schema merge errors).
+
+    PK columns are selected via ``COALESCE(t.[col], ct.[col])`` so that
+    DELETE records (where the source row is gone and ``t.*`` is all NULLs)
+    still carry the primary-key values from the change-tracking table.
     """
-    join_cond = " AND ".join(f"t.[{c}] = ct.[{c}]" for c in pk_cols)
+    pk_lower = {c.lower() for c in pk_cols}
+    col_exprs = []
+    for c in all_cols:
+        q = _bracket_quote(c)
+        if c.lower() in pk_lower:
+            col_exprs.append(f"COALESCE(t.{q}, ct.{q}) AS {q}")
+        else:
+            col_exprs.append(f"t.{q}")
+    data_cols = ", ".join(col_exprs)
+    join_cond = " AND ".join(
+        f"t.{_bracket_quote(c)} = ct.{_bracket_quote(c)}" for c in pk_cols
+    )
     return (
         f"SELECT ct.SYS_CHANGE_VERSION, "
         f"CAST(ct.SYS_CHANGE_CREATION_VERSION AS BIGINT) AS SYS_CHANGE_CREATION_VERSION, "
         f"CAST(ct.SYS_CHANGE_OPERATION AS NCHAR(1)) AS SYS_CHANGE_OPERATION, "
-        f"t.* "
+        f"{data_cols} "
         f"FROM CHANGETABLE(CHANGES {full_table_name}, ?) AS ct "
         f"LEFT JOIN {full_table_name} AS t ON {join_cond}"
     )

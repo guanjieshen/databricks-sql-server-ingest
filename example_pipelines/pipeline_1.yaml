@@ -12,6 +12,9 @@ storage:
   ingest_pipeline: INSERT_UC_VOLUME_PATH_HERE
   # output_format: per_table              # (default) native Parquet per table
   # output_format: unified                # Lakeflow-Connect-style bronze envelope schema
+  # parquet_compression: zstd             # (default) or snappy, gzip, brotli, lz4, none
+  # parquet_compression_level: 3          # optional; ZSTD 1-22
+  # row_group_size: 500000                # (default) rows per Parquet row group; smaller = less memory
 
 databases:
   database_1:
@@ -20,7 +23,10 @@ databases:
       dbo:
         uc_schema: INSERT_SCHEMA_NAME_HERE  # Databricks Unity Catalog schema (not used by sync)
         tables:
-          table_1: full_incremental          # string shorthand: defaults to scd_type 1
+          table_1:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: true                # keep deleted rows with _is_deleted flag
           table_59:
             mode: full_incremental
             scd_type: 2                      # SCD Type II: track historical changes

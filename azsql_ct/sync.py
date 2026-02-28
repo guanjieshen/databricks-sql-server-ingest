@@ -150,6 +150,7 @@ def sync_table(
     snapshot_isolation: bool = False,
     scd_type: int = DEFAULT_SCD_TYPE,
     uc_catalog: Optional[str] = None,
+    soft_delete: bool = False,
 ) -> dict:
     """Sync one change-tracked table.
 
@@ -173,6 +174,9 @@ def sync_table(
                             the result dict and output manifest.
         uc_catalog:         Optional Unity Catalog name; passed through to
                             the writer as ``table_metadata["catalog"]``.
+        soft_delete:        If ``True``, deletes are tracked via an
+                            ``_is_deleted`` flag rather than physical removal.
+                            Passed through to the result dict and output manifest.
 
     Returns:
         Summary dict.
@@ -204,6 +208,7 @@ def sync_table(
             snapshot_isolation=snapshot_isolation,
             scd_type=scd_type,
             uc_catalog=uc_catalog,
+            soft_delete=soft_delete,
         )
 
 
@@ -220,6 +225,7 @@ def _sync_table_locked(
     snapshot_isolation: bool = False,
     scd_type: int = DEFAULT_SCD_TYPE,
     uc_catalog: Optional[str] = None,
+    soft_delete: bool = False,
 ) -> dict:
     """Inner sync logic, called while holding the per-table lock."""
     cur_ver = queries.current_version(cur)
@@ -263,7 +269,8 @@ def _sync_table_locked(
                 f"Could not determine primary key for {full_name}. "
                 "A primary key is required for incremental change tracking JOINs."
             )
-        sql = queries.build_incremental_query(full_name, pk_cols)
+        all_cols = queries.table_columns(cur, full_name)
+        sql = queries.build_incremental_query(full_name, pk_cols, all_cols)
         logger.info(
             "Incremental sync for %s.%s (since version %d)",
             database, full_name, since,
@@ -328,6 +335,7 @@ def _sync_table_locked(
         "table": full_name,
         "mode": actual_mode,
         "scd_type": scd_type,
+        "soft_delete": soft_delete,
         "since_version": since_ver,
         "current_version": cur_ver,
         "rows_written": row_count,
