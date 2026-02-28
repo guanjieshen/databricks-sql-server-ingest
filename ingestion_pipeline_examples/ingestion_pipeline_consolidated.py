@@ -117,7 +117,9 @@ for tc in table_configs:
     )
 
     def create_flow(target, t_name, sc_name, schema, pk, scd):
-        @dp.append_flow(target=target)
+        flow_name = f"_flow_{sc_name}_{t_name}"
+
+        @dp.append_flow(target=target, name=flow_name)
         def _flow():
             return (
                 dp.read_stream("landing_raw")
