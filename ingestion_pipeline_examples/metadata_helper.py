@@ -1,7 +1,14 @@
 import json
 import os
+import uuid
 
 import yaml
+
+
+def _make_uoid(database: str, schema: str, table: str) -> str:
+    """Deterministic UUID5 matching azsql_ct.writer._make_uoid."""
+    key = f"{database}.{schema}.{table}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
 def parse_output_yaml(input_yaml_path: str):
@@ -76,6 +83,7 @@ def parse_output_yaml(input_yaml_path: str):
                     "database": db_name,
                     "schema": schema_name,
                     "table": table_name,
+                    "uoid": _make_uoid(db_name, schema_name, table_name),
                     "primary_key": table_config.get("primary_key") or [],
                     "scd_type": table_config.get("scd_type", 1),
                     "file_path": table_config.get("file_path"),

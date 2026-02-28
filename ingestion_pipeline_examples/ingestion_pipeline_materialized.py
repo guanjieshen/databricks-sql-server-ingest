@@ -100,19 +100,17 @@ for tc in table_configs:
     scd_type = tc["scd_type"]
     columns = tc["columns"]
 
+    uoid = tc["uoid"]
     silver_table_name = f"{uc_catalog}.{uc_schema}.{uc_table}"
     view_name = f"_view_{uc_catalog}_{uc_schema}_{uc_table}"
     spark_schema = _build_spark_schema(columns)
 
-    def create_view(v_name, t_name, sc_name, schema):
+    def create_view(v_name, uoid_val, schema):
         @dp.view(name=v_name)
         def _view():
             return (
                 dp.read_stream("landing_raw")
-                .filter(
-                    (F.col("table_id.schema") == sc_name)
-                    & (F.col("table_id.name") == t_name)
-                )
+                .filter(F.col("table_id.uoid") == uoid_val)
                 .withColumn("parsed", F.from_json("data", schema))
                 .select(
                     F.col("cursor.seqNum").cast("long").alias("_seq_num"),
@@ -122,7 +120,7 @@ for tc in table_configs:
             )
         return _view
 
-    create_view(view_name, table_name, schema_name, spark_schema)
+    create_view(view_name, uoid, spark_schema)
 
     dp.create_streaming_table(
         name=silver_table_name,
