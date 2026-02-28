@@ -79,9 +79,9 @@ table_configs, data_path = parse_output_yaml(input_yaml)
 
 @dp.table(
     name="landing_raw",
+    temporary=True,
     comment="Bronze: materialized unified envelope from all source tables",
     table_properties={
-        "quality": "bronze",
         "delta.autoOptimize.optimizeWrite": "true",
     },
 )
