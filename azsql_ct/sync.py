@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import errno
 import fcntl
-import glob
 import logging
 import os
 import time
@@ -28,7 +27,7 @@ from typing import Any, Generator, List, Optional, Tuple
 
 from . import queries, watermark
 from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES
-from .writer import OutputWriter, ParquetWriter
+from .writer import OutputWriter, ParquetWriter, _compute_schema_version, _make_uoid, _CT_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +148,7 @@ def sync_table(
     batch_size: int = DEFAULT_BATCH_SIZE,
     snapshot_isolation: bool = False,
     scd_type: int = DEFAULT_SCD_TYPE,
+    uc_catalog: Optional[str] = None,
 ) -> dict:
     """Sync one change-tracked table.
 
@@ -170,6 +170,8 @@ def sync_table(
         scd_type:           SCD type for this table (``1`` = overwrite,
                             ``2`` = historical tracking).  Passed through to
                             the result dict and output manifest.
+        uc_catalog:         Optional Unity Catalog name; passed through to
+                            the writer as ``table_metadata["catalog"]``.
 
     Returns:
         Summary dict.
@@ -200,7 +202,27 @@ def sync_table(
             mode=mode, writer=writer, batch_size=batch_size,
             snapshot_isolation=snapshot_isolation,
             scd_type=scd_type,
+            uc_catalog=uc_catalog,
         )
+
+
+def _columns_from_description(
+    description: Any,
+) -> List[dict]:
+    """Convert cursor.description to a list of column dicts for the manifest.
+
+    Filters out change-tracking metadata columns.
+    """
+    if not description:
+        return []
+    cols: List[dict] = []
+    for col in description:
+        name = col[0]
+        if name in _CT_COLUMNS:
+            continue
+        type_code = str(col[1]) if len(col) > 1 and col[1] is not None else "unknown"
+        cols.append({"name": name, "type": type_code})
+    return cols
 
 
 def _sync_table_locked(
@@ -215,6 +237,7 @@ def _sync_table_locked(
     batch_size: int,
     snapshot_isolation: bool = False,
     scd_type: int = DEFAULT_SCD_TYPE,
+    uc_catalog: Optional[str] = None,
 ) -> dict:
     """Inner sync logic, called while holding the per-table lock."""
     cur_ver = queries.current_version(cur)
@@ -274,7 +297,25 @@ def _sync_table_locked(
     description = cur.description
     safe_name = full_name.replace(".", "_")
     row_iter = _iter_cursor(cur, batch_size)
-    output_files, row_count = writer.write(row_iter, description, day_dir, safe_name)
+
+    schema_name, table_only = full_name.split(".", 1)
+    schema_ver = _compute_schema_version(description) if description else 0
+    extraction_ts = int(time.time() * 1000)
+
+    table_metadata = {
+        "database": database,
+        "schema": schema_name,
+        "table": table_only,
+        "catalog": uc_catalog or database,
+        "uoid": _make_uoid(database, schema_name, table_only),
+        "extraction_timestamp": extraction_ts,
+        "schema_version": schema_ver,
+    }
+
+    output_files, row_count = writer.write(
+        row_iter, description, day_dir, safe_name,
+        table_metadata=table_metadata,
+    )
 
     if do_full:
         _clear_data_files(day_dir, keep=set(output_files))
@@ -293,6 +334,8 @@ def _sync_table_locked(
         duration_seconds=elapsed,
     )
 
+    columns = _columns_from_description(description)
+
     logger.info(
         "%s.%s: %d rows written, watermark -> %d (%.1fs)",
         database, full_name, row_count, cur_ver, elapsed,
@@ -308,4 +351,6 @@ def _sync_table_locked(
         "files": output_files,
         "duration_seconds": round(elapsed, 2),
         "primary_key": pk_cols,
+        "columns": columns,
+        "schema_version": schema_ver,
     }

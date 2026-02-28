@@ -19,11 +19,11 @@ class StubWriter:
         self.calls: list = []
 
     def write(
-        self, rows, description: list, dir_path: str, prefix: str
+        self, rows, description: list, dir_path: str, prefix: str, **kwargs
     ):
         materialised = list(rows)
         self.calls.append(
-            {"rows": materialised, "description": description, "dir": dir_path, "prefix": prefix}
+            {"rows": materialised, "description": description, "dir": dir_path, "prefix": prefix, "kwargs": kwargs}
         )
         return [f"{dir_path}/{prefix}.csv"], len(materialised)
 
@@ -550,3 +550,55 @@ class TestFromConfig:
         assert by_table["dbo.t1"][3] == 2
         assert by_table["dbo.t2"][2] == "full"
         assert by_table["dbo.t2"][3] == 1
+
+
+class TestSyncTableUnifiedWriter:
+    """Tests that sync_table passes table_metadata to writer and enriches the result dict."""
+
+    def _sync(self, tmp_path, **extra_kwargs):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",), ("name",)]
+        rows = [(100, None, "L", 1, "Alice")]
+        cursor = _make_cursor(tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc)
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        writer = StubWriter()
+        kwargs = dict(
+            database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full",
+            writer=writer,
+        )
+        kwargs.update(extra_kwargs)
+        result = sync_table(conn, "dbo.Foo", **kwargs)
+        return result, writer
+
+    def test_table_metadata_passed_to_writer(self, tmp_path):
+        _result, writer = self._sync(tmp_path)
+        assert len(writer.calls) == 1
+        meta = writer.calls[0]["kwargs"]["table_metadata"]
+        assert isinstance(meta, dict)
+
+    def test_table_metadata_has_required_fields(self, tmp_path):
+        _result, writer = self._sync(tmp_path)
+        meta = writer.calls[0]["kwargs"]["table_metadata"]
+        required = {"database", "schema", "table", "catalog", "uoid", "extraction_timestamp", "schema_version"}
+        assert required.issubset(meta.keys())
+
+    def test_result_dict_includes_schema_version(self, tmp_path):
+        result, _writer = self._sync(tmp_path)
+        assert "schema_version" in result
+        assert isinstance(result["schema_version"], int)
+
+    def test_result_dict_includes_columns(self, tmp_path):
+        result, _writer = self._sync(tmp_path)
+        assert "columns" in result
+        assert isinstance(result["columns"], list)
+        col_names = [c["name"] for c in result["columns"]]
+        for ct_col in ("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION"):
+            assert ct_col not in col_names
+
+    def test_uc_catalog_passed_through(self, tmp_path):
+        _result, writer = self._sync(tmp_path, uc_catalog="my_cat")
+        meta = writer.calls[0]["kwargs"]["table_metadata"]
+        assert meta["catalog"] == "my_cat"

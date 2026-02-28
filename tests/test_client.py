@@ -1016,3 +1016,83 @@ class TestOutputManifest:
         assert manifest["databases"]["db1"]["uc_catalog_name"] == "gshen_catalog"
         assert manifest["databases"]["db1"]["dbo"]["uc_schema_name"] == "my_schema"
         assert manifest["databases"]["db1"]["dbo"]["orders"]["uc_table_name"] == "orders"
+
+
+class TestOutputFormatConfig:
+    def test_output_format_defaults_to_per_table(self):
+        ct = ChangeTracker("s", "u", "p")
+        assert ct.output_format == "per_table"
+
+    def test_output_format_stored(self):
+        ct = ChangeTracker("s", "u", "p", output_format="unified")
+        assert ct.output_format == "unified"
+
+    def test_output_format_from_config_storage_section(self):
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "storage": {"output_format": "unified"},
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.output_format == "unified"
+
+    def test_output_format_from_config_defaults_per_table(self):
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {"db1": {"dbo": ["t"]}},
+        })
+        assert ct.output_format == "per_table"
+
+    def test_unified_creates_unified_writer(self):
+        from azsql_ct.writer import UnifiedParquetWriter
+        ct = ChangeTracker("s", "u", "p", output_format="unified")
+        assert isinstance(ct.writer, UnifiedParquetWriter)
+
+    def test_per_table_creates_parquet_writer(self):
+        from azsql_ct.writer import ParquetWriter
+        ct = ChangeTracker("s", "u", "p", output_format="per_table")
+        assert isinstance(ct.writer, ParquetWriter)
+
+
+class TestSyncPassesUcCatalog:
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_sync_passes_uc_catalog_to_sync_table(self, MockAz, mock_sync):
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {"ok": True}
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {
+                "db1": {
+                    "uc_catalog": "my_catalog",
+                    "schemas": {"dbo": {"tables": {"t1": "full"}}},
+                },
+            },
+        })
+        ct.sync()
+
+        _, kwargs = mock_sync.call_args
+        assert kwargs["uc_catalog"] == "my_catalog"
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_parallel_sync_passes_uc_catalog(self, MockAz, mock_sync):
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {"ok": True}
+
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {
+                "db1": {
+                    "uc_catalog": "my_catalog",
+                    "schemas": {"dbo": {"tables": {"t1": "full"}}},
+                },
+            },
+        })
+        ct.max_workers = 2
+        ct.sync()
+
+        _, kwargs = mock_sync.call_args
+        assert kwargs["uc_catalog"] == "my_catalog"

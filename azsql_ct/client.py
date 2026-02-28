@@ -59,11 +59,14 @@ from queue import Empty, Queue
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
-from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES, VALID_SCD_TYPES
+from ._constants import (
+    DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_SCD_TYPE,
+    VALID_MODES, VALID_OUTPUT_FORMATS, VALID_SCD_TYPES,
+)
 from .connection import AzureSQLConnection, load_dotenv
 from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
-from .writer import OutputWriter, ParquetWriter
+from .writer import OutputWriter, ParquetWriter, UnifiedParquetWriter
 
 logger = logging.getLogger(__name__)
 
@@ -377,13 +380,20 @@ class ChangeTracker:
         batch_size: int = DEFAULT_BATCH_SIZE,
         snapshot_isolation: bool = False,
         output_manifest: Optional[str] = None,
+        output_format: str = DEFAULT_OUTPUT_FORMAT,
     ) -> None:
         self.server = server
         self.user = user
         self._password = password
         self.output_dir = output_dir
         self.watermark_dir = watermark_dir
-        self.writer: OutputWriter = writer or ParquetWriter()
+        self.output_format = output_format
+        if writer is not None:
+            self.writer: OutputWriter = writer
+        elif output_format == "unified":
+            self.writer = UnifiedParquetWriter()
+        else:
+            self.writer = ParquetWriter()
         self.max_workers = max(1, max_workers)
         self.batch_size = batch_size
         self.snapshot_isolation = snapshot_isolation
@@ -476,6 +486,7 @@ class ChangeTracker:
             cfg_manifest = config.get("output_manifest")
             cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
+            cfg_output_format = None
         else:
             conn_cfg = config.get("connection", {})
             server = expand_env(conn_cfg.get("server", ""))
@@ -498,6 +509,7 @@ class ChangeTracker:
                 cfg_manifest = storage.get("output_manifest")
             cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
+            cfg_output_format = storage.get("output_format")
 
         ct = cls(
             server=server,
@@ -512,6 +524,7 @@ class ChangeTracker:
                 else bool(cfg_snapshot)
             ),
             output_manifest=output_manifest or cfg_manifest,
+            output_format=cfg_output_format or DEFAULT_OUTPUT_FORMAT,
         )
         if not is_flat and base:
             ct.ingest_pipeline = base
@@ -648,6 +661,7 @@ class ChangeTracker:
                         continue
 
                 mode = mode_override or table_mode or "full_incremental"
+                uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
                 try:
                     results.append(
                         sync_table(
@@ -661,6 +675,7 @@ class ChangeTracker:
                             batch_size=self.batch_size,
                             snapshot_isolation=self.snapshot_isolation,
                             scd_type=scd_type,
+                            uc_catalog=uc_catalog,
                         )
                     )
                 except Exception as exc:
@@ -691,6 +706,7 @@ class ChangeTracker:
             logger.error("Failed to connect to %s: %s", database, exc)
             return self._error_result(database, full_table_name, exc)
 
+        uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
         try:
             result = sync_table(
                 conn,
@@ -703,6 +719,7 @@ class ChangeTracker:
                 batch_size=self.batch_size,
                 snapshot_isolation=self.snapshot_isolation,
                 scd_type=scd_type,
+                uc_catalog=uc_catalog,
             )
             pool.release(database, az)
             return result

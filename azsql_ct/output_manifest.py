@@ -4,8 +4,14 @@ The manifest is a YAML file listing each synced table with its output
 directory (file_path), file type, and UC catalog/schema names populated
 from pipeline config metadata.
 
-Update semantics: only new databases, schemas, or tables are added;
-existing entries are never overwritten so user-filled values are preserved.
+Update semantics:
+- New databases, schemas, and tables are added on first sync.
+- Existing table entries are never overwritten for user-editable fields
+  (file_path, file_type, uc_table_name, primary_key, scd_type).
+- ``columns`` uses **append-only merge**: new columns are appended,
+  deleted or renamed source columns are never removed so downstream
+  consumers see nulls instead of missing fields.
+- ``schema_version`` is always updated to the latest value.
 """
 
 from __future__ import annotations
@@ -91,12 +97,13 @@ def merge_add(
             continue
         schema, table = full_table.split(".", 1)
 
-        # Table entry already exists: do not overwrite
+        # Table entry already exists: merge columns (append-only), skip the rest
         if database in databases and isinstance(databases[database], dict):
             db_node = databases[database]
             if schema in db_node and isinstance(db_node[schema], dict):
                 schema_node = db_node[schema]
                 if table in schema_node and isinstance(schema_node[table], dict):
+                    _merge_columns(schema_node[table], result)
                     continue
 
         file_path = os.path.join(output_dir, database, schema, table)
@@ -129,10 +136,32 @@ def merge_add(
             continue
         primary_key = result.get("primary_key")
         scd_type = result.get("scd_type")
+        columns = result.get("columns")
+        schema_version = result.get("schema_version")
         schema_node[table] = _table_entry(
             file_path, file_type, primary_key=primary_key,
             uc_table_name=table, scd_type=scd_type,
+            columns=columns, schema_version=schema_version,
         )
+
+
+def _merge_columns(entry: Dict[str, Any], result: dict) -> None:
+    """Append-only merge of columns from *result* into an existing table *entry*.
+
+    New column names are appended.  Columns that disappeared from the source
+    are kept so downstream consumers see nulls instead of missing fields.
+    ``schema_version`` is always updated to the latest value.
+    """
+    new_cols = result.get("columns")
+    if new_cols:
+        existing = entry.get("columns", [])
+        existing_names = {c["name"] for c in existing}
+        added = [c for c in new_cols if c["name"] not in existing_names]
+        if added:
+            entry["columns"] = existing + added
+    new_sv = result.get("schema_version")
+    if new_sv is not None:
+        entry["schema_version"] = new_sv
 
 
 def _table_entry(
@@ -141,6 +170,8 @@ def _table_entry(
     primary_key: Optional[List[str]] = None,
     uc_table_name: Optional[str] = None,
     scd_type: Optional[int] = None,
+    columns: Optional[List[Dict[str, str]]] = None,
+    schema_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build table node with file_path, file_type, scd_type, and optional primary_key."""
     entry: Dict[str, Any] = {
@@ -152,6 +183,10 @@ def _table_entry(
         entry["scd_type"] = scd_type
     if primary_key is not None:
         entry["primary_key"] = primary_key
+    if columns is not None:
+        entry["columns"] = columns
+    if schema_version is not None:
+        entry["schema_version"] = schema_version
     return entry
 
 

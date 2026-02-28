@@ -232,3 +232,157 @@ class TestSave:
         assert "primary_key:" in raw and "  - " in raw
         data = load(str(path))
         assert data["databases"]["db1"]["dbo"]["t1"]["primary_key"] == ["id"]
+
+
+class TestMergeAddColumnEvolution:
+    def test_adds_columns_on_first_sync(self):
+        manifest = {"databases": {}}
+        results = [{
+            "database": "db1", "table": "dbo.orders", "rows_written": 10,
+            "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}],
+            "schema_version": 111,
+        }]
+        merge_add(manifest, results, "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["columns"] == [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}]
+        assert tbl["schema_version"] == 111
+
+    def test_adds_schema_version_on_first_sync(self):
+        manifest = {"databases": {}}
+        results = [{"database": "db1", "table": "dbo.orders", "rows_written": 10, "schema_version": 42}]
+        merge_add(manifest, results, "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["schema_version"] == 42
+
+    def test_columns_not_added_when_absent(self):
+        manifest = {"databases": {}}
+        results = [{"database": "db1", "table": "dbo.orders", "rows_written": 10}]
+        merge_add(manifest, results, "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "columns" not in tbl
+        assert "schema_version" not in tbl
+
+    def test_appends_new_columns_on_subsequent_sync(self):
+        manifest = {"databases": {
+            "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "orders": {
+                "file_path": "/data/db1/dbo/orders", "file_type": "parquet", "uc_table_name": "orders",
+                "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}],
+                "schema_version": 111,
+            }}},
+        }}
+        results = [{
+            "database": "db1", "table": "dbo.orders", "rows_written": 5,
+            "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}, {"name": "email", "type": "nvarchar"}],
+            "schema_version": 222,
+        }]
+        merge_add(manifest, results, "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert len(tbl["columns"]) == 3
+        assert tbl["columns"][2] == {"name": "email", "type": "nvarchar"}
+        assert tbl["schema_version"] == 222
+
+    def test_preserves_deleted_columns(self):
+        manifest = {"databases": {
+            "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "orders": {
+                "file_path": "/data/db1/dbo/orders", "file_type": "parquet", "uc_table_name": "orders",
+                "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}, {"name": "status", "type": "nvarchar"}],
+                "schema_version": 111,
+            }}},
+        }}
+        results = [{
+            "database": "db1", "table": "dbo.orders", "rows_written": 5,
+            "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}],
+            "schema_version": 222,
+        }]
+        merge_add(manifest, results, "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        col_names = [c["name"] for c in tbl["columns"]]
+        assert "status" in col_names
+        assert len(tbl["columns"]) == 3
+        assert tbl["schema_version"] == 222
+
+    def test_renamed_column_treated_as_new(self):
+        manifest = {"databases": {
+            "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "orders": {
+                "file_path": "/data/db1/dbo/orders", "file_type": "parquet", "uc_table_name": "orders",
+                "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}],
+                "schema_version": 111,
+            }}},
+        }}
+        results = [{
+            "database": "db1", "table": "dbo.orders", "rows_written": 5,
+            "columns": [{"name": "id", "type": "int"}, {"name": "full_name", "type": "nvarchar"}],
+            "schema_version": 333,
+        }]
+        merge_add(manifest, results, "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        col_names = [c["name"] for c in tbl["columns"]]
+        assert col_names == ["id", "name", "full_name"]
+        assert tbl["schema_version"] == 333
+
+    def test_schema_version_updated_on_column_change(self):
+        manifest = {"databases": {
+            "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "orders": {
+                "file_path": "/data/db1/dbo/orders", "file_type": "parquet", "uc_table_name": "orders",
+                "columns": [{"name": "id", "type": "int"}],
+                "schema_version": 100,
+            }}},
+        }}
+        results = [{
+            "database": "db1", "table": "dbo.orders", "rows_written": 5,
+            "columns": [{"name": "id", "type": "int"}],
+            "schema_version": 200,
+        }]
+        merge_add(manifest, results, "/data", "parquet")
+        assert manifest["databases"]["db1"]["dbo"]["orders"]["schema_version"] == 200
+
+    def test_other_fields_not_overwritten_during_column_merge(self):
+        manifest = {"databases": {
+            "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "orders": {
+                "file_path": "/old/path", "file_type": "parquet", "uc_table_name": "orders",
+                "columns": [{"name": "id", "type": "int"}],
+                "schema_version": 100,
+            }}},
+        }}
+        results = [{
+            "database": "db1", "table": "dbo.orders", "rows_written": 5,
+            "columns": [{"name": "id", "type": "int"}, {"name": "email", "type": "nvarchar"}],
+            "schema_version": 200,
+        }]
+        merge_add(manifest, results, "/new/data", "csv")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["file_path"] == "/old/path"
+        assert tbl["file_type"] == "parquet"
+        assert len(tbl["columns"]) == 2
+
+
+class TestSaveColumns:
+    def test_columns_list_round_trips(self, tmp_path):
+        path = tmp_path / "out.yaml"
+        manifest = {
+            "databases": {
+                "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "t1": {
+                    "file_path": "/d", "file_type": "parquet",
+                    "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}],
+                }}},
+            },
+        }
+        save(str(path), manifest)
+        loaded = load(str(path))
+        assert loaded["databases"]["db1"]["dbo"]["t1"]["columns"] == [
+            {"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"},
+        ]
+
+    def test_schema_version_round_trips(self, tmp_path):
+        path = tmp_path / "out.yaml"
+        manifest = {
+            "databases": {
+                "db1": {"uc_catalog_name": None, "dbo": {"uc_schema_name": None, "t1": {
+                    "file_path": "/d", "file_type": "parquet",
+                    "schema_version": 123456789,
+                }}},
+            },
+        }
+        save(str(path), manifest)
+        loaded = load(str(path))
+        assert loaded["databases"]["db1"]["dbo"]["t1"]["schema_version"] == 123456789

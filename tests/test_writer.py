@@ -8,7 +8,13 @@ from datetime import date, datetime
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from azsql_ct.writer import ParquetWriter
+from azsql_ct.writer import (
+    ParquetWriter,
+    UnifiedParquetWriter,
+    _compute_schema_version,
+    _make_uoid,
+    OP_MAP,
+)
 
 
 def _desc(*names: str):
@@ -160,3 +166,150 @@ class TestParquetWriter:
         assert len(files) == 2
         totals = sorted(pq.read_table(f).num_rows for f in files)
         assert totals == [3, 4]
+
+
+def _sample_metadata():
+    return {
+        "database": "db1",
+        "schema": "dbo",
+        "table": "orders",
+        "catalog": "my_catalog",
+        "uoid": "test-uoid-1234",
+        "extraction_timestamp": 1700000000000,
+        "schema_version": 999,
+    }
+
+
+class TestUnifiedParquetWriter:
+    def test_writes_bronze_schema(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id", "name")
+        rows = [(100, None, "L", 1, "Alice")]
+        files, _ = writer.write(rows, desc, str(tmp_path), "bronze", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        assert table.column_names == [
+            "data", "table_id", "cursor", "extractionTimestamp", "operation", "schemaVersion",
+        ]
+
+    def test_data_column_is_valid_json(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id", "name")
+        rows = [(100, None, "I", 1, "Alice")]
+        files, _ = writer.write(rows, desc, str(tmp_path), "json", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        import json
+        data = json.loads(table.column("data").to_pylist()[0])
+        assert "id" in data
+        assert "name" in data
+        assert "SYS_CHANGE_VERSION" not in data
+        assert "SYS_CHANGE_CREATION_VERSION" not in data
+        assert "SYS_CHANGE_OPERATION" not in data
+
+    def test_operation_mapping(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [
+            (1, None, "L", 10),
+            (2, None, "I", 20),
+            (3, None, "U", 30),
+            (4, None, "D", 40),
+        ]
+        files, _ = writer.write(rows, desc, str(tmp_path), "ops", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        ops = table.column("operation").to_pylist()
+        assert ops == ["LOAD", "INSERT", "UPDATE", "DELETE"]
+
+    def test_table_id_struct_fields(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [(100, None, "I", 1)]
+        files, _ = writer.write(rows, desc, str(tmp_path), "tid", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        tid = table.column("table_id").to_pylist()[0]
+        assert tid["catalog"] == "my_catalog"
+        assert tid["schema"] == "dbo"
+        assert tid["name"] == "orders"
+        assert tid["uoid"] == "test-uoid-1234"
+
+    def test_cursor_struct_seqnum(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [(100, None, "I", 1)]
+        files, _ = writer.write(rows, desc, str(tmp_path), "cur", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        cursor = table.column("cursor").to_pylist()[0]
+        assert cursor["seqNum"] == "100"
+
+    def test_schema_version_from_metadata(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [(1, None, "I", 10)]
+        files, _ = writer.write(rows, desc, str(tmp_path), "sv", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        assert table.column("schemaVersion").to_pylist() == [999]
+
+    def test_extraction_timestamp_from_metadata(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [(1, None, "I", 10)]
+        files, _ = writer.write(rows, desc, str(tmp_path), "ts", table_metadata=_sample_metadata())
+
+        table = pq.read_table(files[0])
+        assert table.column("extractionTimestamp").to_pylist() == [1700000000000]
+
+    def test_splits_files_at_max_rows(self, tmp_path):
+        writer = UnifiedParquetWriter(max_rows_per_file=2)
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        rows = [(i, None, "I", i) for i in range(3)]
+        files, row_count = writer.write(rows, desc, str(tmp_path), "split", table_metadata=_sample_metadata())
+
+        assert row_count == 3
+        assert len(files) == 2
+        total = sum(pq.read_table(f).num_rows for f in files)
+        assert total == 3
+
+    def test_empty_rows_no_file(self, tmp_path):
+        writer = UnifiedParquetWriter()
+        desc = _desc("SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION", "id")
+        files, row_count = writer.write([], desc, str(tmp_path), "empty", table_metadata=_sample_metadata())
+
+        assert len(files) == 0
+        assert row_count == 0
+
+
+
+class TestHelpers:
+    def test_make_uoid_deterministic(self):
+        a = _make_uoid("mydb", "dbo", "users")
+        b = _make_uoid("mydb", "dbo", "users")
+        assert a == b
+
+    def test_make_uoid_different_inputs(self):
+        a = _make_uoid("db1", "dbo", "orders")
+        b = _make_uoid("db2", "dbo", "orders")
+        assert a != b
+
+    def test_compute_schema_version_stable(self):
+        desc = _desc("col_a", "col_b")
+        a = _compute_schema_version(desc)
+        b = _compute_schema_version(desc)
+        assert a == b
+        assert isinstance(a, int)
+
+    def test_compute_schema_version_differs(self):
+        desc_a = _desc("col_a", "col_b")
+        desc_b = _desc("col_x", "col_y")
+        assert _compute_schema_version(desc_a) != _compute_schema_version(desc_b)
+
+    def test_op_map_coverage(self):
+        assert OP_MAP["I"] == "INSERT"
+        assert OP_MAP["U"] == "UPDATE"
+        assert OP_MAP["D"] == "DELETE"
+        assert OP_MAP["L"] == "LOAD"
+        assert len(OP_MAP) == 4

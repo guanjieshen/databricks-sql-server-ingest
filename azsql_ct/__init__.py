@@ -3,7 +3,7 @@
 from .client import ChangeTracker, expand_env
 from .connection import AzureSQLConnection, get_connection
 from .sync import sync_table
-from .writer import OutputWriter, ParquetWriter, WriteResult
+from .writer import OutputWriter, ParquetWriter, UnifiedParquetWriter, WriteResult
 
 __all__ = [
     "ChangeTracker",
@@ -12,6 +12,7 @@ __all__ = [
     "get_connection",
     "sync_table",
     "ParquetWriter",
+    "UnifiedParquetWriter",
     "OutputWriter",
     "WriteResult",
 ]

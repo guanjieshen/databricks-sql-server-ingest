@@ -10,6 +10,8 @@ parallelism: 4
 # Single directory for this pipeline: data, watermarks, and output manifest are written under it.
 storage:
   ingest_pipeline: INSERT_UC_VOLUME_PATH_HERE
+  # output_format: per_table              # (default) native Parquet per table
+  # output_format: unified                # Lakeflow-Connect-style bronze envelope schema
 
 databases:
   database_1:

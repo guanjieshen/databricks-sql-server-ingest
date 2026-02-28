@@ -1,6 +1,11 @@
 """Output writers for sync results.
 
-Defines the ``OutputWriter`` protocol and the ``ParquetWriter`` implementation.
+Defines the ``OutputWriter`` protocol and two implementations:
+
+* ``ParquetWriter`` -- writes native per-table Parquet (original behaviour).
+* ``UnifiedParquetWriter`` -- writes a Lakeflow-Connect-style bronze
+  envelope schema (JSON ``data`` column, ``table_id`` struct, ``cursor``
+  struct, ``operation``, ``schemaVersion``).
 
 Both follow a **write-then-rename** strategy: each file is written to a
 ``.tmp`` suffix first and only renamed to its final name after the full
@@ -14,8 +19,12 @@ reading partial files and makes cleanup of crash leftovers trivial.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import time
+import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
@@ -74,10 +83,14 @@ class OutputWriter(Protocol):
         description: Sequence[Tuple[str, ...]],
         dir_path: str,
         prefix: str,
+        **kwargs: Any,
     ) -> WriteResult:
         """Write *rows* (with column metadata in *description*) to *dir_path*.
 
         Returns ``(file_paths, row_count)``.
+
+        Implementations may accept extra keyword arguments (e.g.
+        ``table_metadata``) and should ignore any they do not recognise.
         """
         ...  # pragma: no cover
 
@@ -169,6 +182,7 @@ class ParquetWriter:
         description: Sequence[Tuple[str, ...]],
         dir_path: str,
         prefix: str,
+        **kwargs: Any,
     ) -> WriteResult:
         import pyarrow.parquet as pq
 
@@ -316,6 +330,233 @@ class ParquetWriter:
         files = _finalize_temp_files(pending)
         logger.debug(
             "Wrote %d file(s) (%d rows) to %s (partitioned by day)",
+            len(files), row_count, dir_path,
+        )
+        return files, row_count
+
+
+# ---------------------------------------------------------------------------
+# Unified (bronze envelope) writer
+# ---------------------------------------------------------------------------
+
+_CT_COLUMNS = frozenset({
+    "SYS_CHANGE_VERSION",
+    "SYS_CHANGE_CREATION_VERSION",
+    "SYS_CHANGE_OPERATION",
+})
+
+OP_MAP: Dict[str, str] = {
+    "I": "INSERT",
+    "U": "UPDATE",
+    "D": "DELETE",
+    "L": "LOAD",
+}
+
+
+def _make_uoid(database: str, schema: str, table: str) -> str:
+    """Deterministic UUID5 from the (database, schema, table) triple."""
+    key = f"{database}.{schema}.{table}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
+
+
+def _compute_schema_version(description: Sequence[Tuple[str, ...]]) -> int:
+    """Stable int64 hash from column names and type info in *description*.
+
+    Only data columns are considered (CT metadata columns are excluded).
+    """
+    parts = []
+    for col in description:
+        name = col[0]
+        if name in _CT_COLUMNS:
+            continue
+        type_code = col[1] if len(col) > 1 else ""
+        parts.append(f"{name}:{type_code}")
+    sig = "|".join(parts)
+    digest = hashlib.sha256(sig.encode()).hexdigest()
+    return int(digest[:15], 16)
+
+
+def _bronze_schema() -> Any:
+    """Return the PyArrow schema for the unified bronze envelope."""
+    import pyarrow as pa
+
+    return pa.schema([
+        ("data", pa.string()),
+        ("table_id", pa.struct([
+            ("catalog", pa.string()),
+            ("schema", pa.string()),
+            ("name", pa.string()),
+            ("uoid", pa.string()),
+        ])),
+        ("cursor", pa.struct([
+            ("lsn", pa.string()),
+            ("seqNum", pa.string()),
+            ("sequence", pa.string()),
+            ("timestamp", pa.int64()),
+        ])),
+        ("extractionTimestamp", pa.int64()),
+        ("operation", pa.string()),
+        ("schemaVersion", pa.int64()),
+    ])
+
+
+class UnifiedParquetWriter:
+    """Write query results as a Lakeflow-Connect-style bronze envelope.
+
+    Every row is transformed into the unified bronze schema:
+
+    * ``data`` -- JSON string of all non-CT data columns.
+    * ``table_id`` -- struct identifying the source table.
+    * ``cursor`` -- struct with change-tracking position info.
+    * ``extractionTimestamp`` -- epoch milliseconds of the sync.
+    * ``operation`` -- INSERT / UPDATE / DELETE / LOAD.
+    * ``schemaVersion`` -- deterministic hash of the source column set.
+
+    Requires ``table_metadata`` kwarg to be passed to :meth:`write`.
+
+    Streaming and file-splitting behaviour mirrors :class:`ParquetWriter`.
+    """
+
+    def __init__(
+        self,
+        max_rows_per_file: int = 1_000_000,
+        row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+    ) -> None:
+        self.max_rows_per_file = max_rows_per_file
+        self.row_group_size = row_group_size
+
+    @property
+    def file_type(self) -> str:
+        return "parquet"
+
+    def write(
+        self,
+        rows: Iterable,
+        description: Sequence[Tuple[str, ...]],
+        dir_path: str,
+        prefix: str,
+        **kwargs: Any,
+    ) -> WriteResult:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        meta: Dict[str, Any] = kwargs.get("table_metadata", {})
+        database = meta.get("database", "")
+        schema_name = meta.get("schema", "")
+        table_name = meta.get("table", "")
+        catalog = meta.get("catalog") or database
+        uoid = meta.get("uoid") or _make_uoid(database, schema_name, table_name)
+        extraction_ts = meta.get("extraction_timestamp") or int(time.time() * 1000)
+        schema_version = meta.get("schema_version") or _compute_schema_version(description)
+
+        col_names = [col[0] for col in description]
+        ct_map: Dict[str, int] = {}
+        data_indices: List[int] = []
+        data_col_names: List[str] = []
+        for i, name in enumerate(col_names):
+            if name in _CT_COLUMNS:
+                ct_map[name] = i
+            else:
+                data_indices.append(i)
+                data_col_names.append(name)
+
+        table_id_val = {
+            "catalog": catalog,
+            "schema": schema_name,
+            "name": table_name,
+            "uoid": uoid,
+        }
+
+        arrow_schema = _bronze_schema()
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        pending: List[Tuple[str, str]] = []
+        row_count = 0
+        pq_writer: Optional[pq.ParquetWriter] = None
+        rows_in_file = 0
+        part = 1
+
+        buf_data: List[str] = []
+        buf_table_id: List[dict] = []
+        buf_cursor: List[dict] = []
+        buf_extraction_ts: List[int] = []
+        buf_operation: List[str] = []
+        buf_schema_version: List[int] = []
+
+        def _flush() -> None:
+            nonlocal pq_writer
+            if not buf_data:
+                return
+            batch = pa.RecordBatch.from_pydict(
+                {
+                    "data": buf_data,
+                    "table_id": buf_table_id,
+                    "cursor": buf_cursor,
+                    "extractionTimestamp": buf_extraction_ts,
+                    "operation": buf_operation,
+                    "schemaVersion": buf_schema_version,
+                },
+                schema=arrow_schema,
+            )
+            if pq_writer is None:
+                final = os.path.join(dir_path, f"{prefix}_{ts_str}_part{part}.parquet")
+                tmp = final + _TEMP_SUFFIX
+                pq_writer = pq.ParquetWriter(tmp, arrow_schema)
+                pending.append((tmp, final))
+            pq_writer.write_batch(batch)
+            buf_data.clear()
+            buf_table_id.clear()
+            buf_cursor.clear()
+            buf_extraction_ts.clear()
+            buf_operation.clear()
+            buf_schema_version.clear()
+
+        def _close_file() -> None:
+            nonlocal pq_writer, rows_in_file, part
+            if pq_writer is not None:
+                pq_writer.close()
+                pq_writer = None
+            rows_in_file = 0
+            part += 1
+
+        for row in rows:
+            t = tuple(row)
+            row_count += 1
+            rows_in_file += 1
+
+            data_dict = {}
+            for j, idx in enumerate(data_indices):
+                val = t[idx] if idx < len(t) else None
+                data_dict[data_col_names[j]] = val
+            buf_data.append(json.dumps(data_dict, default=str))
+
+            buf_table_id.append(table_id_val)
+
+            change_ver = t[ct_map["SYS_CHANGE_VERSION"]] if "SYS_CHANGE_VERSION" in ct_map else None
+            raw_op = t[ct_map["SYS_CHANGE_OPERATION"]] if "SYS_CHANGE_OPERATION" in ct_map else None
+            buf_cursor.append({
+                "lsn": None,
+                "seqNum": str(change_ver) if change_ver is not None else None,
+                "sequence": str(change_ver) if change_ver is not None else None,
+                "timestamp": None,
+            })
+            buf_extraction_ts.append(extraction_ts)
+            buf_operation.append(OP_MAP.get(str(raw_op).strip() if raw_op else "", str(raw_op) if raw_op else "UNKNOWN"))
+            buf_schema_version.append(schema_version)
+
+            if len(buf_data) >= self.row_group_size:
+                _flush()
+
+            if rows_in_file >= self.max_rows_per_file:
+                _flush()
+                _close_file()
+
+        _flush()
+        if pq_writer is not None:
+            pq_writer.close()
+
+        files = _finalize_temp_files(pending)
+        logger.debug(
+            "Wrote %d unified file(s) (%d rows) to %s",
             len(files), row_count, dir_path,
         )
         return files, row_count
