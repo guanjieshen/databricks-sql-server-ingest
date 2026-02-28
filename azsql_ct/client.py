@@ -52,8 +52,10 @@ import json
 import logging
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Empty, Queue
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -195,6 +197,60 @@ def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[st
 TableSpec = Union[List[str], Dict[str, Any]]
 TableMap = Dict[str, Dict[str, TableSpec]]
 FlatEntry = Tuple[str, str, Optional[str], int]
+
+
+class _ConnectionPool:
+    """Thread-safe pool of :class:`AzureSQLConnection` objects keyed by database.
+
+    Workers :meth:`acquire` a connection before syncing a table and
+    :meth:`release` it back when done.  Connections are created lazily on
+    first acquire and reused on subsequent ones, so the pool never holds
+    more connections than the number of concurrent workers.
+
+    On sync failure the caller should **not** release the connection (it may
+    be in a bad state); a fresh one will be created on the next acquire.
+    """
+
+    def __init__(self, server: str, user: str, password: str) -> None:
+        self._server = server
+        self._user = user
+        self._password = password
+        self._queues: Dict[str, Queue] = {}
+        self._lock = threading.Lock()
+
+    def _queue_for(self, database: str) -> Queue:
+        with self._lock:
+            if database not in self._queues:
+                self._queues[database] = Queue()
+            return self._queues[database]
+
+    def acquire(self, database: str) -> Tuple[AzureSQLConnection, Any]:
+        """Return an ``(AzureSQLConnection, conn)`` pair, reusing an idle one
+        if available or creating a new one otherwise."""
+        q = self._queue_for(database)
+        try:
+            az = q.get_nowait()
+            return az, az.connect()
+        except Empty:
+            az = AzureSQLConnection(
+                server=self._server, user=self._user,
+                password=self._password, database=database,
+            )
+            return az, az.connect()
+
+    def release(self, database: str, az: AzureSQLConnection) -> None:
+        """Return a healthy connection to the pool for reuse."""
+        self._queue_for(database).put(az)
+
+    def close_all(self) -> None:
+        """Close every connection in the pool."""
+        for q in self._queues.values():
+            while True:
+                try:
+                    az = q.get_nowait()
+                    az.close()
+                except Empty:
+                    break
 
 
 def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
@@ -621,21 +677,22 @@ class ChangeTracker:
     # -- parallel (max_workers>1) -------------------------------------------
 
     def _sync_one_table(
-        self, database: str, full_table_name: str, mode: str, scd_type: int,
+        self,
+        pool: _ConnectionPool,
+        database: str,
+        full_table_name: str,
+        mode: str,
+        scd_type: int,
     ) -> dict:
-        """Sync a single table with its own connection. Thread-safe."""
+        """Sync a single table using a connection from *pool*. Thread-safe."""
         try:
-            az = AzureSQLConnection(
-                server=self.server, user=self.user,
-                password=self._password, database=database,
-            )
-            conn = az.connect()
+            az, conn = pool.acquire(database)
         except Exception as exc:
             logger.error("Failed to connect to %s: %s", database, exc)
             return self._error_result(database, full_table_name, exc)
 
         try:
-            return sync_table(
+            result = sync_table(
                 conn,
                 full_table_name,
                 database=database,
@@ -647,11 +704,12 @@ class ChangeTracker:
                 snapshot_isolation=self.snapshot_isolation,
                 scd_type=scd_type,
             )
+            pool.release(database, az)
+            return result
         except Exception as exc:
             logger.error("Failed to sync %s.%s: %s", database, full_table_name, exc)
-            return self._error_result(database, full_table_name, exc, mode)
-        finally:
             az.close()
+            return self._error_result(database, full_table_name, exc, mode)
 
     def _run_sync_parallel(self, mode_override: Optional[str]) -> List[dict]:
         logger.info("Parallel sync with max_workers=%d", self.max_workers)
@@ -664,15 +722,21 @@ class ChangeTracker:
             work.append((idx, database, full_table_name, mode, scd_type))
 
         results: List[Optional[dict]] = [None] * len(work)
+        conn_pool = _ConnectionPool(self.server, self.user, self._password)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            future_to_idx = {
-                pool.submit(self._sync_one_table, db, tbl, mode, scd): idx
-                for idx, db, tbl, mode, scd in work
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                results[idx] = future.result()
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(
+                        self._sync_one_table, conn_pool, db, tbl, mode, scd,
+                    ): idx
+                    for idx, db, tbl, mode, scd in work
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    results[idx] = future.result()
+        finally:
+            conn_pool.close_all()
 
         return results  # type: ignore[return-value]
 

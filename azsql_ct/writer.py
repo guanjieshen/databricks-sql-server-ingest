@@ -6,6 +6,10 @@ Both follow a **write-then-rename** strategy: each file is written to a
 ``.tmp`` suffix first and only renamed to its final name after the full
 write completes successfully.  This prevents downstream consumers from
 reading partial files and makes cleanup of crash leftovers trivial.
+
+``ParquetWriter`` streams row groups incrementally via
+``pyarrow.parquet.ParquetWriter`` so that peak memory is proportional to
+*row_group_size* (default 500 K rows) rather than *max_rows_per_file*.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tupl
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROW_GROUP_SIZE = 500_000
+_PARTITION_BUFFER_CAP = 10_000
 _TEMP_SUFFIX = ".tmp"
 
 WriteResult = Tuple[List[str], int]
@@ -47,7 +52,6 @@ def _value_to_partition_date(value: Any) -> str:
         return value.isoformat()
     if isinstance(value, str):
         try:
-            # Try YYYY-MM-DD or datetime string
             if "T" in value or " " in value:
                 return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
             return value[:10] if len(value) >= 10 else "_unknown"
@@ -79,15 +83,19 @@ class OutputWriter(Protocol):
 
 
 class ParquetWriter:
-    """Write query results to Parquet files.
+    """Write query results to Parquet files via streaming row groups.
+
+    Rows are buffered in chunks of *row_group_size* and written incrementally
+    using ``pyarrow.parquet.ParquetWriter``.  Peak memory is proportional to
+    *row_group_size* rather than *max_rows_per_file*.
 
     Splits output into multiple files when *max_rows_per_file* is exceeded.
-    Uses *row_group_size* to control the row-group granularity inside each
-    Parquet file.
 
     If *partition_column* is set, files are written under *dir_path* in
-    day subdirectories (YYYY-MM-DD) based on that column's value. Rows
-    with null/invalid values go under ``_unknown``.
+    day subdirectories (YYYY-MM-DD) based on that column's value.  Rows
+    with null/invalid values go under ``_unknown``.  Per-partition buffers
+    are capped at ``min(row_group_size, 10_000)`` to bound memory when many
+    partitions are open simultaneously.
 
     Requires ``pyarrow`` (pre-installed on Databricks; install separately
     elsewhere with ``pip install pyarrow``).
@@ -121,36 +129,39 @@ class ParquetWriter:
         return values
 
     @staticmethod
-    def _write_file(
-        path: str,
+    def _rows_to_batch(
+        rows: List[tuple],
         col_names: List[str],
-        batch: List[tuple],
-        row_group_size: int,
-    ) -> None:
+        schema: Any = None,
+    ) -> Tuple[Any, Any]:
+        """Convert a buffer of row tuples into a ``pa.RecordBatch``.
+
+        On the first call (*schema* is ``None``), the schema is inferred from
+        the data.  All-null columns are cast to ``int64`` so the Parquet
+        schema stays consistent across full and incremental writes.
+
+        Returns ``(record_batch, schema)`` so the caller can reuse the schema
+        for subsequent batches.
+        """
         import pyarrow as pa
-        import pyarrow.parquet as pq
 
         columns = {
-            name: ParquetWriter._coerce_column([row[i] for row in batch])
+            name: ParquetWriter._coerce_column([row[i] for row in rows])
             for i, name in enumerate(col_names)
         }
-        table = pa.table(columns)
 
-        # When every value in a column is None, PyArrow infers type `null`.
-        # Cast these to int64 so the Parquet schema stays consistent across
-        # full (all-NULL metadata cols) and incremental writes.
-        null_cols = [
-            f for f in table.schema if pa.types.is_null(f.type)
-        ]
-        if null_cols:
-            table = table.cast(
-                pa.schema(
-                    f.with_type(pa.int64()) if pa.types.is_null(f.type) else f
-                    for f in table.schema
-                )
+        if schema is None:
+            table = pa.table(columns)
+            has_nulls = any(pa.types.is_null(f.type) for f in table.schema)
+            schema = pa.schema(
+                f.with_type(pa.int64()) if pa.types.is_null(f.type) else f
+                for f in table.schema
             )
+            if has_nulls:
+                table = table.cast(schema)
+            return table.to_batches()[0], schema
 
-        pq.write_table(table, path, row_group_size=row_group_size)
+        return pa.RecordBatch.from_pydict(columns, schema=schema), schema
 
     def write(
         self,
@@ -159,6 +170,8 @@ class ParquetWriter:
         dir_path: str,
         prefix: str,
     ) -> WriteResult:
+        import pyarrow.parquet as pq
+
         col_names = [col[0] for col in description]
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         pending: List[Tuple[str, str]] = []
@@ -169,28 +182,51 @@ class ParquetWriter:
             partition_idx = col_names.index(self.partition_column)
         if partition_idx is not None:
             return self._write_partitioned(
-                rows, col_names, dir_path, prefix, ts, pending, partition_idx,
+                rows, col_names, dir_path, prefix, ts, partition_idx,
             )
 
+        schema: Any = None
+        pq_writer: Optional[pq.ParquetWriter] = None
+        rows_in_file = 0
         part = 1
-        batch: List[tuple] = []
-        for row in rows:
-            batch.append(tuple(row))
-            row_count += 1
+        buf: List[tuple] = []
 
-            if len(batch) >= self.max_rows_per_file:
+        def _flush() -> None:
+            nonlocal schema, pq_writer
+            if not buf:
+                return
+            batch, schema = self._rows_to_batch(buf, col_names, schema)
+            if pq_writer is None:
                 final = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
                 tmp = final + _TEMP_SUFFIX
-                self._write_file(tmp, col_names, batch, self.row_group_size)
+                pq_writer = pq.ParquetWriter(tmp, schema)
                 pending.append((tmp, final))
-                batch = []
-                part += 1
+            pq_writer.write_batch(batch)
+            buf.clear()
 
-        if batch:
-            final = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
-            tmp = final + _TEMP_SUFFIX
-            self._write_file(tmp, col_names, batch, self.row_group_size)
-            pending.append((tmp, final))
+        def _close_file() -> None:
+            nonlocal pq_writer, rows_in_file, part
+            if pq_writer is not None:
+                pq_writer.close()
+                pq_writer = None
+            rows_in_file = 0
+            part += 1
+
+        for row in rows:
+            buf.append(tuple(row))
+            row_count += 1
+            rows_in_file += 1
+
+            if len(buf) >= self.row_group_size:
+                _flush()
+
+            if rows_in_file >= self.max_rows_per_file:
+                _flush()
+                _close_file()
+
+        _flush()
+        if pq_writer is not None:
+            pq_writer.close()
 
         files = _finalize_temp_files(pending)
         logger.debug("Wrote %d file(s) (%d rows) to %s", len(files), row_count, dir_path)
@@ -203,32 +239,79 @@ class ParquetWriter:
         dir_path: str,
         prefix: str,
         ts: str,
-        pending: List[Tuple[str, str]],
         partition_idx: int,
     ) -> WriteResult:
-        """Buffer rows by partition date, then write one or more files per day."""
-        by_day: Dict[str, List[tuple]] = {}
+        """Stream rows into per-partition Parquet writers.
+
+        Each partition maintains a small buffer that is flushed as a row group
+        when it reaches ``min(row_group_size, _PARTITION_BUFFER_CAP)``.  This
+        bounds memory even when many partitions are open simultaneously.
+        """
+        import pyarrow.parquet as pq
+
+        flush_size = min(self.row_group_size, _PARTITION_BUFFER_CAP)
+        pending: List[Tuple[str, str]] = []
         row_count = 0
+
+        parts: Dict[str, dict] = {}
+
+        def _ensure(key: str) -> dict:
+            if key not in parts:
+                parts[key] = {
+                    "writer": None,
+                    "buf": [],
+                    "rows_in_file": 0,
+                    "part_num": 1,
+                    "schema": None,
+                }
+            return parts[key]
+
+        def _flush_part(key: str, ps: dict) -> None:
+            if not ps["buf"]:
+                return
+            batch, ps["schema"] = self._rows_to_batch(
+                ps["buf"], col_names, ps["schema"],
+            )
+            if ps["writer"] is None:
+                part_dir = os.path.join(dir_path, key)
+                os.makedirs(part_dir, exist_ok=True)
+                final = os.path.join(
+                    part_dir, f"{prefix}_{ts}_part{ps['part_num']}.parquet",
+                )
+                tmp = final + _TEMP_SUFFIX
+                ps["writer"] = pq.ParquetWriter(tmp, ps["schema"])
+                pending.append((tmp, final))
+            ps["writer"].write_batch(batch)
+            ps["buf"].clear()
+
+        def _close_part_file(ps: dict) -> None:
+            if ps["writer"] is not None:
+                ps["writer"].close()
+                ps["writer"] = None
+            ps["rows_in_file"] = 0
+            ps["part_num"] += 1
 
         for row in rows:
             t = tuple(row)
             row_count += 1
-            key = _value_to_partition_date(t[partition_idx] if partition_idx < len(t) else None)
-            by_day.setdefault(key, []).append(t)
+            key = _value_to_partition_date(
+                t[partition_idx] if partition_idx < len(t) else None,
+            )
+            ps = _ensure(key)
+            ps["buf"].append(t)
+            ps["rows_in_file"] += 1
 
-        for part_date, batch in by_day.items():
-            part_dir = os.path.join(dir_path, part_date)
-            os.makedirs(part_dir, exist_ok=True)
-            offset = 0
-            part = 1
-            while offset < len(batch):
-                chunk = batch[offset : offset + self.max_rows_per_file]
-                offset += len(chunk)
-                final = os.path.join(part_dir, f"{prefix}_{ts}_part{part}.parquet")
-                tmp = final + _TEMP_SUFFIX
-                self._write_file(tmp, col_names, chunk, self.row_group_size)
-                pending.append((tmp, final))
-                part += 1
+            if len(ps["buf"]) >= flush_size:
+                _flush_part(key, ps)
+
+            if ps["rows_in_file"] >= self.max_rows_per_file:
+                _flush_part(key, ps)
+                _close_part_file(ps)
+
+        for key, ps in parts.items():
+            _flush_part(key, ps)
+            if ps["writer"] is not None:
+                ps["writer"].close()
 
         files = _finalize_temp_files(pending)
         logger.debug(

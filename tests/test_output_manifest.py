@@ -36,7 +36,7 @@ class TestMergeAdd:
         assert manifest["databases"]["db1"]["uc_catalog_name"] is None
         assert manifest["databases"]["db1"]["dbo"]["uc_schema_name"] is None
         tbl = manifest["databases"]["db1"]["dbo"]["orders"]
-        assert "uc_table_name" not in tbl
+        assert tbl["uc_table_name"] == "orders"
         assert tbl["file_path"] == "/data/db1/dbo/orders"
         assert tbl["file_type"] == "parquet"
 

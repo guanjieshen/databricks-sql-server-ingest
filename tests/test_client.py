@@ -632,14 +632,14 @@ class TestParallelSync:
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
-    def test_parallel_each_table_gets_own_connection(self, MockAz, mock_sync):
+    def test_parallel_connections_bounded_by_workers(self, MockAz, mock_sync):
         mock_sync.return_value = {"ok": True}
 
         ct = ChangeTracker("srv", "usr", "pw", max_workers=3)
         ct.tables = {"db1": {"dbo": ["t1", "t2", "t3"]}}
         ct.full_load()
 
-        assert MockAz.call_count == 3
+        assert MockAz.call_count <= 3
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
@@ -715,6 +715,132 @@ class TestParallelSync:
 
         for inst in instances:
             inst.close.assert_called_once()
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_parallel_reuses_connections_for_same_database(self, MockAz, mock_sync):
+        import time
+
+        instances: List[MagicMock] = []
+
+        def make_az(**kw):
+            m = MagicMock()
+            m.connect.return_value = MagicMock()
+            instances.append(m)
+            return m
+
+        MockAz.side_effect = make_az
+
+        def slow_sync(conn, table_name, **kw):
+            time.sleep(0.01)
+            return {"table": table_name, "ok": True}
+
+        mock_sync.side_effect = slow_sync
+
+        ct = ChangeTracker("srv", "usr", "pw", max_workers=2)
+        ct.tables = {"db1": {"dbo": [f"t{i}" for i in range(6)]}}
+        results = ct.full_load()
+
+        assert len(results) == 6
+        assert all(r["ok"] for r in results)
+        assert MockAz.call_count <= 2
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_parallel_failed_sync_does_not_return_connection_to_pool(self, MockAz, mock_sync):
+        """When a sync fails, the connection is discarded (not released back
+        to the pool).  Verifying indirectly: all errors are reported and
+        remaining tables still succeed."""
+        instances: List[MagicMock] = []
+
+        def make_az(**kw):
+            m = MagicMock()
+            m.connect.return_value = MagicMock()
+            instances.append(m)
+            return m
+
+        MockAz.side_effect = make_az
+
+        def fail_t2(conn, table_name, **kw):
+            if "t2" in table_name:
+                raise RuntimeError("transient error")
+            return {"table": table_name, "ok": True}
+
+        mock_sync.side_effect = fail_t2
+
+        ct = ChangeTracker("srv", "usr", "pw", max_workers=2)
+        ct.tables = {"db1": {"dbo": ["t1", "t2", "t3"]}}
+        results = ct.full_load()
+
+        assert results[0]["ok"] is True
+        assert results[1]["status"] == "error"
+        assert results[2]["ok"] is True
+        for inst in instances:
+            inst.close.assert_called_once()
+
+
+class TestConnectionPool:
+    """Unit tests for the _ConnectionPool class."""
+
+    def test_acquire_creates_new_connection(self):
+        from azsql_ct.client import _ConnectionPool
+
+        mock_az = MagicMock()
+        mock_az.connect.return_value = MagicMock()
+        with patch("azsql_ct.client.AzureSQLConnection", return_value=mock_az):
+            pool = _ConnectionPool("srv", "usr", "pw")
+            az, conn = pool.acquire("db1")
+            assert az is mock_az
+            mock_az.connect.assert_called_once()
+
+    def test_release_and_reacquire(self):
+        from azsql_ct.client import _ConnectionPool
+
+        instances = []
+
+        def make_az(**kw):
+            m = MagicMock()
+            m.connect.return_value = MagicMock()
+            instances.append(m)
+            return m
+
+        with patch("azsql_ct.client.AzureSQLConnection", side_effect=make_az):
+            pool = _ConnectionPool("srv", "usr", "pw")
+            az1, _ = pool.acquire("db1")
+            pool.release("db1", az1)
+            az2, _ = pool.acquire("db1")
+            assert az2 is az1
+            assert len(instances) == 1
+
+    def test_separate_pools_per_database(self):
+        from azsql_ct.client import _ConnectionPool
+
+        instances = []
+
+        def make_az(**kw):
+            m = MagicMock()
+            m.connect.return_value = MagicMock()
+            instances.append(m)
+            return m
+
+        with patch("azsql_ct.client.AzureSQLConnection", side_effect=make_az):
+            pool = _ConnectionPool("srv", "usr", "pw")
+            az1, _ = pool.acquire("db1")
+            az2, _ = pool.acquire("db2")
+            assert az1 is not az2
+            assert len(instances) == 2
+
+    def test_close_all_closes_pooled_connections(self):
+        from azsql_ct.client import _ConnectionPool
+
+        mock_az = MagicMock()
+        mock_az.connect.return_value = MagicMock()
+        with patch("azsql_ct.client.AzureSQLConnection", return_value=mock_az):
+            pool = _ConnectionPool("srv", "usr", "pw")
+            az, _ = pool.acquire("db1")
+            pool.release("db1", az)
+            pool.close_all()
+            mock_az.close.assert_called_once()
 
 
 class TestMaxWorkersConfig:
@@ -889,4 +1015,4 @@ class TestOutputManifest:
         manifest = load(str(manifest_path))
         assert manifest["databases"]["db1"]["uc_catalog_name"] == "gshen_catalog"
         assert manifest["databases"]["db1"]["dbo"]["uc_schema_name"] == "my_schema"
-        assert "uc_table_name" not in manifest["databases"]["db1"]["dbo"]["orders"]
+        assert manifest["databases"]["db1"]["dbo"]["orders"]["uc_table_name"] == "orders"

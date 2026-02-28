@@ -117,3 +117,46 @@ class TestParquetWriter:
             assert os.path.isfile(f)
         total = sum(pq.read_table(p).num_rows for p in files)
         assert total == 3
+
+    def test_streaming_row_groups(self, tmp_path):
+        """row_group_size controls how many row groups are written per file."""
+        writer = ParquetWriter(max_rows_per_file=100, row_group_size=3)
+        rows = [(i, f"v{i}") for i in range(7)]
+        desc = _desc("id", "val")
+        files, row_count = writer.write(rows, desc, str(tmp_path), "rg")
+
+        assert row_count == 7
+        assert len(files) == 1
+        pf = pq.ParquetFile(files[0])
+        assert pf.metadata.num_row_groups == 3  # ceil(7 / 3)
+        assert pf.metadata.num_rows == 7
+
+    def test_streaming_splits_files_at_max_rows(self, tmp_path):
+        """Files are split at max_rows_per_file even with small row_group_size."""
+        writer = ParquetWriter(max_rows_per_file=5, row_group_size=2)
+        rows = [(i,) for i in range(11)]
+        desc = _desc("id")
+        files, row_count = writer.write(rows, desc, str(tmp_path), "split")
+
+        assert row_count == 11
+        assert len(files) == 3  # 5, 5, 1
+        totals = [pq.read_table(f).num_rows for f in files]
+        assert totals == [5, 5, 1]
+
+    def test_streaming_partitioned_row_groups(self, tmp_path):
+        """Partitioned writes produce per-partition files with correct rows."""
+        from datetime import timezone
+
+        writer = ParquetWriter(partition_column="dt", max_rows_per_file=100)
+        rows = [
+            (i, datetime(2025, 1, 1, i, tzinfo=timezone.utc)) for i in range(4)
+        ] + [
+            (i, datetime(2025, 1, 2, i, tzinfo=timezone.utc)) for i in range(3)
+        ]
+        desc = _desc("id", "dt")
+        files, row_count = writer.write(rows, desc, str(tmp_path), "part")
+
+        assert row_count == 7
+        assert len(files) == 2
+        totals = sorted(pq.read_table(f).num_rows for f in files)
+        assert totals == [3, 4]
