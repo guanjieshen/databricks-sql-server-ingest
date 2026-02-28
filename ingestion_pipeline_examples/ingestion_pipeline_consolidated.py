@@ -134,8 +134,9 @@ for tc in table_configs:
             )
 
         if pk:
-            dp.apply_changes(
+            dp.create_auto_cdc_flow(
                 target=target,
+                source=target,
                 keys=pk if isinstance(pk, list) else [pk],
                 sequence_by="_seq_num",
                 stored_as_scd_type=scd,
