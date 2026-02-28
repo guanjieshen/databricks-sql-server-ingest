@@ -25,9 +25,10 @@ import time
 from datetime import date
 from typing import Any, Generator, List, Optional, Tuple
 
-from . import queries, watermark
+from . import queries, schema, watermark
 from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES
-from .writer import OutputWriter, ParquetWriter, _compute_schema_version, _make_uoid, _CT_COLUMNS
+from .schema import columns_from_description
+from .writer import OutputWriter, ParquetWriter, _compute_schema_version, _make_uoid
 
 logger = logging.getLogger(__name__)
 
@@ -206,25 +207,6 @@ def sync_table(
         )
 
 
-def _columns_from_description(
-    description: Any,
-) -> List[dict]:
-    """Convert cursor.description to a list of column dicts for the manifest.
-
-    Filters out change-tracking metadata columns.
-    """
-    if not description:
-        return []
-    cols: List[dict] = []
-    for col in description:
-        name = col[0]
-        if name in _CT_COLUMNS:
-            continue
-        type_code = str(col[1]) if len(col) > 1 and col[1] is not None else "unknown"
-        cols.append({"name": name, "type": type_code})
-    return cols
-
-
 def _sync_table_locked(
     cur: Any,
     full_name: str,
@@ -334,7 +316,8 @@ def _sync_table_locked(
         duration_seconds=elapsed,
     )
 
-    columns = _columns_from_description(description)
+    columns = columns_from_description(description)
+    schema.save(wm_dir, columns, schema_ver)
 
     logger.info(
         "%s.%s: %d rows written, watermark -> %d (%.1fs)",

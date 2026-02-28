@@ -949,6 +949,8 @@ class TestOutputManifest:
         manifest = load(str(manifest_path))
         assert manifest["databases"]["db1"]["dbo"]["orders"]["file_path"] == str(tmp_path / "data" / "db1" / "dbo" / "orders")
         assert manifest["databases"]["db1"]["dbo"]["orders"]["file_type"] == "parquet"
+        assert "columns" not in manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "schema_version" not in manifest["databases"]["db1"]["dbo"]["orders"]
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")

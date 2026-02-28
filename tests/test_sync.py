@@ -602,3 +602,19 @@ class TestSyncTableUnifiedWriter:
         _result, writer = self._sync(tmp_path, uc_catalog="my_cat")
         meta = writer.calls[0]["kwargs"]["table_metadata"]
         assert meta["catalog"] == "my_cat"
+
+    def test_schema_file_written_after_sync(self, tmp_path):
+        self._sync(tmp_path)
+        schema_path = tmp_path / "wm" / "db1" / "dbo" / "Foo" / "schema.json"
+        assert schema_path.exists()
+
+    def test_schema_file_contains_correct_columns(self, tmp_path):
+        import json
+        self._sync(tmp_path)
+        schema_path = tmp_path / "wm" / "db1" / "dbo" / "Foo" / "schema.json"
+        data = json.loads(schema_path.read_text())
+        col_names = [c["name"] for c in data["columns"]]
+        assert "id" in col_names
+        assert "name" in col_names
+        assert "SYS_CHANGE_VERSION" not in col_names
+        assert isinstance(data["schema_version"], int)
