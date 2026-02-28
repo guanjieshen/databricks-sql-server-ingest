@@ -1,10 +1,14 @@
-"""Consolidated ingestion pipeline: materialized landing + append_flow.
+"""Consolidated ingestion pipeline: materialized landing + per-table CDC.
 
-DAG: N+1 nodes (1 landing table + N silver targets).
-No intermediate staging tables or views -- filter + from_json happens
-inline in each append_flow edge.
+Key difference from ingestion_pipeline.py: the landing table is
+materialized as Delta (not a view), so data is read from cloud storage
+once and downstream reads benefit from Delta data skipping.
 
-Compare against ingestion_pipeline.py (2N+1 nodes) for benchmarking.
+DAG: 2N+1 nodes (same structure as ingestion_pipeline.py, but landing
+is a table instead of a view for better read performance).
+
+Compare against ingestion_pipeline.py to benchmark materialized landing
+vs view-based landing.
 """
 
 from pyspark import pipelines as dp
@@ -69,7 +73,8 @@ table_configs, data_path = parse_output_yaml(input_yaml)
 
 # ---------------------------------------------------------------------------
 # BRONZE: Materialized landing table (1 DAG node)
-# Data is written to Delta once; downstream reads use Delta data skipping.
+# Data is written to Delta once; downstream reads use Delta data skipping
+# instead of re-reading all Parquet files for each table.
 # ---------------------------------------------------------------------------
 
 @dp.table(
@@ -90,8 +95,8 @@ def landing_raw():
 
 
 # ---------------------------------------------------------------------------
-# SILVER: Per-table append_flow + apply_changes (1 DAG node each)
-# No staging tables or views -- filter + from_json inline in append_flow.
+# SILVER: Per-table view + create_auto_cdc_flow (2 DAG nodes each)
+# Views filter + parse JSON from the materialized landing table.
 # ---------------------------------------------------------------------------
 
 for tc in table_configs:
@@ -105,22 +110,12 @@ for tc in table_configs:
     columns = tc["columns"]
 
     silver_table_name = f"{uc_catalog}.{uc_schema}.{uc_table}"
+    view_name = f"_view_{uc_catalog}_{uc_schema}_{uc_table}"
     spark_schema = _build_spark_schema(columns)
 
-    dp.create_streaming_table(
-        name=silver_table_name,
-        comment=f"Silver: SCD Type {scd_type} from {table_name}",
-        table_properties={
-            "delta.feature.timestampNtz": "supported",
-            "delta.enableChangeDataFeed": "true",
-        },
-    )
-
-    def create_flow(target, t_name, sc_name, schema, pk, scd):
-        flow_name = f"_flow_{sc_name}_{t_name}"
-
-        @dp.append_flow(target=target, name=flow_name)
-        def _flow():
+    def create_view(v_name, t_name, sc_name, schema):
+        @dp.view(name=v_name)
+        def _view():
             return (
                 dp.read_stream("landing_raw")
                 .filter(
@@ -134,20 +129,27 @@ for tc in table_configs:
                     "parsed.*",
                 )
             )
+        return _view
 
-        if pk:
-            dp.create_auto_cdc_flow(
-                target=target,
-                source=target,
-                keys=pk if isinstance(pk, list) else [pk],
-                sequence_by="_seq_num",
-                stored_as_scd_type=scd,
-                ignore_null_updates=True,
-                apply_as_deletes=F.expr("operation = 'DELETE'"),
-                except_column_list=["_seq_num", "operation"],
-            )
+    create_view(view_name, table_name, schema_name, spark_schema)
 
-    create_flow(
-        silver_table_name, table_name, schema_name,
-        spark_schema, primary_key, scd_type,
+    dp.create_streaming_table(
+        name=silver_table_name,
+        comment=f"Silver: SCD Type {scd_type} from {table_name}",
+        table_properties={
+            "delta.feature.timestampNtz": "supported",
+            "delta.enableChangeDataFeed": "true",
+        },
     )
+
+    if primary_key:
+        dp.create_auto_cdc_flow(
+            target=silver_table_name,
+            source=view_name,
+            keys=primary_key if isinstance(primary_key, list) else [primary_key],
+            sequence_by="_seq_num",
+            stored_as_scd_type=scd_type,
+            ignore_null_updates=True,
+            apply_as_deletes=F.expr("operation = 'DELETE'"),
+            except_column_list=["_seq_num", "operation"],
+        )
