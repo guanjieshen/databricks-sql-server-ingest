@@ -15,6 +15,7 @@ from azsql_ct.writer import (
     _compute_schema_version,
     _json_dumps,
     _make_uoid,
+    _validate_compression,
     OP_MAP,
 )
 
@@ -340,6 +341,26 @@ class TestHelpers:
         assert a != b
 
 
+class TestValidateCompression:
+    def test_returns_lowercase(self):
+        assert _validate_compression("ZSTD") == "zstd"
+
+    def test_returns_default_for_empty(self):
+        assert _validate_compression("") == "zstd"
+
+    def test_raises_for_invalid(self):
+        with pytest.raises(ValueError, match="Invalid compression"):
+            _validate_compression("invalid")
+
+    def test_accepts_all_valid(self):
+        for codec in ("none", "snappy", "gzip", "brotli", "lz4", "zstd"):
+            assert _validate_compression(codec) == codec
+
+    def test_invalid_unified_writer(self):
+        with pytest.raises(ValueError, match="Invalid compression"):
+            UnifiedParquetWriter(compression="invalid")
+
+
 class TestParquetCompression:
     """Verify ZSTD compression is applied to Parquet output."""
 
@@ -392,3 +413,75 @@ class TestJsonDumps:
         out = _json_dumps(data)
         parsed = json.loads(out)
         assert "dt" in parsed
+
+    def test_bytes_serialized_as_base64(self):
+        import base64
+        import json
+        raw = b"\x00\x01\xff"
+        out = _json_dumps({"col": raw})
+        parsed = json.loads(out)
+        assert parsed["col"] == base64.b64encode(raw).decode()
+
+    def test_bytearray_serialized_as_base64(self):
+        import base64
+        import json
+        raw = bytearray(b"\xde\xad\xbe\xef")
+        out = _json_dumps({"col": raw})
+        parsed = json.loads(out)
+        assert parsed["col"] == base64.b64encode(raw).decode()
+
+    def test_empty_bytes_serialized_as_base64(self):
+        import json
+        out = _json_dumps({"col": b""})
+        parsed = json.loads(out)
+        assert parsed["col"] == ""
+
+    def test_non_bytes_still_uses_str_fallback(self):
+        import json
+        import uuid as _uuid
+        val = _uuid.UUID("12345678-1234-5678-1234-567812345678")
+        out = _json_dumps({"col": val})
+        parsed = json.loads(out)
+        assert parsed["col"] == str(val)
+
+
+class TestUnifiedWriterBinaryData:
+    """Verify binary column values are base64-encoded in the JSON data column."""
+
+    def test_binary_column_base64_round_trip(self, tmp_path):
+        import json
+        import base64
+
+        writer = UnifiedParquetWriter()
+        desc = _desc(
+            "SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION",
+            "SYS_CHANGE_OPERATION", "id", "blob",
+        )
+        raw_bytes = b"\x00\x01\x02\xff"
+        rows = [(100, None, "I", 1, raw_bytes)]
+        files, _ = writer.write(
+            rows, desc, str(tmp_path), "bin",
+            table_metadata=_sample_metadata(),
+        )
+
+        table = pq.read_table(files[0])
+        data = json.loads(table.column("data").to_pylist()[0])
+        assert data["blob"] == base64.b64encode(raw_bytes).decode()
+
+    def test_none_binary_column_is_null(self, tmp_path):
+        import json
+
+        writer = UnifiedParquetWriter()
+        desc = _desc(
+            "SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION",
+            "SYS_CHANGE_OPERATION", "id", "blob",
+        )
+        rows = [(100, None, "I", 1, None)]
+        files, _ = writer.write(
+            rows, desc, str(tmp_path), "nullbin",
+            table_metadata=_sample_metadata(),
+        )
+
+        table = pq.read_table(files[0])
+        data = json.loads(table.column("data").to_pylist()[0])
+        assert data["blob"] is None

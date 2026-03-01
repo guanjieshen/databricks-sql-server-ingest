@@ -15,8 +15,7 @@
         "database_1": {
             "dbo": {
                 "table_1": "full_incremental",
-                "table_2": "full",
-                "table_3": "incremental",
+                "table_2": "incremental",
             }
         }
     }
@@ -36,10 +35,9 @@
     # Parallel sync (4 tables at a time):
     ct = ChangeTracker("server", "user", "pw", max_workers=4)
     ct.tables = {"db1": {"dbo": [f"table_{i}" for i in range(1, 101)]}}
-    ct.full_load()
+    ct.sync()
 
 Modes:
-    ``full``               Always reload the entire table.
     ``incremental``        Strict incremental via change tracking; raises if
                            no watermark exists yet.
     ``full_incremental``   Full load when no watermark exists, incremental
@@ -48,10 +46,8 @@ Modes:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -62,8 +58,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 from . import queries
 from ._constants import (
     DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PARQUET_COMPRESSION,
-    DEFAULT_ROW_GROUP_SIZE, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE,
-    VALID_MODES, VALID_OUTPUT_FORMATS, VALID_SCD_TYPES,
+    DEFAULT_ROW_GROUP_SIZE,
+)
+from .config import (
+    expand_env, _load_config_file, _normalize_table_map,
+    _extract_uc_metadata, _flat_config_to_table_map,
+    TableMap, FlatEntry,
+    _flatten_table_map, _validate_table_map,
 )
 from .connection import AzureSQLConnection, load_dotenv
 from .incremental_output import write as incremental_output_write
@@ -73,21 +74,6 @@ from . import watermark
 from .writer import OutputWriter, ParquetWriter, UnifiedParquetWriter
 
 logger = logging.getLogger(__name__)
-
-
-def expand_env(value: str) -> str:
-    """Expand ``${VAR}`` references in *value* with environment variables."""
-
-    def _repl(m):
-        name = m.group(1)
-        if name not in os.environ:
-            raise KeyError(
-                f"Environment variable {name!r} is not set "
-                f"(referenced in config as ${{{name}}})"
-            )
-        return os.environ[name]
-
-    return re.sub(r"\$\{(\w+)}", _repl, str(value))
 
 
 def set_databricks_task_values(results: List[dict]) -> int:
@@ -118,122 +104,6 @@ def set_databricks_task_values(results: List[dict]) -> int:
     return total_rows
 
 
-def _load_config_file(path: Union[str, Path]) -> dict:
-    """Load a YAML or JSON config file, chosen by extension."""
-    p = Path(path)
-    text = p.read_text()
-    if p.suffix in (".yaml", ".yml"):
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError(
-                "PyYAML is required for YAML config files. "
-                "Install it with: pip install azsql_ct[yaml]"
-            )
-        return yaml.safe_load(text)
-    return json.loads(text)
-
-
-# Keys at the database level that are metadata, not schema names.
-_DB_META_KEYS = frozenset({"uc_catalog", "schemas"})
-# Keys at the schema level that are metadata, not table names.
-_SCHEMA_META_KEYS = frozenset({"uc_schema", "tables"})
-
-
-def _normalize_table_map(raw: dict) -> dict:
-    """Normalise a ``databases`` dict into the internal table-map format.
-
-    Accepts both the **structured** layout (with ``schemas``/``tables`` keys
-    and optional ``uc_catalog``/``uc_schema`` metadata) and the **legacy**
-    flat layout where database keys map directly to schema dicts.
-
-    Returns ``{db: {schema: {table: mode}}}`` (or list variant) with all
-    metadata keys stripped.
-    """
-    result: dict = {}
-    for db_name, db_value in raw.items():
-        if not isinstance(db_value, dict):
-            result[db_name] = db_value
-            continue
-
-        if "schemas" in db_value:
-            schemas_section = db_value["schemas"]
-            if not isinstance(schemas_section, dict):
-                raise TypeError(
-                    f"'schemas' for database '{db_name}' must be a dict, "
-                    f"got {type(schemas_section).__name__}"
-                )
-            normalised_schemas: dict = {}
-            for schema_name, schema_value in schemas_section.items():
-                if not isinstance(schema_value, dict):
-                    raise TypeError(
-                        f"schema '{schema_name}' in database '{db_name}' "
-                        f"must be a dict, got {type(schema_value).__name__}"
-                    )
-                if "tables" in schema_value:
-                    normalised_schemas[schema_name] = schema_value["tables"]
-                else:
-                    normalised_schemas[schema_name] = {
-                        k: v
-                        for k, v in schema_value.items()
-                        if k not in _SCHEMA_META_KEYS
-                    }
-            result[db_name] = normalised_schemas
-        else:
-            result[db_name] = db_value
-    return result
-
-
-def _extract_uc_metadata(raw: dict) -> Dict[str, Dict[str, Any]]:
-    """Extract Unity Catalog metadata from a raw ``databases`` config dict.
-
-    Returns ``{db: {"uc_catalog": value, "schemas": {schema: uc_schema_value}}}``
-    for databases that use the structured format.  Returns an empty dict for
-    legacy-format configs or databases without UC fields.
-    """
-    result: Dict[str, Dict[str, Any]] = {}
-    for db_name, db_value in raw.items():
-        if not isinstance(db_value, dict):
-            continue
-        uc_catalog = db_value.get("uc_catalog")
-        schemas_section = db_value.get("schemas")
-        if uc_catalog is None and schemas_section is None:
-            continue
-        schema_map: Dict[str, Any] = {}
-        if isinstance(schemas_section, dict):
-            for schema_name, schema_value in schemas_section.items():
-                if isinstance(schema_value, dict):
-                    uc_schema = schema_value.get("uc_schema")
-                    if uc_schema is not None:
-                        schema_map[schema_name] = uc_schema
-        entry: Dict[str, Any] = {"schemas": schema_map}
-        if uc_catalog is not None:
-            entry["uc_catalog"] = uc_catalog
-        result[db_name] = entry
-    return result
-
-
-def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[str, str]]]:
-    """Convert a flat ``[{"database": ..., "table": ..., "mode": ...}]`` list
-    into the nested ``{db: {schema: {table: mode}}}`` format."""
-    result: Dict[str, Dict[str, Dict[str, str]]] = {}
-    for entry in tables:
-        db = entry["database"]
-        full_name = entry["table"]
-        mode = entry.get("mode", "full_incremental")
-        if "." in full_name:
-            schema, table = full_name.split(".", 1)
-        else:
-            schema, table = "dbo", full_name
-        result.setdefault(db, {}).setdefault(schema, {})[table] = mode
-    return result
-
-
-TableSpec = Union[List[str], Dict[str, Any]]
-TableMap = Dict[str, Dict[str, TableSpec]]
-FlatEntry = Tuple[str, str, Optional[str], int]
-
-
 class _ConnectionPool:
     """Thread-safe pool of :class:`AzureSQLConnection` objects keyed by database.
 
@@ -261,17 +131,28 @@ class _ConnectionPool:
 
     def acquire(self, database: str) -> Tuple[AzureSQLConnection, Any]:
         """Return an ``(AzureSQLConnection, conn)`` pair, reusing an idle one
-        if available or creating a new one otherwise."""
+        if available or creating a new one otherwise.
+
+        Reused connections are health-checked with ``SELECT 1``; stale
+        connections are discarded and a fresh one is created.
+        """
         q = self._queue_for(database)
         try:
             az = q.get_nowait()
-            return az, az.connect()
+            conn = az.connect()
+            try:
+                conn.cursor().execute("SELECT 1")
+                return az, conn
+            except Exception:
+                logger.debug("Stale connection for %s, reconnecting", database)
+                az.close()
         except Empty:
-            az = AzureSQLConnection(
-                server=self._server, user=self._user,
-                password=self._password, database=database,
-            )
-            return az, az.connect()
+            pass
+        az = AzureSQLConnection(
+            server=self._server, user=self._user,
+            password=self._password, database=database,
+        )
+        return az, az.connect()
 
     def release(self, database: str, az: AzureSQLConnection) -> None:
         """Return a healthy connection to the pool for reuse."""
@@ -286,103 +167,6 @@ class _ConnectionPool:
                     az.close()
                 except Empty:
                     break
-
-
-def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
-    """Convert a table map to ``[(db, "schema.table", mode, scd_type, soft_delete), ...]``.
-
-    *mode_or_none* is ``None`` for list-format entries (no per-table mode).
-    *scd_type* defaults to ``DEFAULT_SCD_TYPE`` (1) when not specified.
-    *soft_delete* defaults to ``DEFAULT_SOFT_DELETE`` (False) when not specified.
-    """
-    entries: List[FlatEntry] = []
-    for database, schemas in table_map.items():
-        for schema, tables in schemas.items():
-            if isinstance(tables, dict):
-                for table, tbl_cfg in tables.items():
-                    if isinstance(tbl_cfg, dict):
-                        mode = tbl_cfg.get("mode")
-                        scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
-                        soft_delete = tbl_cfg.get("soft_delete", DEFAULT_SOFT_DELETE)
-                        entries.append((database, f"{schema}.{table}", mode, scd_type, soft_delete))
-                    else:
-                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE))
-            else:
-                for table in tables:
-                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE))
-    return entries
-
-
-def _validate_table_map(value: object) -> TableMap:
-    """Raise ``TypeError`` / ``ValueError`` if *value* is not a valid table map."""
-    if not isinstance(value, dict):
-        raise TypeError(f"tables must be a dict, got {type(value).__name__}")
-    for db, schemas in value.items():
-        if not isinstance(db, str):
-            raise TypeError(f"database key must be str, got {type(db).__name__}")
-        if not isinstance(schemas, dict):
-            raise TypeError(
-                f"schemas for database '{db}' must be a dict, "
-                f"got {type(schemas).__name__}"
-            )
-        for schema, tables in schemas.items():
-            if not isinstance(schema, str):
-                raise TypeError(
-                    f"schema key must be str, got {type(schema).__name__}"
-                )
-            if isinstance(tables, dict):
-                if not tables:
-                    raise ValueError(
-                        f"table dict for '{db}'.'{schema}' must not be empty"
-                    )
-                for tbl, tbl_cfg in tables.items():
-                    if not isinstance(tbl, str):
-                        raise TypeError(
-                            f"table name must be str, got {type(tbl).__name__}"
-                        )
-                    if isinstance(tbl_cfg, str):
-                        if tbl_cfg not in VALID_MODES:
-                            raise ValueError(
-                                f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
-                                f"of {sorted(VALID_MODES)}, got {tbl_cfg!r}"
-                            )
-                    elif isinstance(tbl_cfg, dict):
-                        mode = tbl_cfg.get("mode")
-                        if mode not in VALID_MODES:
-                            raise ValueError(
-                                f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
-                                f"of {sorted(VALID_MODES)}, got {mode!r}"
-                            )
-                        scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
-                        if scd_type not in VALID_SCD_TYPES:
-                            raise ValueError(
-                                f"scd_type for '{db}'.'{schema}'.'{tbl}' must be one "
-                                f"of {sorted(VALID_SCD_TYPES)}, got {scd_type!r}"
-                            )
-                        soft_delete = tbl_cfg.get("soft_delete", DEFAULT_SOFT_DELETE)
-                        if not isinstance(soft_delete, bool):
-                            raise ValueError(
-                                f"soft_delete for '{db}'.'{schema}'.'{tbl}' must be "
-                                f"a bool, got {soft_delete!r}"
-                            )
-                    else:
-                        raise TypeError(
-                            f"table config for '{db}'.'{schema}'.'{tbl}' must be "
-                            f"a mode string or a dict, got {type(tbl_cfg).__name__}"
-                        )
-            elif isinstance(tables, list):
-                if not tables:
-                    raise ValueError(
-                        f"table list for '{db}'.'{schema}' must not be empty"
-                    )
-            else:
-                raise TypeError(
-                    f"tables for '{db}'.'{schema}' must be a list or dict, "
-                    f"got {type(tables).__name__}"
-                )
-    if not value:
-        raise ValueError("tables dict must not be empty")
-    return value  # type: ignore[return-value]
 
 
 def _load_watermarks_for_tables(
@@ -410,6 +194,7 @@ def _compute_tables_to_skip(
     try:
         cur = conn.cursor()
         tracked = queries.list_tracked_tables(cur)
+        tracked_lookup = queries.build_tracked_lookup(tracked)
 
         resolved_to_config: Dict[str, str] = {}
         for _db, full_table_name, table_mode, _scd, _soft in flat_entries:
@@ -418,7 +203,7 @@ def _compute_tables_to_skip(
             mode = mode_override or table_mode or "full_incremental"
             if mode not in ("incremental", "full_incremental"):
                 continue
-            resolved = queries.resolve_table(full_table_name, tracked)
+            resolved = queries.resolve_table(full_table_name, tracked_lookup)
             if resolved is None:
                 continue
             resolved_to_config[resolved] = full_table_name
@@ -595,7 +380,7 @@ class ChangeTracker:
               "user": "sqladmin",
               "password": "secret",
               "tables": [
-                {"database": "db1", "table": "dbo.orders", "mode": "full"}
+                {"database": "db1", "table": "dbo.orders", "mode": "full_incremental"}
               ]
             }
         """
@@ -681,8 +466,7 @@ class ChangeTracker:
         """The current ``{database: {schema: tables}}`` mapping.
 
         *tables* can be a list of names (no per-table mode) or a dict
-        mapping each name to ``"full"``, ``"incremental"``, or
-        ``"full_incremental"``.
+        mapping each name to ``"full_incremental"`` or ``"incremental"``.
         """
         return self._table_map
 
@@ -722,13 +506,6 @@ class ChangeTracker:
         Returns a list of per-table result dicts.
         """
         return self._run_sync(mode_override=None)
-
-    def full_load(self) -> List[dict]:
-        """Full-sync every table (ignores per-table modes).
-
-        Returns a list of per-table result dicts.
-        """
-        return self._run_sync(mode_override="full")
 
     def incremental_load(self) -> List[dict]:
         """Incremental-sync every table (ignores per-table modes).
@@ -814,28 +591,20 @@ class ChangeTracker:
                         )
                         results.append(self._error_result(database, full_table_name, exc))
                         continue
-                    if mode_override != "full":
-                        try:
-                            db_entries = [
-                                e for e in self._flat_tables
-                                if e[0] == database
-                            ]
-                            skip_cache[database] = _compute_tables_to_skip(
-                                database,
-                                conns[database],
-                                db_entries,
-                                self.watermark_dir,
-                                mode_override,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Change check failed for %s, syncing all tables: %s",
-                                database, exc,
-                            )
-                            skip_cache[database] = set()
+                    db_entries = [
+                        e for e in self._flat_tables
+                        if e[0] == database
+                    ]
+                    skip_cache[database] = _compute_tables_to_skip(
+                        database,
+                        conns[database],
+                        db_entries,
+                        self.watermark_dir,
+                        mode_override,
+                    )
 
                 mode = mode_override or table_mode or "full_incremental"
-                if mode != "full" and full_table_name in skip_cache.get(database, set()):
+                if full_table_name in skip_cache.get(database, set()):
                     results.append(_skipped_result(database, full_table_name))
                     continue
 
@@ -923,27 +692,37 @@ class ChangeTracker:
         conn_pool = _ConnectionPool(self.server, self.user, self._password)
 
         skip_set: Set[Tuple[str, str]] = set()
-        if mode_override != "full":
-            db_entries: Dict[str, List[FlatEntry]] = {}
-            for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
-                db_entries.setdefault(database, []).append(
-                    (database, full_table_name, table_mode, scd_type, soft_delete),
+        db_entries: Dict[str, List[FlatEntry]] = {}
+        for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
+            db_entries.setdefault(database, []).append(
+                (database, full_table_name, table_mode, scd_type, soft_delete),
+            )
+
+        def _check_db(database: str, entries: List[FlatEntry]) -> Set[str]:
+            try:
+                az, conn = conn_pool.acquire(database)
+                to_skip = _compute_tables_to_skip(
+                    database, conn, entries,
+                    self.watermark_dir, mode_override,
                 )
-            for database, entries in db_entries.items():
-                try:
-                    az, conn = conn_pool.acquire(database)
-                    to_skip = _compute_tables_to_skip(
-                        database, conn, entries,
-                        self.watermark_dir, mode_override,
-                    )
-                    conn_pool.release(database, az)
-                    for tbl in to_skip:
-                        skip_set.add((database, tbl))
-                except Exception as exc:
-                    logger.warning(
-                        "Change check failed for %s, syncing all tables: %s",
-                        database, exc,
-                    )
+                conn_pool.release(database, az)
+                return to_skip
+            except Exception as exc:
+                logger.warning(
+                    "Change check failed for %s, syncing all tables: %s",
+                    database, exc,
+                )
+                return set()
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as check_executor:
+            check_futures = {
+                check_executor.submit(_check_db, db, entries): db
+                for db, entries in db_entries.items()
+            }
+            for future in as_completed(check_futures):
+                db = check_futures[future]
+                for tbl in future.result():
+                    skip_set.add((db, tbl))
 
         for idx, db, tbl, mode, scd, sd in work:
             if (db, tbl) in skip_set:

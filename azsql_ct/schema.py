@@ -3,10 +3,14 @@
 Each table's watermark directory contains a ``schema.json`` file that
 records the cumulative column set and a schema version hash.
 
-Update semantics are **append-only**: new columns are appended, deleted
-or renamed source columns are never removed so downstream consumers see
-nulls instead of missing fields.  ``schema_version`` is always updated
-to the latest value.
+Update semantics are **append-only** for column names: new columns are
+appended, removed or renamed source columns are never deleted so
+downstream consumers see nulls instead of missing fields.
+
+Column **types** are updated in-place when a source type change is
+detected; the previous type is preserved as ``previous_type`` for
+auditability.  Each column carries a ``last_seen`` timestamp indicating
+the most recent sync that included it.
 """
 
 from __future__ import annotations
@@ -70,7 +74,7 @@ def load(wm_dir: str) -> Dict[str, Any]:
 
 def save(
     wm_dir: str,
-    columns: List[Dict[str, str]],
+    columns: List[Dict[str, Any]],
     schema_version: int,
 ) -> None:
     """Write or merge ``schema.json`` with append-only column semantics.
@@ -78,19 +82,73 @@ def save(
     New column names are appended to the existing list.  Columns that
     disappeared from the source are kept so downstream consumers see
     nulls.  ``schema_version`` and ``updated_at`` are always overwritten.
+
+    Column dicts may contain optional keys beyond ``name`` and ``type``
+    (e.g. ``precision``, ``scale``).  For existing columns, extra keys
+    from newer syncs are merged in without overwriting existing values.
+
+    If a column's ``type`` changes, the new type replaces the old one
+    and ``previous_type`` is recorded.  Stale ``precision``/``scale``
+    are cleared and re-applied from the incoming column dict.
+
+    Columns present in the incoming batch receive a ``last_seen``
+    timestamp.  Columns no longer in the source retain their previous
+    ``last_seen`` value.
     """
     os.makedirs(wm_dir, exist_ok=True)
 
     existing = load(wm_dir)
-    existing_cols: List[Dict[str, str]] = existing.get("columns", [])
-    existing_names = {c["name"] for c in existing_cols}
-    added = [c for c in columns if c["name"] not in existing_names]
-    merged = existing_cols + added
+    existing_cols: List[Dict[str, Any]] = existing.get("columns", [])
+    existing_by_name = {c["name"]: c for c in existing_cols}
+
+    changed = False
+    for c in columns:
+        if c["name"] in existing_by_name:
+            dest = existing_by_name[c["name"]]
+
+            old_type = dest.get("type")
+            new_type = c.get("type")
+            if old_type and new_type and old_type != new_type:
+                logger.warning(
+                    "Column %r type changed: %s -> %s",
+                    c["name"], old_type, new_type,
+                )
+                dest["previous_type"] = old_type
+                dest["type"] = new_type
+                for numeric_key in ("precision", "scale"):
+                    dest.pop(numeric_key, None)
+                    if numeric_key in c:
+                        dest[numeric_key] = c[numeric_key]
+                changed = True
+            else:
+                for numeric_key in ("precision", "scale"):
+                    new_val = c.get(numeric_key)
+                    if new_val is not None and dest.get(numeric_key) != new_val:
+                        dest[numeric_key] = new_val
+                        changed = True
+
+            for key, val in c.items():
+                if key not in dest:
+                    dest[key] = val
+                    changed = True
+        else:
+            existing_cols.append(c)
+            changed = True
+    merged = existing_cols
+
+    if not changed and existing.get("schema_version") == schema_version:
+        return
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    active_names = {c["name"] for c in columns}
+    for col in merged:
+        if col["name"] in active_names:
+            col["last_seen"] = now
 
     data = {
         "schema_version": schema_version,
         "columns": merged,
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "updated_at": now,
     }
     payload = json.dumps(data, indent=2).encode("utf-8") + b"\n"
     _atomic_write(_path(wm_dir), payload)

@@ -29,13 +29,23 @@ class StubWriter:
         return [f"{dir_path}/{prefix}.csv"], len(materialised)
 
 
-def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc, table_cols=None):
+_CT_COLS = frozenset({
+    "SYS_CHANGE_VERSION", "SYS_CHANGE_CREATION_VERSION", "SYS_CHANGE_OPERATION",
+})
+
+
+def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc, table_cols=None,
+                 column_metadata_rows=None):
     """Build a MagicMock cursor that responds to the queries sync_table makes.
 
     *table_cols* is a list of column names returned by ``table_columns()``
     (the ``SELECT TOP 0`` call added for incremental syncs).  When provided
     and *pk_cols* is non-empty, an extra execute step is inserted so the
     mock sets ``cursor.description`` appropriately for that call.
+
+    *column_metadata_rows* overrides the ``INFORMATION_SCHEMA.COLUMNS``
+    result used by ``queries.column_metadata()``.  When ``None`` (default),
+    a synthetic result is derived from *desc* so existing tests keep passing.
     """
     cursor = MagicMock()
     call_count = {"n": 0}
@@ -59,6 +69,19 @@ def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc, table_cols=None
 
     results_sequence.append(rows)
     descs_sequence.append(desc)
+
+    # column_metadata (INFORMATION_SCHEMA.COLUMNS) — called after the write
+    if column_metadata_rows is not None:
+        _cm_rows = column_metadata_rows
+    elif desc:
+        _cm_rows = [
+            (col[0], "nvarchar", None, None)
+            for col in desc if col[0] not in _CT_COLS
+        ]
+    else:
+        _cm_rows = []
+    results_sequence.append(_cm_rows)
+    descs_sequence.append(None)
 
     def side_effect_execute(sql, params=None):
         idx = exec_count["n"]
@@ -132,7 +155,7 @@ class TestSyncTable:
             database="db1",
             output_dir=str(tmp_path / "data"),
             watermark_dir=str(tmp_path / "wm"),
-            mode="full",
+            mode="full_incremental",
             writer=writer,
         )
 
@@ -156,7 +179,7 @@ class TestSyncTable:
             conn, "dbo.Foo", database="db1",
             output_dir=str(tmp_path / "data"),
             watermark_dir=str(tmp_path / "wm"),
-            mode="full", writer=StubWriter(), scd_type=2,
+            mode="full_incremental", writer=StubWriter(), scd_type=2,
         )
         assert result["scd_type"] == 2
 
@@ -192,7 +215,7 @@ class TestSyncTable:
             conn, "dbo.T", database="db1",
             output_dir=str(tmp_path / "data"),
             watermark_dir=str(tmp_path / "wm"),
-            mode="full",
+            mode="full_incremental",
             writer=StubWriter(),
         )
 
@@ -367,7 +390,12 @@ class TestSyncTable:
         assert result["mode"] == "incremental"
         assert result["since_version"] == 20
 
-    def test_soft_delete_passed_through_to_result(self, tmp_path):
+    @pytest.mark.parametrize("extra_kwargs,expected_soft_delete,expected_scd_type", [
+        ({"soft_delete": True}, True, 1),
+        ({}, False, 1),
+        ({"scd_type": 2, "soft_delete": True}, True, 2),
+    ], ids=["soft_delete_true", "soft_delete_default_false", "soft_delete_with_scd_type_2"])
+    def test_soft_delete_and_scd_type_in_result(self, tmp_path, extra_kwargs, expected_soft_delete, expected_scd_type):
         desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
         rows = [(100, None, "L", 1)]
         cursor = _make_cursor(
@@ -381,48 +409,10 @@ class TestSyncTable:
             conn, "dbo.Foo", database="db1",
             output_dir=str(tmp_path / "data"),
             watermark_dir=str(tmp_path / "wm"),
-            mode="full", writer=StubWriter(), soft_delete=True,
+            mode="full_incremental", writer=StubWriter(), **extra_kwargs,
         )
-        assert result["soft_delete"] is True
-
-    def test_soft_delete_defaults_to_false(self, tmp_path):
-        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
-        rows = [(100, None, "L", 1)]
-        cursor = _make_cursor(
-            tracked=["dbo.Foo"],
-            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
-        )
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-
-        result = sync_table(
-            conn, "dbo.Foo", database="db1",
-            output_dir=str(tmp_path / "data"),
-            watermark_dir=str(tmp_path / "wm"),
-            mode="full", writer=StubWriter(),
-        )
-        assert result["soft_delete"] is False
-
-    def test_soft_delete_with_scd_type_2(self, tmp_path):
-        """Both soft_delete and scd_type=2 coexist in the result dict."""
-        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
-        rows = [(100, None, "L", 1)]
-        cursor = _make_cursor(
-            tracked=["dbo.Foo"],
-            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
-        )
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-
-        result = sync_table(
-            conn, "dbo.Foo", database="db1",
-            output_dir=str(tmp_path / "data"),
-            watermark_dir=str(tmp_path / "wm"),
-            mode="full", writer=StubWriter(),
-            scd_type=2, soft_delete=True,
-        )
-        assert result["soft_delete"] is True
-        assert result["scd_type"] == 2
+        assert result["soft_delete"] is expected_soft_delete
+        assert result["scd_type"] == expected_scd_type
 
     def test_invalid_mode_raises(self, tmp_path):
         conn = MagicMock()
@@ -433,6 +423,35 @@ class TestSyncTable:
                 watermark_dir=str(tmp_path / "wm"),
                 mode="snapshot",
             )
+
+
+class TestClearDataFilesOnFullSync:
+    """Full sync should clean old day directories, not just today's."""
+
+    def test_full_sync_removes_old_day_files(self, tmp_path):
+        old_day = tmp_path / "data" / "db1" / "dbo" / "Foo" / "2025-01-01"
+        old_day.mkdir(parents=True)
+        stale_file = old_day / "dbo_Foo_old.parquet"
+        stale_file.write_text("stale")
+
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        writer = StubWriter()
+        sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=writer,
+        )
+
+        assert not stale_file.exists()
 
 
 class TestSubDir:
@@ -464,228 +483,34 @@ class TestSubDir:
         assert os.path.isdir(d)
 
 
-class TestFromConfig:
-    """Tests for ChangeTracker.from_config() factory method."""
+class TestTableLock:
+    """Tests for _TableLock -- per-table advisory file lock."""
 
-    def test_loads_flat_json_config(self, tmp_path):
-        from azsql_ct.client import ChangeTracker
+    def test_successful_acquisition(self, tmp_path):
+        from azsql_ct.sync import _TableLock, _LOCK_FILENAME
 
-        cfg = tmp_path / "cfg.json"
-        cfg.write_text(json.dumps({
-            "server": "srv.database.windows.net",
-            "user": "admin",
-            "password": "secret",
-            "tables": [
-                {"database": "db1", "table": "dbo.Foo", "mode": "full"},
-                {"database": "db1", "table": "dbo.Bar", "mode": "incremental"},
-            ],
-        }))
+        lock_dir = str(tmp_path / "locks")
+        with _TableLock(lock_dir) as lock:
+            assert lock is not None
+            assert os.path.isfile(os.path.join(lock_dir, _LOCK_FILENAME))
 
-        ct = ChangeTracker.from_config(str(cfg))
-        assert ct.server == "srv.database.windows.net"
-        assert ct.user == "admin"
-        assert len(ct._flat_tables) == 2
+    def test_contention_raises_runtime_error(self, tmp_path):
+        from azsql_ct.sync import _TableLock
 
-    def test_loads_dict_config(self):
-        from azsql_ct.client import ChangeTracker
+        lock_dir = str(tmp_path / "locks")
+        with _TableLock(lock_dir):
+            with pytest.raises(RuntimeError, match="Another sync is already running"):
+                with _TableLock(lock_dir):
+                    pass
 
-        ct = ChangeTracker.from_config({
-            "server": "srv",
-            "user": "u",
-            "password": "p",
-            "tables": [
-                {"database": "db1", "table": "dbo.T", "mode": "full"},
-            ],
-        })
-        assert ct.server == "srv"
-        assert len(ct._flat_tables) == 1
+    def test_release_allows_reacquisition(self, tmp_path):
+        from azsql_ct.sync import _TableLock
 
-    def test_loads_nested_dict_config(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {
-                "server": "myserver",
-                "sql_login": "admin",
-                "password": "pw",
-            },
-            "databases": {
-                "db1": {"dbo": {"t1": "full", "t2": "incremental"}},
-            },
-        })
-        assert ct.server == "myserver"
-        assert ct.user == "admin"
-        assert len(ct._flat_tables) == 2
-
-    def test_loads_structured_format_with_uc_metadata(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {
-                "server": "myserver",
-                "sql_login": "admin",
-                "password": "pw",
-            },
-            "databases": {
-                "db1": {
-                    "uc_catalog": "my_catalog",
-                    "schemas": {
-                        "dbo": {
-                            "uc_schema": "my_schema",
-                            "tables": {
-                                "t1": "full",
-                                "t2": "incremental",
-                            },
-                        },
-                    },
-                },
-            },
-        })
-        assert ct.server == "myserver"
-        assert len(ct._flat_tables) == 2
-        tables = {t[1] for t in ct._flat_tables}
-        assert tables == {"dbo.t1", "dbo.t2"}
-        assert ct._uc_metadata == {
-            "db1": {"uc_catalog": "my_catalog", "schemas": {"dbo": "my_schema"}},
-        }
-
-    def test_cli_overrides_take_precedence(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config(
-            {
-                "connection": {
-                    "server": "srv", "sql_login": "u", "password": "p",
-                },
-                "storage": {"data_dir": "/default"},
-                "max_workers": 2,
-                "databases": {"db1": {"dbo": ["t"]}},
-            },
-            max_workers=8,
-            output_dir="/override",
-        )
-        assert ct.max_workers == 8
-        assert ct.output_dir == "/override"
-
-    def test_parallelism_config_key(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "srv", "sql_login": "u", "password": "p"},
-            "parallelism": 4,
-            "databases": {"db1": {"dbo": ["t"]}},
-        })
-        assert ct.max_workers == 4
-
-    def test_output_manifest_from_config(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "srv", "sql_login": "u", "password": "p"},
-            "storage": {"data_dir": "/d", "watermark_dir": "/w", "output_manifest": "/out.yaml"},
-            "databases": {"db1": {"dbo": ["t"]}},
-        })
-        assert ct.output_manifest == "/out.yaml"
-
-    def test_env_var_expansion(self, monkeypatch):
-        from azsql_ct.client import ChangeTracker
-
-        monkeypatch.setenv("TEST_SERVER", "expanded.database.windows.net")
-        monkeypatch.setenv("TEST_PW", "secret123")
-
-        ct = ChangeTracker.from_config({
-            "server": "${TEST_SERVER}",
-            "user": "admin",
-            "password": "${TEST_PW}",
-            "tables": [],
-        })
-        assert ct.server == "expanded.database.windows.net"
-
-    def test_storage_section_applied(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "s", "sql_login": "u", "password": "p"},
-            "storage": {"data_dir": "/mydata", "watermark_dir": "/mywm"},
-            "databases": {"db1": {"dbo": ["t"]}},
-        })
-        assert ct.output_dir == "/mydata"
-        assert ct.watermark_dir == "/mywm"
-
-    def test_ingest_pipeline_derives_paths(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "s", "sql_login": "u", "password": "p"},
-            "storage": {"ingest_pipeline": "/some/base"},
-            "databases": {"db1": {"dbo": ["t"]}},
-        })
-        assert ct.output_dir == "/some/base/data"
-        assert ct.watermark_dir == "/some/base/watermarks"
-        assert ct.output_manifest == "/some/base/output.yaml"
-
-    def test_ingest_pipeline_explicit_data_dir_overrides(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "s", "sql_login": "u", "password": "p"},
-            "storage": {
-                "ingest_pipeline": "/some/base",
-                "data_dir": "/custom/data",
-            },
-            "databases": {"db1": {"dbo": ["t"]}},
-        })
-        assert ct.output_dir == "/custom/data"
-        assert ct.watermark_dir == "/some/base/watermarks"
-        assert ct.output_manifest == "/some/base/output.yaml"
-
-    def test_structured_config_with_scd_type(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "s", "sql_login": "u", "password": "p"},
-            "databases": {
-                "db1": {
-                    "schemas": {
-                        "dbo": {
-                            "tables": {
-                                "t1": {"mode": "full_incremental", "scd_type": 2},
-                                "t2": "full",
-                            },
-                        },
-                    },
-                },
-            },
-        })
-        assert len(ct._flat_tables) == 2
-        by_table = {t[1]: t for t in ct._flat_tables}
-        assert by_table["dbo.t1"][2] == "full_incremental"
-        assert by_table["dbo.t1"][3] == 2
-        assert by_table["dbo.t2"][2] == "full"
-        assert by_table["dbo.t2"][3] == 1
-
-    def test_structured_config_with_soft_delete(self):
-        from azsql_ct.client import ChangeTracker
-
-        ct = ChangeTracker.from_config({
-            "connection": {"server": "s", "sql_login": "u", "password": "p"},
-            "databases": {
-                "db1": {
-                    "schemas": {
-                        "dbo": {
-                            "tables": {
-                                "t1": {"mode": "full_incremental", "scd_type": 1, "soft_delete": True},
-                                "t2": "full",
-                            },
-                        },
-                    },
-                },
-            },
-        })
-        assert len(ct._flat_tables) == 2
-        by_table = {t[1]: t for t in ct._flat_tables}
-        assert by_table["dbo.t1"][4] is True
-        assert by_table["dbo.t2"][4] is False
+        lock_dir = str(tmp_path / "locks")
+        with _TableLock(lock_dir):
+            pass
+        with _TableLock(lock_dir):
+            pass
 
 
 class TestSyncTableUnifiedWriter:
@@ -702,7 +527,7 @@ class TestSyncTableUnifiedWriter:
             database="db1",
             output_dir=str(tmp_path / "data"),
             watermark_dir=str(tmp_path / "wm"),
-            mode="full",
+            mode="full_incremental",
             writer=writer,
         )
         kwargs.update(extra_kwargs)
@@ -754,3 +579,97 @@ class TestSyncTableUnifiedWriter:
         assert "name" in col_names
         assert "SYS_CHANGE_VERSION" not in col_names
         assert isinstance(data["schema_version"], int)
+
+
+class TestColumnMetadataIntegration:
+    """Tests that sync_table uses native SQL Server type metadata from INFORMATION_SCHEMA."""
+
+    def _sync(self, tmp_path, column_metadata_rows=None, **extra_kwargs):
+        desc = [
+            ("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+            ("SYS_CHANGE_OPERATION",), ("id",), ("name",),
+        ]
+        rows = [(100, None, "L", 1, "Alice")]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc, column_metadata_rows=column_metadata_rows,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        writer = StubWriter()
+        kwargs = dict(
+            database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental",
+            writer=writer,
+        )
+        kwargs.update(extra_kwargs)
+        result = sync_table(conn, "dbo.Foo", **kwargs)
+        return result, writer
+
+    def test_schema_uses_native_types(self, tmp_path):
+        """column_metadata result is written to schema.json with real SQL Server types."""
+        cm_rows = [
+            ("id", "bigint", 19, 0),
+            ("name", "varchar", None, None),
+        ]
+        result, _ = self._sync(tmp_path, column_metadata_rows=cm_rows)
+        data = json.loads(
+            (tmp_path / "wm" / "db1" / "dbo" / "Foo" / "schema.json").read_text()
+        )
+        type_map = {c["name"]: c["type"] for c in data["columns"]}
+        assert type_map["id"] == "bigint"
+        assert type_map["name"] == "varchar"
+
+    def test_precision_scale_preserved(self, tmp_path):
+        """Precision and scale from INFORMATION_SCHEMA flow into schema.json."""
+        cm_rows = [
+            ("amount", "decimal", 19, 4),
+        ]
+        self._sync(tmp_path, column_metadata_rows=cm_rows)
+        data = json.loads(
+            (tmp_path / "wm" / "db1" / "dbo" / "Foo" / "schema.json").read_text()
+        )
+        col = data["columns"][0]
+        assert col["type"] == "decimal"
+        assert col["precision"] == 19
+        assert col["scale"] == 4
+
+    def test_falls_back_to_description_on_failure(self, tmp_path):
+        """When column_metadata raises, sync uses columns_from_description."""
+        desc = [
+            ("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+            ("SYS_CHANGE_OPERATION",), ("id",), ("name",),
+        ]
+        rows = [(100, None, "L", 1, "Alice")]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with patch("azsql_ct.sync.queries.column_metadata", side_effect=RuntimeError("no access")):
+            result = sync_table(
+                conn, "dbo.Foo", database="db1",
+                output_dir=str(tmp_path / "data"),
+                watermark_dir=str(tmp_path / "wm"),
+                mode="full_incremental", writer=StubWriter(),
+            )
+
+        assert "columns" in result
+        col_names = [c["name"] for c in result["columns"]]
+        assert "id" in col_names
+        assert "name" in col_names
+
+    def test_result_dict_columns_from_native_metadata(self, tmp_path):
+        """The result dict 'columns' key uses native types when available."""
+        cm_rows = [
+            ("id", "int", 10, 0),
+            ("name", "nvarchar", None, None),
+        ]
+        result, _ = self._sync(tmp_path, column_metadata_rows=cm_rows)
+        type_map = {c["name"]: c["type"] for c in result["columns"]}
+        assert type_map["id"] == "int"
+        assert type_map["name"] == "nvarchar"

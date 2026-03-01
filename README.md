@@ -16,7 +16,7 @@ Key capabilities:
 - **Parallel table sync** with configurable worker count.
 - **Two output formats**: native per-table Parquet or a Lakeflow-Connect-style unified bronze envelope.
 - **Watermark management** — persists sync state (version, rows, duration, files) per table so runs are resumable.
-- **Schema tracking** — append-only column metadata with deterministic schema-version hashing.
+- **Schema evolution** — append-only column tracking with type change detection, `previous_type` auditability, and `last_seen` timestamps for column activity.
 - **Output manifest** — YAML manifest of synced tables for downstream orchestration.
 - **SCD Type 1 & 2** support, configurable per table.
 - **Soft-delete support** — optionally preserve deleted rows with an `_is_deleted` flag.
@@ -73,7 +73,7 @@ If a watermark is older than `CHANGE_TRACKING_MIN_VALID_VERSION()`, the engine a
 | **Change Data Capture (CDC)** | Only SQL Server Change Tracking is supported — not CDC, temporal tables, or transaction-log reading. |
 | **Primary-key requirement** | Incremental sync requires a primary key on each table (used for the `CHANGETABLE` join). |
 | **Strict incremental without prior state** | `incremental` mode raises an error if no watermark exists; use `full_incremental` for the first run. |
-| **Column renames** | Schema tracking is append-only — renamed columns appear as a new column + the old column filled with nulls. |
+| **Column renames** | Column names are append-only — renamed columns appear as a new column + the old column filled with nulls. No rename tracking. |
 | **Retry / back-off** | No automatic retry on transient failures; the caller is responsible for re-running. |
 | **Streaming** | Processes result sets in batches, not a continuous streaming solution. |
 | **Windows file locking** | File-based locking uses POSIX `fcntl.flock`; behaviour on Windows is untested. |
@@ -216,6 +216,56 @@ results = ct.sync()
 
 ---
 
+## Schema Evolution
+
+Each table's watermark directory contains a `schema.json` file that tracks the cumulative column set across syncs. The sync engine detects and logs schema changes at `WARNING` level.
+
+### Column Changes
+
+| Change | Behaviour |
+|---|---|
+| **Column added** | Appended to `schema.json`; downstream sees nulls for historical rows |
+| **Column removed** | Retained in `schema.json` (never deleted); new rows have nulls for the removed column |
+| **Column renamed** | Treated as a removal + addition — old name stays, new name appended |
+
+### Type Changes
+
+When a column's SQL Server type changes (e.g. `int` → `bigint`), the sync engine:
+
+1. Updates the `type` in `schema.json` to the new value.
+2. Records the old type as `previous_type` for auditability.
+3. Clears stale `precision`/`scale` and re-applies from the source if applicable.
+4. Logs a warning: `Column 'id' type changed: int -> bigint`.
+
+Precision and scale changes within the same type (e.g. `decimal(10,2)` → `decimal(19,4)`) are also detected and updated.
+
+### Column Activity Tracking
+
+Each column in `schema.json` carries a `last_seen` timestamp updated on every sync that includes it. Columns no longer in the source retain their previous `last_seen`, making it easy to identify stale/removed columns:
+
+```json
+{
+  "schema_version": 200,
+  "columns": [
+    {"name": "id", "type": "bigint", "previous_type": "int", "last_seen": "2026-03-01T12:00:00Z"},
+    {"name": "status", "type": "nvarchar", "last_seen": "2026-02-28T12:00:00Z"}
+  ],
+  "updated_at": "2026-03-01T12:00:00Z"
+}
+```
+
+Here `status` has a stale `last_seen` — it was dropped from the source after the Feb 28 sync.
+
+### Schema Version
+
+A deterministic `schemaVersion` hash (based on column names and types) is computed on each sync and embedded in every row of the unified bronze output. This allows downstream consumers to identify which schema version produced each row.
+
+### Downstream Integration
+
+For Databricks pipelines consuming the unified bronze output, see `ingestion_pipeline/README.md` for details on how schema evolution interacts with `from_json` parsing and Delta type widening.
+
+---
+
 ## Change Tracking Permissions
 
 If change tracking is enabled on tables in your database, the read-only user needs this one-time grant from an admin:
@@ -236,7 +286,7 @@ azsql_ct/               Core package
   sync.py                 Sync engine (full / incremental)
   watermark.py            JSON watermark store
   writer.py               Pluggable Parquet output writers
-  schema.py               Append-only schema tracking
+  schema.py               Schema evolution: type change detection, column activity tracking
   output_manifest.py      YAML output manifest management
   _constants.py           Shared constants and defaults
   __main__.py             CLI entry point

@@ -70,13 +70,14 @@ class TestSchemaSave:
         assert data["schema_version"] == 300
 
 
-    def test_type_change_preserves_original_type(self, tmp_path):
-        """Append-only merge matches by name; the original type is kept."""
+    def test_type_change_updates_type_and_records_previous(self, tmp_path):
+        """Type change updates the stored type and records previous_type."""
         save(str(tmp_path), [{"name": "id", "type": "int"}], 100)
         save(str(tmp_path), [{"name": "id", "type": "bigint"}], 200)
         data = load(str(tmp_path))
         assert len(data["columns"]) == 1
-        assert data["columns"][0]["type"] == "int"
+        assert data["columns"][0]["type"] == "bigint"
+        assert data["columns"][0]["previous_type"] == "int"
         assert data["schema_version"] == 200
 
     def test_column_name_case_sensitivity(self, tmp_path):
@@ -99,11 +100,114 @@ class TestSchemaSave:
         assert col_names == ["a", "b", "c", "d", "e"]
         assert data["schema_version"] == 5
 
+    def test_no_write_when_nothing_changed(self, tmp_path):
+        """When columns and schema_version are identical, save should skip the write."""
+        cols = [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}]
+        save(str(tmp_path), cols, 100)
+        mtime_after_first = (tmp_path / "schema.json").stat().st_mtime_ns
+        save(str(tmp_path), cols, 100)
+        mtime_after_second = (tmp_path / "schema.json").stat().st_mtime_ns
+        assert mtime_after_first == mtime_after_second
+
+    def test_writes_when_schema_version_changes(self, tmp_path):
+        cols = [{"name": "id", "type": "int"}]
+        save(str(tmp_path), cols, 100)
+        mtime1 = (tmp_path / "schema.json").stat().st_mtime_ns
+        save(str(tmp_path), cols, 200)
+        mtime2 = (tmp_path / "schema.json").stat().st_mtime_ns
+        assert mtime2 > mtime1
+        data = load(str(tmp_path))
+        assert data["schema_version"] == 200
+
     def test_corrupted_schema_json_raises(self, tmp_path):
         """Invalid JSON in schema.json surfaces a JSONDecodeError."""
         (tmp_path / "schema.json").write_text("{bad json!!!")
         with pytest.raises(json.JSONDecodeError):
             load(str(tmp_path))
+
+
+class TestSchemaTypeChange:
+    """Verify type-change detection, precision/scale clearing, and previous_type."""
+
+    def test_type_change_clears_stale_precision(self, tmp_path):
+        """When type changes from decimal to int, old precision/scale are removed."""
+        save(str(tmp_path), [{"name": "amt", "type": "decimal", "precision": 19, "scale": 4}], 100)
+        save(str(tmp_path), [{"name": "amt", "type": "int"}], 200)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["type"] == "int"
+        assert col["previous_type"] == "decimal"
+        assert "precision" not in col
+        assert "scale" not in col
+
+    def test_type_change_applies_new_precision(self, tmp_path):
+        """When type changes to decimal, new precision/scale are applied."""
+        save(str(tmp_path), [{"name": "amt", "type": "int"}], 100)
+        save(str(tmp_path), [{"name": "amt", "type": "decimal", "precision": 19, "scale": 4}], 200)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["type"] == "decimal"
+        assert col["previous_type"] == "int"
+        assert col["precision"] == 19
+        assert col["scale"] == 4
+
+    def test_type_change_replaces_precision(self, tmp_path):
+        """When decimal precision changes, new values replace old ones."""
+        save(str(tmp_path), [{"name": "amt", "type": "decimal", "precision": 10, "scale": 2}], 100)
+        save(str(tmp_path), [{"name": "amt", "type": "decimal", "precision": 19, "scale": 4}], 200)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["type"] == "decimal"
+        assert col["precision"] == 19
+        assert col["scale"] == 4
+
+    def test_consecutive_type_changes_track_last_previous(self, tmp_path):
+        """previous_type always records the immediately prior type."""
+        save(str(tmp_path), [{"name": "id", "type": "int"}], 100)
+        save(str(tmp_path), [{"name": "id", "type": "bigint"}], 200)
+        save(str(tmp_path), [{"name": "id", "type": "nvarchar"}], 300)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["type"] == "nvarchar"
+        assert col["previous_type"] == "bigint"
+
+
+class TestSchemaLastSeen:
+    """Verify last_seen timestamp tracking on columns."""
+
+    def test_last_seen_set_on_columns(self, tmp_path):
+        """Columns present in the sync receive a last_seen matching updated_at."""
+        save(str(tmp_path), [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}], 100)
+        data = load(str(tmp_path))
+        for col in data["columns"]:
+            assert "last_seen" in col
+            assert col["last_seen"] == data["updated_at"]
+
+    def test_last_seen_not_updated_for_removed_columns(self, tmp_path):
+        """Columns no longer in source retain their old last_seen."""
+        save(str(tmp_path), [{"name": "id", "type": "int"}, {"name": "status", "type": "nvarchar"}], 100)
+        first_data = load(str(tmp_path))
+        first_updated = first_data["updated_at"]
+
+        import time
+        time.sleep(1.1)
+
+        save(str(tmp_path), [{"name": "id", "type": "int"}], 200)
+        data = load(str(tmp_path))
+        id_col = next(c for c in data["columns"] if c["name"] == "id")
+        status_col = next(c for c in data["columns"] if c["name"] == "status")
+        assert id_col["last_seen"] == data["updated_at"]
+        assert status_col["last_seen"] == first_updated
+        assert status_col["last_seen"] != data["updated_at"]
+
+    def test_no_write_still_skips_when_nothing_changed(self, tmp_path):
+        """The no-write optimization is preserved even with last_seen logic."""
+        cols = [{"name": "id", "type": "int"}, {"name": "name", "type": "nvarchar"}]
+        save(str(tmp_path), cols, 100)
+        mtime_after_first = (tmp_path / "schema.json").stat().st_mtime_ns
+        save(str(tmp_path), cols, 100)
+        mtime_after_second = (tmp_path / "schema.json").stat().st_mtime_ns
+        assert mtime_after_first == mtime_after_second
 
 
 class TestColumnsFromDescription:
@@ -142,3 +246,43 @@ class TestColumnsFromDescription:
         cols = columns_from_description([("data", memoryview)])
         assert cols[0]["name"] == "data"
         assert cols[0]["type"] == str(memoryview)
+
+
+class TestSchemaPrecisionScale:
+    """Verify that optional precision/scale keys survive save/load cycles."""
+
+    def test_save_preserves_precision_scale_keys(self, tmp_path):
+        cols = [{"name": "amt", "type": "decimal", "precision": 19, "scale": 4}]
+        save(str(tmp_path), cols, 100)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["precision"] == 19
+        assert col["scale"] == 4
+
+    def test_append_only_merge_keeps_precision_from_original(self, tmp_path):
+        """Second save without precision does not strip the original keys."""
+        save(str(tmp_path), [{"name": "amt", "type": "decimal", "precision": 19, "scale": 4}], 100)
+        save(str(tmp_path), [{"name": "amt", "type": "decimal"}], 200)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["precision"] == 19
+        assert col["scale"] == 4
+        assert data["schema_version"] == 200
+
+    def test_merge_adds_precision_to_existing_column(self, tmp_path):
+        """If original column had no precision, a newer sync can add it."""
+        save(str(tmp_path), [{"name": "amt", "type": "decimal"}], 100)
+        save(str(tmp_path), [{"name": "amt", "type": "decimal", "precision": 19, "scale": 4}], 200)
+        data = load(str(tmp_path))
+        col = data["columns"][0]
+        assert col["precision"] == 19
+        assert col["scale"] == 4
+
+    def test_new_column_with_precision_appended(self, tmp_path):
+        save(str(tmp_path), [{"name": "id", "type": "int"}], 100)
+        save(str(tmp_path), [{"name": "id", "type": "int"}, {"name": "price", "type": "money", "precision": 19, "scale": 4}], 200)
+        data = load(str(tmp_path))
+        assert len(data["columns"]) == 2
+        price_col = data["columns"][1]
+        assert price_col["name"] == "price"
+        assert price_col["precision"] == 19

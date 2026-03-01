@@ -160,7 +160,7 @@ def sync_table(
         database:           Database name (used for directory layout).
         output_dir:         Root directory for data files.
         watermark_dir:      Root directory for watermark files (mirrors data layout).
-        mode:               ``"full_incremental"`` (default), ``"full"``, or
+        mode:               ``"full_incremental"`` (default) or
                             ``"incremental"``.
         writer:             An ``OutputWriter`` instance; defaults to ``ParquetWriter()``.
         batch_size:         Number of rows fetched from the database at a time
@@ -191,7 +191,8 @@ def sync_table(
 
     cur = conn.cursor()
     tracked = queries.list_tracked_tables(cur)
-    full_name = queries.resolve_table(table_name, tracked)
+    tracked_lookup = queries.build_tracked_lookup(tracked)
+    full_name = queries.resolve_table(table_name, tracked_lookup)
     if full_name is None:
         raise ValueError(
             f"Table '{table_name}' is not change-tracked in {database}. "
@@ -238,7 +239,7 @@ def _sync_table_locked(
         raise RuntimeError(
             f"No watermark exists for {database}.{full_name} and mode is "
             f"'incremental'. Use mode='full_incremental' for initial load "
-            f"followed by incremental syncs, or mode='full' for a full reload."
+            f"followed by incremental syncs."
         )
 
     if mode in ("incremental", "full_incremental") and not is_initial and since < min_ver:
@@ -247,7 +248,7 @@ def _sync_table_locked(
             "falling back to full sync.",
             since, database, full_name, min_ver,
         )
-        mode = "full"
+        mode = "full"  # internal-only; not a user-facing mode
 
     t0 = time.monotonic()
 
@@ -307,7 +308,7 @@ def _sync_table_locked(
     )
 
     if do_full:
-        _clear_data_files(day_dir, keep=set(output_files))
+        _clear_data_files(data_dir, keep=set(output_files))
 
     elapsed = time.monotonic() - t0
     since_ver = since if actual_mode == "incremental" else None
@@ -323,7 +324,58 @@ def _sync_table_locked(
         duration_seconds=elapsed,
     )
 
-    columns = columns_from_description(description)
+    try:
+        columns = queries.column_metadata(cur, full_name)
+    except Exception:
+        logger.debug(
+            "INFORMATION_SCHEMA lookup failed for %s.%s; "
+            "falling back to cursor.description",
+            database, full_name,
+        )
+        columns = columns_from_description(description)
+
+    existing_schema = schema.load(wm_dir)
+    if existing_schema:
+        existing_by_name = {
+            c["name"]: c for c in existing_schema.get("columns", [])
+        }
+        incoming_names = {c["name"] for c in columns}
+        existing_names = set(existing_by_name)
+
+        added = incoming_names - existing_names
+        removed = existing_names - incoming_names
+        type_changed = [
+            (c["name"], existing_by_name[c["name"]]["type"], c["type"])
+            for c in columns
+            if c["name"] in existing_by_name
+            and c.get("type") != existing_by_name[c["name"]].get("type")
+        ]
+
+        if added or removed or type_changed:
+            logger.warning(
+                "Schema change detected for %s.%s (version %d -> %d)",
+                database, full_name,
+                existing_schema.get("schema_version", 0), schema_ver,
+            )
+            if added:
+                logger.warning("  Columns added: %s", sorted(added))
+            if removed:
+                logger.warning(
+                    "  Columns removed (retained as null): %s", sorted(removed),
+                )
+            for col_name, old_type, new_type in type_changed:
+                logger.warning(
+                    "  Column %r type changed: %s -> %s",
+                    col_name, old_type, new_type,
+                )
+        elif schema_ver != existing_schema.get("schema_version"):
+            logger.info(
+                "Schema version changed for %s.%s (%d -> %d) "
+                "but columns unchanged",
+                database, full_name,
+                existing_schema.get("schema_version", 0), schema_ver,
+            )
+
     schema.save(wm_dir, columns, schema_ver)
 
     logger.info(

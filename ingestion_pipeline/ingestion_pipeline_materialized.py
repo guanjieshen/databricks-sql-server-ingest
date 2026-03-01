@@ -11,10 +11,12 @@ improvement -- ingestion_pipeline.py re-reads all Parquet N times.
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
+    BinaryType,
     BooleanType,
     DateType,
     DecimalType,
     DoubleType,
+    FloatType,
     IntegerType,
     LongType,
     ShortType,
@@ -26,7 +28,10 @@ from pyspark.sql.types import (
 
 from metadata_helper import parse_output_yaml
 
-# SQL Server type names (from schema.json) -> Spark types
+# SQL Server type names (from schema.json) -> Spark types.
+# Reference: https://learn.microsoft.com/en-us/azure/databricks/ingestion/lakeflow-connect/sql-server-reference
+_DECIMAL_TYPES = frozenset({"decimal", "numeric", "money", "smallmoney"})
+
 MSSQL_TO_SPARK = {
     "int": IntegerType(),
     "bigint": LongType(),
@@ -34,34 +39,51 @@ MSSQL_TO_SPARK = {
     "tinyint": ShortType(),
     "bit": BooleanType(),
     "float": DoubleType(),
-    "real": DoubleType(),
-    "decimal": DecimalType(18, 2),
-    "numeric": DecimalType(18, 2),
+    "real": FloatType(),
+    "decimal": DecimalType(38, 10),
+    "numeric": DecimalType(38, 10),
     "money": DecimalType(19, 4),
+    "smallmoney": DecimalType(10, 4),
     "nvarchar": StringType(),
     "varchar": StringType(),
     "nchar": StringType(),
     "char": StringType(),
     "ntext": StringType(),
     "text": StringType(),
+    "xml": StringType(),
+    "sql_variant": StringType(),
+    "hierarchyid": StringType(),
     "uniqueidentifier": StringType(),
     "datetime": TimestampType(),
     "datetime2": TimestampType(),
     "smalldatetime": TimestampType(),
+    "datetimeoffset": TimestampType(),
     "date": DateType(),
     "time": StringType(),
-    "varbinary": StringType(),
-    "binary": StringType(),
+    "varbinary": BinaryType(),
+    "binary": BinaryType(),
+    "image": BinaryType(),
+    "geography": BinaryType(),
+    "geometry": BinaryType(),
+    "rowversion": BinaryType(),
     "unknown": StringType(),
 }
 
 
 def _build_spark_schema(columns):
-    """Build a StructType from schema.json columns list."""
-    return StructType([
-        StructField(c["name"], MSSQL_TO_SPARK.get(c["type"], StringType()), nullable=True)
-        for c in columns
-    ])
+    """Build a StructType from schema.json columns list.
+
+    Uses ``precision`` and ``scale`` from schema.json when available
+    for decimal/numeric/money types; otherwise falls back to the
+    default in ``MSSQL_TO_SPARK``.
+    """
+    fields = []
+    for c in columns:
+        spark_type = MSSQL_TO_SPARK.get(c["type"], StringType())
+        if c["type"] in _DECIMAL_TYPES and "precision" in c:
+            spark_type = DecimalType(c["precision"], c.get("scale", 0))
+        fields.append(StructField(c["name"], spark_type, nullable=True))
+    return StructType(fields)
 
 
 # Load pipeline config and table metadata (including schema.json columns)

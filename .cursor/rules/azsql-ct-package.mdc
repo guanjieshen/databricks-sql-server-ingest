@@ -12,7 +12,8 @@ Azure SQL Change Tracking → Parquet sync engine. Extracts data from SQL Server
 
 | Module | Purpose |
 |---|---|
-| `client.py` | **Start here.** `ChangeTracker` facade — config loading, connection pooling, parallel dispatch |
+| `client.py` | **Start here.** `ChangeTracker` facade — connection pooling, parallel dispatch, manifest updates |
+| `config.py` | Config loading, env-var expansion, table-map types (`TableMap`, `FlatEntry`), validation, and normalization |
 | `sync.py` | Core sync engine — `sync_table()` orchestrates query → stream → write → watermark per table |
 | `queries.py` | SQL query builders — CT version checks, PK discovery, full/incremental SELECT generation |
 | `connection.py` | `AzureSQLConnection` wrapper around `mssql-python` with context manager support |

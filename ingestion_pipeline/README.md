@@ -79,6 +79,31 @@ The Parquet files from `azsql_ct` (unified format) use:
 
 ---
 
+## Schema Evolution and Type Widening
+
+`azsql_ct` tracks schema changes in `schema.json` using append-only column semantics:
+
+- **New columns** are appended; downstream sees nulls for historical rows.
+- **Removed columns** are retained so downstream sees nulls instead of missing fields.
+- **Type changes** are updated in-place; the previous type is preserved as `previous_type` for auditability. Each column carries a `last_seen` timestamp.
+
+Because the unified bronze format stores row data as a JSON string in the `data` column, the Parquet schema is stable regardless of source schema evolution. Type information only matters at the `from_json` parsing stage in the pipeline, where `_build_spark_schema` reads the latest `schema.json` to construct the Spark schema.
+
+### Delta Type Widening
+
+For numeric type widenings (e.g., SQL Server `int` -> `bigint`) to flow through to the silver streaming tables without a full refresh, enable [Delta type widening](https://docs.databricks.com/aws/en/delta/type-widening) on the pipeline. Add the following to your Databricks pipeline configuration:
+
+```yaml
+configuration:
+  pipelines.enableTypeWidening: "true"
+```
+
+This allows the silver Delta tables to automatically widen column types (e.g., `INT` -> `BIGINT`) when the parsed view produces a wider type after a source schema change. Without type widening, a type change in the source requires a full refresh of the affected silver table.
+
+See the [supported type widening rules](https://docs.databricks.com/aws/en/delta/type-widening#supported-type-changes) for which widenings are handled automatically. Unsupported type changes (e.g., `int` -> `nvarchar`) still require a full refresh.
+
+---
+
 ## MSSQL-to-Spark Type Mapping
 
 `MSSQL_TO_SPARK` in `ingestion_pipeline_materialized.py` maps SQL Server type names (from `schema.json`) to PySpark types for `from_json` parsing. Unknown types fall back to `StringType()`.

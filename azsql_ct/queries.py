@@ -6,7 +6,7 @@ independently from the sync orchestration and I/O layers.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 
 def list_tracked_tables(cursor: Any) -> List[str]:
@@ -18,11 +18,27 @@ def list_tracked_tables(cursor: Any) -> List[str]:
     return [row[0] for row in cursor.fetchall()]
 
 
-def resolve_table(name: str, tracked: List[str]) -> Optional[str]:
-    """Match a user-supplied name against the tracked-table list (case-insensitive)."""
+def build_tracked_lookup(tracked: List[str]) -> Dict[str, str]:
+    """Build a case-insensitive lookup dict from a tracked-table list.
+
+    Returns ``{lowercase_name: original_name}`` for O(1) resolution.
+    """
+    return {t.lower(): t for t in tracked}
+
+
+def resolve_table(
+    name: str, tracked: "Union[List[str], Dict[str, str]]",
+) -> Optional[str]:
+    """Match a user-supplied name against tracked tables (case-insensitive).
+
+    *tracked* may be a list (legacy, O(n) scan) or a dict from
+    :func:`build_tracked_lookup` (O(1) lookup).
+    """
     want = name.strip().lower()
     if "." not in want:
         want = "dbo." + want
+    if isinstance(tracked, dict):
+        return tracked.get(want)
     for t in tracked:
         if t.lower() == want:
             return t
@@ -138,7 +154,7 @@ def build_change_check_query(table_watermarks: Dict[str, int]) -> str:
     for full_table_name, since_version in table_watermarks.items():
         parts.append(
             f"SELECT '{full_table_name}' AS table_name "
-            f"WHERE EXISTS(SELECT 1 FROM CHANGETABLE(CHANGES {full_table_name}, {since_version}))"
+            f"WHERE EXISTS(SELECT 1 FROM CHANGETABLE(CHANGES {full_table_name}, {since_version}) AS ct)"
         )
     return " UNION ALL ".join(parts)
 
@@ -150,6 +166,35 @@ def fetch_tables_with_changes(cursor: Any, table_watermarks: Dict[str, int]) -> 
     sql = build_change_check_query(table_watermarks)
     cursor.execute(sql)
     return {row[0] for row in cursor.fetchall()}
+
+
+def column_metadata(cursor: Any, full_table_name: str) -> List[Dict[str, Any]]:
+    """Return column names and native SQL Server types for *full_table_name*.
+
+    Queries ``INFORMATION_SCHEMA.COLUMNS`` so that downstream consumers
+    receive the real SQL Server type name (e.g. ``bigint``, ``varchar``,
+    ``money``) instead of the lossy Python type inferred from
+    ``cursor.description``.
+
+    Each returned dict contains ``name`` and ``type``; ``precision`` and
+    ``scale`` are included when the column has non-NULL numeric metadata.
+    """
+    schema_name, table_name = full_table_name.split(".", 1)
+    cursor.execute(
+        "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE "
+        "FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? "
+        "ORDER BY ORDINAL_POSITION",
+        (schema_name, table_name),
+    )
+    columns: List[Dict[str, Any]] = []
+    for row in cursor.fetchall():
+        col: Dict[str, Any] = {"name": row[0], "type": row[1]}
+        if row[2] is not None:
+            col["precision"] = row[2]
+            col["scale"] = row[3]
+        columns.append(col)
+    return columns
 
 
 def min_valid_versions_batch(cursor: Any, table_names: List[str]) -> Dict[str, int]:

@@ -15,6 +15,15 @@ class TestListTrackedTables:
         assert queries.list_tracked_tables(cur) == []
 
 
+class TestBuildTrackedLookup:
+    def test_returns_lowercase_keyed_dict(self):
+        lookup = queries.build_tracked_lookup(["dbo.Foo", "dbo.Bar"])
+        assert lookup == {"dbo.foo": "dbo.Foo", "dbo.bar": "dbo.Bar"}
+
+    def test_empty_list(self):
+        assert queries.build_tracked_lookup([]) == {}
+
+
 class TestResolveTable:
     def test_exact_match(self):
         assert queries.resolve_table("dbo.Foo", ["dbo.Foo", "dbo.Bar"]) == "dbo.Foo"
@@ -30,6 +39,22 @@ class TestResolveTable:
 
     def test_strips_whitespace(self):
         assert queries.resolve_table("  dbo.Foo  ", ["dbo.Foo"]) == "dbo.Foo"
+
+    def test_dict_lookup_exact(self):
+        lookup = queries.build_tracked_lookup(["dbo.Foo", "dbo.Bar"])
+        assert queries.resolve_table("dbo.Foo", lookup) == "dbo.Foo"
+
+    def test_dict_lookup_case_insensitive(self):
+        lookup = queries.build_tracked_lookup(["dbo.Foo"])
+        assert queries.resolve_table("DBO.FOO", lookup) == "dbo.Foo"
+
+    def test_dict_lookup_unqualified(self):
+        lookup = queries.build_tracked_lookup(["dbo.Foo"])
+        assert queries.resolve_table("Foo", lookup) == "dbo.Foo"
+
+    def test_dict_lookup_missing(self):
+        lookup = queries.build_tracked_lookup(["dbo.Foo"])
+        assert queries.resolve_table("dbo.Missing", lookup) is None
 
 
 class TestCurrentVersion:
@@ -257,3 +282,43 @@ class TestMinValidVersionsBatch:
         cur = fake_cursor(results=[[("dbo.T1", 5)]])
         result = queries.min_valid_versions_batch(cur, ["dbo.T1", "dbo.Missing"])
         assert result == {"dbo.T1": 5}
+
+
+class TestColumnMetadata:
+    def test_returns_column_names_and_types(self, fake_cursor):
+        cur = fake_cursor(results=[[
+            ("id", "bigint", 19, 0),
+            ("name", "nvarchar", None, None),
+            ("active", "bit", None, None),
+        ]])
+        cols = queries.column_metadata(cur, "dbo.Users")
+        assert len(cols) == 3
+        assert cols[0] == {"name": "id", "type": "bigint", "precision": 19, "scale": 0}
+        assert cols[1] == {"name": "name", "type": "nvarchar"}
+        assert cols[2] == {"name": "active", "type": "bit"}
+
+    def test_splits_schema_and_table_from_full_name(self, fake_cursor):
+        cur = fake_cursor(results=[[]])
+        queries.column_metadata(cur, "sales.Orders")
+        assert cur.last_params == ("sales", "Orders")
+
+    def test_empty_table_returns_empty_list(self, fake_cursor):
+        cur = fake_cursor(results=[[]])
+        assert queries.column_metadata(cur, "dbo.Empty") == []
+
+    def test_includes_precision_scale_for_decimal(self, fake_cursor):
+        cur = fake_cursor(results=[[("amount", "decimal", 19, 4)]])
+        cols = queries.column_metadata(cur, "dbo.T")
+        assert cols[0]["precision"] == 19
+        assert cols[0]["scale"] == 4
+
+    def test_omits_precision_scale_when_null(self, fake_cursor):
+        cur = fake_cursor(results=[[("email", "varchar", None, None)]])
+        cols = queries.column_metadata(cur, "dbo.T")
+        assert "precision" not in cols[0]
+        assert "scale" not in cols[0]
+
+    def test_executes_information_schema_query(self, fake_cursor):
+        cur = fake_cursor(results=[[]])
+        queries.column_metadata(cur, "dbo.T")
+        assert "INFORMATION_SCHEMA.COLUMNS" in cur.last_sql

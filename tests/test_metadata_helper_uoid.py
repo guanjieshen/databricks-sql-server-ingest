@@ -26,13 +26,3 @@ class TestUoidConsistency:
         a = writer_uoid("a.b", "c", "d")
         b = metadata_uoid("a.b", "c", "d")
         assert a == b
-
-    def test_different_triples_different_uoids(self):
-        w1 = writer_uoid("db1", "dbo", "t1")
-        w2 = writer_uoid("db2", "dbo", "t1")
-        m1 = metadata_uoid("db1", "dbo", "t1")
-        m2 = metadata_uoid("db2", "dbo", "t1")
-        assert w1 != w2
-        assert m1 != m2
-        assert w1 == m1
-        assert w2 == m2

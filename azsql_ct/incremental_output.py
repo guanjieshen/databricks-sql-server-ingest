@@ -12,18 +12,9 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .output_manifest import merge_add, save
+from .output_manifest import _is_success_result, merge_add, save
 
 logger = logging.getLogger(__name__)
-
-
-def _is_success_result(result: dict) -> bool:
-    """True if result is a successful sync (no error)."""
-    if result.get("status") == "error":
-        return False
-    if "database" not in result or "table" not in result:
-        return False
-    return True
 
 
 def write(

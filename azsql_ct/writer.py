@@ -19,6 +19,7 @@ reading partial files and makes cleanup of crash leftovers trivial.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -36,18 +37,37 @@ from ._constants import (
 
 logger = logging.getLogger(__name__)
 
+
+def _default(obj: Any) -> str:
+    """JSON serialization fallback: base64 for binary, str() for everything else."""
+    if isinstance(obj, (bytes, bytearray)):
+        return base64.b64encode(obj).decode()
+    return str(obj)
+
+
 try:
     import orjson
     def _json_dumps(obj: dict) -> str:
-        return orjson.dumps(obj, default=str).decode()
+        return orjson.dumps(obj, default=_default).decode()
 except ImportError:
     def _json_dumps(obj: dict) -> str:
-        return json.dumps(obj, default=str)
+        return json.dumps(obj, default=_default)
 
 _PARTITION_BUFFER_CAP = 10_000
 _TEMP_SUFFIX = ".tmp"
 
 WriteResult = Tuple[List[str], int]
+
+
+def _validate_compression(compression: str) -> str:
+    """Normalize and validate a Parquet compression codec name."""
+    comp = (compression or "").lower()
+    if comp and comp not in VALID_PARQUET_COMPRESSION:
+        raise ValueError(
+            f"Invalid compression {compression!r}; must be one of "
+            f"{sorted(VALID_PARQUET_COMPRESSION)}"
+        )
+    return comp or DEFAULT_PARQUET_COMPRESSION
 
 
 def _parquet_writer_kwargs(compression: str, compression_level: Optional[int]) -> Dict[str, Any]:
@@ -76,8 +96,7 @@ def _value_to_partition_date(value: Any) -> str:
     if value is None:
         return "_unknown"
     if isinstance(value, datetime):
-        d = value.date() if hasattr(value, "date") else value
-        return d.isoformat()
+        return value.date().isoformat()
     if isinstance(value, date) and not isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, str):
@@ -146,13 +165,7 @@ class ParquetWriter:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
         self.partition_column = partition_column
-        _comp = (compression or "").lower()
-        if _comp and _comp not in VALID_PARQUET_COMPRESSION:
-            raise ValueError(
-                f"Invalid compression {compression!r}; must be one of "
-                f"{sorted(VALID_PARQUET_COMPRESSION)}"
-            )
-        self.compression = _comp or DEFAULT_PARQUET_COMPRESSION
+        self.compression = _validate_compression(compression)
         self.compression_level = compression_level
 
     @property
@@ -189,9 +202,10 @@ class ParquetWriter:
         """
         import pyarrow as pa
 
+        transposed = list(zip(*rows))
         columns = {
-            name: ParquetWriter._coerce_column([row[i] for row in rows])
-            for i, name in enumerate(col_names)
+            name: ParquetWriter._coerce_column(list(col))
+            for name, col in zip(col_names, transposed)
         }
 
         if schema is None:
@@ -468,13 +482,7 @@ class UnifiedParquetWriter:
     ) -> None:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
-        _comp = (compression or "").lower()
-        if _comp and _comp not in VALID_PARQUET_COMPRESSION:
-            raise ValueError(
-                f"Invalid compression {compression!r}; must be one of "
-                f"{sorted(VALID_PARQUET_COMPRESSION)}"
-            )
-        self.compression = _comp or DEFAULT_PARQUET_COMPRESSION
+        self.compression = _validate_compression(compression)
         self.compression_level = compression_level
 
     @property
@@ -527,28 +535,51 @@ class UnifiedParquetWriter:
         rows_in_file = 0
         part = 1
 
-        buf_data: List[str] = []
-        buf_table_id: List[dict] = []
-        buf_cursor: List[dict] = []
-        buf_extraction_ts: List[int] = []
-        buf_operation: List[str] = []
-        buf_schema_version: List[int] = []
+        ver_idx = ct_map.get("SYS_CHANGE_VERSION")
+        op_idx = ct_map.get("SYS_CHANGE_OPERATION")
+
+        raw_buf: List[tuple] = []
+
+        def _serialize_batch(buf: List[tuple]) -> Dict[str, list]:
+            """Convert buffered raw tuples into column lists for the arrow batch."""
+            data_strs: List[str] = []
+            cursors: List[dict] = []
+            operations: List[str] = []
+            for t in buf:
+                data_dict = {
+                    data_col_names[j]: (t[idx] if idx < len(t) else None)
+                    for j, idx in enumerate(data_indices)
+                }
+                data_strs.append(_json_dumps(data_dict))
+
+                change_ver = t[ver_idx] if ver_idx is not None else None
+                ver_str = str(change_ver) if change_ver is not None else None
+                cursors.append({
+                    "lsn": None, "seqNum": ver_str,
+                    "sequence": ver_str, "timestamp": None,
+                })
+
+                raw_op = t[op_idx] if op_idx is not None else None
+                operations.append(
+                    OP_MAP.get(str(raw_op).strip() if raw_op else "",
+                               str(raw_op) if raw_op else "UNKNOWN")
+                )
+            n = len(buf)
+            return {
+                "data": data_strs,
+                "table_id": [table_id_val] * n,
+                "cursor": cursors,
+                "extractionTimestamp": [extraction_ts] * n,
+                "operation": operations,
+                "schemaVersion": [schema_version] * n,
+            }
 
         def _flush() -> None:
             nonlocal pq_writer
-            if not buf_data:
+            if not raw_buf:
                 return
-            batch = pa.RecordBatch.from_pydict(
-                {
-                    "data": buf_data,
-                    "table_id": buf_table_id,
-                    "cursor": buf_cursor,
-                    "extractionTimestamp": buf_extraction_ts,
-                    "operation": buf_operation,
-                    "schemaVersion": buf_schema_version,
-                },
-                schema=arrow_schema,
-            )
+            cols = _serialize_batch(raw_buf)
+            batch = pa.RecordBatch.from_pydict(cols, schema=arrow_schema)
             if pq_writer is None:
                 final = os.path.join(dir_path, f"{prefix}_{ts_str}_part{part}.parquet")
                 tmp = final + _TEMP_SUFFIX
@@ -558,12 +589,7 @@ class UnifiedParquetWriter:
                 )
                 pending.append((tmp, final))
             pq_writer.write_batch(batch)
-            buf_data.clear()
-            buf_table_id.clear()
-            buf_cursor.clear()
-            buf_extraction_ts.clear()
-            buf_operation.clear()
-            buf_schema_version.clear()
+            raw_buf.clear()
 
         def _close_file() -> None:
             nonlocal pq_writer, rows_in_file, part
@@ -574,31 +600,11 @@ class UnifiedParquetWriter:
             part += 1
 
         for row in rows:
-            t = tuple(row)
+            raw_buf.append(tuple(row))
             row_count += 1
             rows_in_file += 1
 
-            data_dict = {}
-            for j, idx in enumerate(data_indices):
-                val = t[idx] if idx < len(t) else None
-                data_dict[data_col_names[j]] = val
-            buf_data.append(_json_dumps(data_dict))
-
-            buf_table_id.append(table_id_val)
-
-            change_ver = t[ct_map["SYS_CHANGE_VERSION"]] if "SYS_CHANGE_VERSION" in ct_map else None
-            raw_op = t[ct_map["SYS_CHANGE_OPERATION"]] if "SYS_CHANGE_OPERATION" in ct_map else None
-            buf_cursor.append({
-                "lsn": None,
-                "seqNum": str(change_ver) if change_ver is not None else None,
-                "sequence": str(change_ver) if change_ver is not None else None,
-                "timestamp": None,
-            })
-            buf_extraction_ts.append(extraction_ts)
-            buf_operation.append(OP_MAP.get(str(raw_op).strip() if raw_op else "", str(raw_op) if raw_op else "UNKNOWN"))
-            buf_schema_version.append(schema_version)
-
-            if len(buf_data) >= self.row_group_size:
+            if len(raw_buf) >= self.row_group_size:
                 _flush()
 
             if rows_in_file >= self.max_rows_per_file:

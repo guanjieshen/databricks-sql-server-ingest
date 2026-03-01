@@ -143,6 +143,19 @@ class TestAzureSQLConnection:
         az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
         assert az.test_connectivity() is False
 
+    @patch("azsql_ct.connection._mssql")
+    def test_reconnect_creates_fresh_connection(self, mock_mssql, tmp_path):
+        conn1, conn2 = MagicMock(), MagicMock()
+        mock_mssql.connect.side_effect = [conn1, conn2]
+        env_file = tmp_path / ".env"
+        env_file.write_text("")
+        az = AzureSQLConnection(password="pw", dotenv_path=str(env_file))
+        first = az.connect()
+        assert first is conn1
+        second = az.reconnect()
+        assert second is conn2
+        conn1.close.assert_called_once()
+
     def test_repr(self, tmp_path):
         env_file = tmp_path / ".env"
         env_file.write_text("")
