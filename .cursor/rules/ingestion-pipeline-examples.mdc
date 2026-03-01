@@ -13,7 +13,7 @@ Databricks Lakeflow Declarative Pipelines (DLT) code that reads the Parquet file
 | File | Purpose |
 |---|---|
 | `ingestion_pipeline_materialized.py` | Main DLT pipeline: bronze materialized temp table → per-table silver streaming tables with `create_auto_cdc_flow` |
-| `metadata_helper.py` | Reads pipeline YAML → `output.yaml` → per-table `schema.json`; returns `(table_configs, data_path)` |
+| `metadata_helper.py` | Reads pipeline YAML → manifest (`output.yaml` or `incremental_output.yaml`) → per-table `schema.json`; returns `(table_configs, data_path)` |
 
 ## Architecture: Two-Layer Medallion
 
@@ -62,12 +62,14 @@ The Parquet files produced by `azsql_ct.writer.UnifiedParquetWriter` use this sc
 ```
 pipeline YAML (spark conf `input_yaml`)
   → storage.ingest_pipeline path
-    → {ingest_pipeline}/output.yaml    (which tables, UC names, PKs, SCD types)
+    → {ingest_pipeline}/output.yaml or incremental_output.yaml  (which tables, UC names, PKs, SCD types)
     → {ingest_pipeline}/watermarks/{db}/{schema}/{table}/schema.json  (column definitions)
     → {ingest_pipeline}/data/          (Parquet files — Auto Loader source)
 ```
 
-`parse_output_yaml()` walks the nested `output.yaml` structure (`databases → db → schema → table`) and joins each table with its `schema.json` columns. Returns a flat list of table config dicts with keys: `uc_catalog`, `uc_schema`, `uc_table`, `database`, `schema`, `table`, `uoid`, `primary_key`, `scd_type`, `soft_delete`, `columns`.
+`parse_output_yaml()` walks the nested manifest structure (`databases → db → schema → table`) and joins each table with its `schema.json` columns. Returns a flat list of table config dicts with keys: `uc_catalog`, `uc_schema`, `uc_table`, `database`, `schema`, `table`, `uoid`, `primary_key`, `scd_type`, `soft_delete`, `columns`.
+
+**Manifest selection**: Spark conf `manifest_file` (default `"output.yaml"`) can be set to `"incremental_output.yaml"` to process only tables with changes from the last sync. Falls back to `output.yaml` if incremental is missing or empty.
 
 ## Important: UOID Must Match
 

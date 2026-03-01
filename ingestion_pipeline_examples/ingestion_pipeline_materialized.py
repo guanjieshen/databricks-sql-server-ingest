@@ -66,7 +66,8 @@ def _build_spark_schema(columns):
 
 # Load pipeline config and table metadata (including schema.json columns)
 input_yaml = spark.conf.get("input_yaml")
-table_configs, data_path = parse_output_yaml(input_yaml)
+manifest_file = spark.conf.get("manifest_file", "output.yaml")
+table_configs, data_path = parse_output_yaml(input_yaml, manifest_file=manifest_file)
 
 # BRONZE: Materialized landing (temporary Delta, not published to UC).
 # Parquet read once; downstream views get Delta data skipping.

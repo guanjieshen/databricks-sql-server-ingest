@@ -11,7 +11,7 @@ Databricks Lakeflow Declarative Pipelines (DLT) that consume Parquet output from
 | File | Purpose |
 |------|---------|
 | `ingestion_pipeline_materialized.py` | Main DLT pipeline: bronze materialized temp table → per-table silver streaming tables with `create_auto_cdc_flow` |
-| `metadata_helper.py` | Reads pipeline YAML → `output.yaml` → per-table `schema.json`; returns `(table_configs, data_path)` for downstream use |
+| `metadata_helper.py` | Reads pipeline YAML → manifest (`output.yaml` or `incremental_output.yaml`) → per-table `schema.json`; returns `(table_configs, data_path)` for downstream use |
 
 ---
 
@@ -34,12 +34,24 @@ Cloud Storage (Parquet from azsql_ct)
 ```
 pipeline YAML (spark conf `input_yaml`)
   → storage.ingest_pipeline path
-    → {ingest_pipeline}/output.yaml    (which tables, UC names, PKs, SCD types)
+    → {ingest_pipeline}/output.yaml or incremental_output.yaml  (which tables, UC names, PKs, SCD types)
     → {ingest_pipeline}/watermarks/{db}/{schema}/{table}/schema.json  (column definitions)
     → {ingest_pipeline}/data/          (Parquet files — Auto Loader source)
 ```
 
-`parse_output_yaml()` walks the nested `output.yaml` structure and joins each table with its `schema.json` columns.
+`parse_output_yaml()` walks the nested manifest structure and joins each table with its `schema.json` columns.
+
+### Manifest selection (`manifest_file`)
+
+By default, the pipeline uses `output.yaml` (all synced tables). You can optionally use `incremental_output.yaml` (only tables with changes from the last sync) by setting the Spark config:
+
+```python
+spark.conf.set("manifest_file", "incremental_output.yaml")
+```
+
+**Fallback behavior**: When `manifest_file` is `incremental_output.yaml`, the pipeline falls back to `output.yaml` if:
+- `incremental_output.yaml` does not exist (e.g. before first sync)
+- `incremental_output.yaml` exists but contains no tables (no changes in last sync)
 
 ---
 
@@ -62,7 +74,8 @@ The Parquet files from `azsql_ct` (unified format) use:
 
 1. Run `azsql_ct` sync to produce Parquet under `{ingest_pipeline}/data/`.
 2. Set Spark config `input_yaml` to the path of your pipeline YAML (the same config used by sync, or one that points to the same `storage.ingest_pipeline`).
-3. Run the DLT pipeline in Databricks (or compatible Spark environment).
+3. Optionally set `manifest_file` to `"incremental_output.yaml"` to process only tables with changes (falls back to `output.yaml` if incremental is missing or empty).
+4. Run the DLT pipeline in Databricks (or compatible Spark environment).
 
 ---
 
