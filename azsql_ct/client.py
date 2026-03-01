@@ -66,6 +66,7 @@ from ._constants import (
     VALID_MODES, VALID_OUTPUT_FORMATS, VALID_SCD_TYPES,
 )
 from .connection import AzureSQLConnection, load_dotenv
+from .incremental_output import write as incremental_output_write
 from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
 from . import watermark
@@ -763,6 +764,20 @@ class ChangeTracker:
                 manifest["ingest_pipeline"] = self.ingest_pipeline
             manifest_save(self.output_manifest, manifest)
             logger.debug("Updated output manifest %s", self.output_manifest)
+
+            if self.ingest_pipeline is not None:
+                inc_path = os.path.join(self.ingest_pipeline, "incremental_output.yaml")
+                try:
+                    incremental_output_write(
+                        results,
+                        self.output_dir,
+                        getattr(self.writer, "file_type", "parquet"),
+                        inc_path,
+                        uc_metadata=self._uc_metadata,
+                        ingest_pipeline=self.ingest_pipeline,
+                    )
+                except Exception as inc_exc:
+                    logger.warning("Failed to write incremental output %s: %s", inc_path, inc_exc)
         except Exception as exc:
             logger.warning("Failed to update output manifest %s: %s", self.output_manifest, exc)
 

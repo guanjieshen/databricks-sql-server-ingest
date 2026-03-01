@@ -36,6 +36,7 @@ pytest -m integration -v
 | `test_watermark.py` | Watermark load/save, sync history |
 | `test_schema.py` | Append-only schema tracking |
 | `test_output_manifest.py` | `output.yaml` manifest load/merge/save |
+| `test_incremental_output.py` | `incremental_output.yaml` — tables with changes, `generated_at` timestamp |
 | `test_cli.py` | `python -m azsql_ct` entry point |
 | `test_integration.py` | Live DB: restricted login sees only allowed databases |
 
