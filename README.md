@@ -192,6 +192,17 @@ ct.tables = {
 results = ct.sync()
 ```
 
+### Databricks task values
+
+When the sync is run as a Databricks job task and `set_databricks_task_values(results)` is called (as in `scripts/sync.py` or `python -m azsql_ct`), two task values are set for downstream tasks:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `total_rows_changed` | int | Sum of `rows_written` across all non-error table results. |
+| `schema_changes_detected` | bool | `True` if any synced table had a schema change (columns added, removed, or type changed) compared to the previous run. |
+
+Reference them in the job as `{{tasks.<sync_task_name>.values.total_rows_changed}}` and `{{tasks.<sync_task_name>.values.schema_changes_detected}}`. For example, add a conditional notification task that runs only when `schema_changes_detected` is true.
+
 ---
 
 ## Output Structure

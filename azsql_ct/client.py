@@ -79,9 +79,14 @@ logger = logging.getLogger(__name__)
 def set_databricks_task_values(results: List[dict]) -> int:
     """Set Databricks task values from sync results for downstream workflow tasks.
 
-    When running in a Databricks job, sets ``total_rows_changed`` to the sum of
-    ``rows_written`` across all non-error results. Downstream tasks can reference
-    it via ``{{tasks.<task_name>.values.total_rows_changed}}``.
+    When running in a Databricks job, sets:
+
+    - ``total_rows_changed`` (int): Sum of ``rows_written`` across all non-error
+      results. Reference via ``{{tasks.<task_name>.values.total_rows_changed}}``.
+    - ``schema_changes_detected`` (bool): ``True`` if any synced table had a
+      schema change (columns added, removed, or type changed). Reference via
+      ``{{tasks.<task_name>.values.schema_changes_detected}}`` for notifications
+      or conditional branching.
 
     When run locally (no ``dbutils``), this is a no-op.
 
@@ -93,12 +98,20 @@ def set_databricks_task_values(results: List[dict]) -> int:
         for r in results
         if r.get("status") != "error"
     )
+    has_schema_changes = any(
+        r.get("schema_changed")
+        for r in results
+        if r.get("status") != "error"
+    )
     try:
         import sys
         main = sys.modules.get("__main__")
         dbutils = getattr(main, "dbutils", None) if main else None
         if dbutils is not None:
             dbutils.jobs.taskValues.set(key="total_rows_changed", value=total_rows)
+            dbutils.jobs.taskValues.set(
+                key="schema_changes_detected", value=has_schema_changes
+            )
     except Exception:
         pass
     return total_rows

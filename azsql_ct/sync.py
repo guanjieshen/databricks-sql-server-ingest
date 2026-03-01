@@ -335,6 +335,7 @@ def _sync_table_locked(
         columns = columns_from_description(description)
 
     existing_schema = schema.load(wm_dir)
+    schema_changed = False
     if existing_schema:
         existing_by_name = {
             c["name"]: c for c in existing_schema.get("columns", [])
@@ -352,6 +353,7 @@ def _sync_table_locked(
         ]
 
         if added or removed or type_changed:
+            schema_changed = True
             logger.warning(
                 "Schema change detected for %s.%s (version %d -> %d)",
                 database, full_name,
@@ -396,4 +398,5 @@ def _sync_table_locked(
         "primary_key": pk_cols,
         "columns": columns,
         "schema_version": schema_ver,
+        "schema_changed": schema_changed,
     }

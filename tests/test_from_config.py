@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from azsql_ct.client import (
     ChangeTracker,
@@ -71,9 +71,10 @@ class TestSetDatabricksTaskValues:
             total = set_databricks_task_values(results)
 
         assert total == 15
-        mock_dbutils.jobs.taskValues.set.assert_called_once_with(
-            key="total_rows_changed", value=15
-        )
+        mock_dbutils.jobs.taskValues.set.assert_has_calls([
+            call(key="total_rows_changed", value=15),
+            call(key="schema_changes_detected", value=False),
+        ])
 
     def test_returns_total_when_no_dbutils(self):
         results = [
@@ -94,9 +95,27 @@ class TestSetDatabricksTaskValues:
             total = set_databricks_task_values(results)
 
         assert total == 7
-        mock_dbutils.jobs.taskValues.set.assert_called_once_with(
-            key="total_rows_changed", value=7
-        )
+        mock_dbutils.jobs.taskValues.set.assert_has_calls([
+            call(key="total_rows_changed", value=7),
+            call(key="schema_changes_detected", value=False),
+        ])
+
+    def test_sets_schema_changes_detected_when_any_table_has_schema_changed(self):
+        results = [
+            {"database": "db1", "table": "dbo.t1", "rows_written": 10, "schema_changed": False},
+            {"database": "db1", "table": "dbo.t2", "rows_written": 5, "schema_changed": True},
+        ]
+        mock_main = MagicMock()
+        mock_dbutils = MagicMock()
+        mock_main.dbutils = mock_dbutils
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            total = set_databricks_task_values(results)
+
+        assert total == 15
+        mock_dbutils.jobs.taskValues.set.assert_has_calls([
+            call(key="total_rows_changed", value=15),
+            call(key="schema_changes_detected", value=True),
+        ])
 
     def test_returns_total_even_when_dbutils_raises(self):
         results = [{"database": "db1", "table": "dbo.t1", "rows_written": 10}]
