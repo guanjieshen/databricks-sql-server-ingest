@@ -9,6 +9,7 @@ import argparse
 import logging
 
 from azsql_ct import ChangeTracker
+from azsql_ct.client import set_databricks_task_values
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +29,8 @@ if __name__ == "__main__":
     ct = ChangeTracker.from_config(args.config)
     print(ct)
     results = ct.sync()
+    total_rows = set_databricks_task_values(results)
     for r in results:
         status = r.get("status", r.get("mode", ""))
         print(f"  {r['database']}.{r['table']}: {status} ({r.get('rows_written', 0)} rows)")
+    print(f"Total: {total_rows} rows across all tables")

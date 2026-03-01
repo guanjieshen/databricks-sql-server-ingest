@@ -6,7 +6,7 @@ independently from the sync orchestration and I/O layers.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 def list_tracked_tables(cursor: Any) -> List[str]:
@@ -123,3 +123,49 @@ def build_incremental_query(
         f"FROM CHANGETABLE(CHANGES {full_table_name}, ?) AS ct "
         f"LEFT JOIN {full_table_name} AS t ON {join_cond}"
     )
+
+
+def build_change_check_query(table_watermarks: Dict[str, int]) -> str:
+    """Build a UNION ALL query that returns table names having changes since their version.
+
+    Each subquery uses EXISTS(SELECT 1 FROM CHANGETABLE(CHANGES table, version))
+    so SQL Server stops at the first change record per table.
+    Returns empty string if table_watermarks is empty.
+    """
+    if not table_watermarks:
+        return ""
+    parts = []
+    for full_table_name, since_version in table_watermarks.items():
+        parts.append(
+            f"SELECT '{full_table_name}' AS table_name "
+            f"WHERE EXISTS(SELECT 1 FROM CHANGETABLE(CHANGES {full_table_name}, {since_version}))"
+        )
+    return " UNION ALL ".join(parts)
+
+
+def fetch_tables_with_changes(cursor: Any, table_watermarks: Dict[str, int]) -> Set[str]:
+    """Execute the change-check query and return set of table names that have changes."""
+    if not table_watermarks:
+        return set()
+    sql = build_change_check_query(table_watermarks)
+    cursor.execute(sql)
+    return {row[0] for row in cursor.fetchall()}
+
+
+def min_valid_versions_batch(cursor: Any, table_names: List[str]) -> Dict[str, int]:
+    """Return min valid version for each table in one query. Uses 0 for missing/NULL."""
+    if not table_names:
+        return {}
+    placeholders = ", ".join("?" * len(table_names))
+    cursor.execute(
+        "SELECT OBJECT_SCHEMA_NAME(t.object_id) + '.' + OBJECT_NAME(t.object_id), "
+        "CHANGE_TRACKING_MIN_VALID_VERSION(t.object_id) "
+        "FROM sys.change_tracking_tables t "
+        f"WHERE OBJECT_SCHEMA_NAME(t.object_id) + '.' + OBJECT_NAME(t.object_id) IN ({placeholders})",
+        tuple(table_names),
+    )
+    result = {}
+    for row in cursor.fetchall():
+        name, min_ver = row[0], row[1]
+        result[name] = min_ver if min_ver is not None else 0
+    return result

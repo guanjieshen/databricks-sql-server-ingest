@@ -54,6 +54,14 @@ PYTHONPATH=/path/to/sql_server_permissions python3.11 scripts/sync.py [config]
 - `pipelines/pipeline_1.yaml` — project-specific pipeline (often gitignored)
 - `example_pipelines/pipeline_1.yaml` — template with placeholders
 
+**Databricks Jobs integration**: When run as a Databricks job task, the script sets `total_rows_changed` as a task value (sum of `rows_written` across all non-error results). Downstream tasks can reference it for conditional branching, e.g. in an If/else condition:
+
+```
+{{tasks.<sync_task_name>.values.total_rows_changed}} == 0
+```
+
+Replace `<sync_task_name>` with your sync task's key (e.g. `Gateway`). When run locally or when `dbutils` is unavailable, the helper is a no-op and the script completes normally.
+
 ---
 
 ### connect.py
@@ -132,3 +140,39 @@ scripts/
 | `ModuleNotFoundError: No module named 'mssql_python'` | Install with Python 3.10+: `python3.11 -m pip install mssql-python` |
 | `ChangeTracker has no attribute 'from_config'` | Run with `PYTHONPATH` set to project root (use local package, not installed copy) |
 | `FileNotFoundError: pipelines/pipeline_1.yaml` | Create config or pass explicit path: `scripts/sync.py example_pipelines/pipeline_1.yaml` |
+| `Table 'dbo.table_X' is not change-tracked in database_Y. Tracked tables: []` | Enable change tracking at the database and table level (see below) |
+
+---
+
+## Fix: Table is not change-tracked
+
+If you see:
+
+```
+Failed to sync database_1.dbo.table_1: Table 'dbo.table_1' is not change-tracked in database_1. Tracked tables: []
+```
+
+Change tracking must be enabled at both the **database** and **table** level. Run the following as a database admin (e.g. in Azure Data Studio or SSMS):
+
+**1. Enable change tracking on the database** (once per database):
+
+```sql
+ALTER DATABASE [database_1]
+SET CHANGE_TRACKING = ON
+(CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
+```
+
+**2. Enable change tracking on each table** (once per table):
+
+```sql
+ALTER TABLE dbo.table_1 ENABLE CHANGE_TRACKING;
+ALTER TABLE dbo.table_59 ENABLE CHANGE_TRACKING;
+```
+
+**3. Grant permissions** (if using a read-only user for sync):
+
+```sql
+GRANT VIEW CHANGE TRACKING ON SCHEMA::dbo TO [<your_sync_user>];
+```
+
+Then re-run the sync. See [Enable and Disable Change Tracking (SQL Server)](https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/enable-and-disable-change-tracking-sql-server) for details.

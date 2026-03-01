@@ -10,7 +10,7 @@ import json
 import logging
 import sys
 
-from .client import ChangeTracker
+from .client import ChangeTracker, set_databricks_task_values
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,7 @@ def main() -> None:
         logger.error("Sync failed: %s", exc)
         sys.exit(1)
 
+    set_databricks_task_values(results)
     _log_summary(results)
 
     for r in results:

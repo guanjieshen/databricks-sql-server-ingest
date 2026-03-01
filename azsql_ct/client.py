@@ -57,8 +57,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Empty, Queue
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
+from . import queries
 from ._constants import (
     DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PARQUET_COMPRESSION,
     DEFAULT_ROW_GROUP_SIZE, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE,
@@ -67,6 +68,7 @@ from ._constants import (
 from .connection import AzureSQLConnection, load_dotenv
 from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
+from . import watermark
 from .writer import OutputWriter, ParquetWriter, UnifiedParquetWriter
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,34 @@ def expand_env(value: str) -> str:
         return os.environ[name]
 
     return re.sub(r"\$\{(\w+)}", _repl, str(value))
+
+
+def set_databricks_task_values(results: List[dict]) -> int:
+    """Set Databricks task values from sync results for downstream workflow tasks.
+
+    When running in a Databricks job, sets ``total_rows_changed`` to the sum of
+    ``rows_written`` across all non-error results. Downstream tasks can reference
+    it via ``{{tasks.<task_name>.values.total_rows_changed}}``.
+
+    When run locally (no ``dbutils``), this is a no-op.
+
+    Returns:
+        Total rows written across all non-error results.
+    """
+    total_rows = sum(
+        r.get("rows_written", 0)
+        for r in results
+        if r.get("status") != "error"
+    )
+    try:
+        import sys
+        main = sys.modules.get("__main__")
+        dbutils = getattr(main, "dbutils", None) if main else None
+        if dbutils is not None:
+            dbutils.jobs.taskValues.set(key="total_rows_changed", value=total_rows)
+    except Exception:
+        pass
+    return total_rows
 
 
 def _load_config_file(path: Union[str, Path]) -> dict:
@@ -352,6 +382,86 @@ def _validate_table_map(value: object) -> TableMap:
     if not value:
         raise ValueError("tables dict must not be empty")
     return value  # type: ignore[return-value]
+
+
+def _load_watermarks_for_tables(
+    watermark_dir: str, database: str, tables: List[str],
+) -> Dict[str, int]:
+    """Load watermark version for each table. Returns {full_table_name: version} for tables with watermarks."""
+    result: Dict[str, int] = {}
+    for full_table_name in tables:
+        schema, table = full_table_name.split(".", 1)
+        wm_dir = os.path.join(watermark_dir, database, schema, table)
+        since = watermark.get(wm_dir, full_table_name)
+        if since is not None:
+            result[full_table_name] = since
+    return result
+
+
+def _compute_tables_to_skip(
+    database: str,
+    conn: Any,
+    flat_entries: List[FlatEntry],
+    watermark_dir: str,
+    mode_override: Optional[str],
+) -> Set[str]:
+    """Return set of full_table_name (config names) to skip (incremental tables with no changes)."""
+    try:
+        cur = conn.cursor()
+        tracked = queries.list_tracked_tables(cur)
+
+        resolved_to_config: Dict[str, str] = {}
+        for _db, full_table_name, table_mode, _scd, _soft in flat_entries:
+            if _db != database:
+                continue
+            mode = mode_override or table_mode or "full_incremental"
+            if mode not in ("incremental", "full_incremental"):
+                continue
+            resolved = queries.resolve_table(full_table_name, tracked)
+            if resolved is None:
+                continue
+            resolved_to_config[resolved] = full_table_name
+
+        if not resolved_to_config:
+            return set()
+
+        watermarks = _load_watermarks_for_tables(
+            watermark_dir, database, list(resolved_to_config.keys()),
+        )
+        resolved_with_wm = [r for r in resolved_to_config if r in watermarks]
+        if not resolved_with_wm:
+            return set()
+
+        min_vers = queries.min_valid_versions_batch(cur, resolved_with_wm)
+
+        table_watermarks: Dict[str, int] = {}
+        for resolved in resolved_with_wm:
+            since = watermarks[resolved]
+            min_ver = min_vers.get(resolved, 0)
+            if since >= min_ver:
+                table_watermarks[resolved] = since
+
+        if not table_watermarks:
+            return set()
+
+        changed = queries.fetch_tables_with_changes(cur, table_watermarks)
+        to_skip_resolved = {t for t in table_watermarks if t not in changed}
+        return {resolved_to_config[r] for r in to_skip_resolved}
+    except Exception as exc:
+        logger.warning(
+            "Change check failed for %s, syncing all tables: %s", database, exc,
+        )
+        return set()
+
+
+def _skipped_result(database: str, table: str) -> dict:
+    """Result dict for a table skipped due to no changes."""
+    return {
+        "database": database,
+        "table": table,
+        "status": "skipped",
+        "reason": "no changes",
+    }
 
 
 class ChangeTracker:
@@ -671,6 +781,7 @@ class ChangeTracker:
 
     def _run_sync_sequential(self, mode_override: Optional[str]) -> List[dict]:
         conns: Dict[str, Any] = {}
+        skip_cache: Dict[str, Set[str]] = {}
         results: List[dict] = []
 
         try:
@@ -688,8 +799,31 @@ class ChangeTracker:
                         )
                         results.append(self._error_result(database, full_table_name, exc))
                         continue
+                    if mode_override != "full":
+                        try:
+                            db_entries = [
+                                e for e in self._flat_tables
+                                if e[0] == database
+                            ]
+                            skip_cache[database] = _compute_tables_to_skip(
+                                database,
+                                conns[database],
+                                db_entries,
+                                self.watermark_dir,
+                                mode_override,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Change check failed for %s, syncing all tables: %s",
+                                database, exc,
+                            )
+                            skip_cache[database] = set()
 
                 mode = mode_override or table_mode or "full_incremental"
+                if mode != "full" and full_table_name in skip_cache.get(database, set()):
+                    results.append(_skipped_result(database, full_table_name))
+                    continue
+
                 uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
                 try:
                     results.append(
@@ -773,13 +907,42 @@ class ChangeTracker:
         results: List[Optional[dict]] = [None] * len(work)
         conn_pool = _ConnectionPool(self.server, self.user, self._password)
 
+        skip_set: Set[Tuple[str, str]] = set()
+        if mode_override != "full":
+            db_entries: Dict[str, List[FlatEntry]] = {}
+            for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
+                db_entries.setdefault(database, []).append(
+                    (database, full_table_name, table_mode, scd_type, soft_delete),
+                )
+            for database, entries in db_entries.items():
+                try:
+                    az, conn = conn_pool.acquire(database)
+                    to_skip = _compute_tables_to_skip(
+                        database, conn, entries,
+                        self.watermark_dir, mode_override,
+                    )
+                    conn_pool.release(database, az)
+                    for tbl in to_skip:
+                        skip_set.add((database, tbl))
+                except Exception as exc:
+                    logger.warning(
+                        "Change check failed for %s, syncing all tables: %s",
+                        database, exc,
+                    )
+
+        for idx, db, tbl, mode, scd, sd in work:
+            if (db, tbl) in skip_set:
+                results[idx] = _skipped_result(db, tbl)
+
+        work_to_run = [(idx, db, tbl, mode, scd, sd) for idx, db, tbl, mode, scd, sd in work if (db, tbl) not in skip_set]
+
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_idx = {
                     executor.submit(
                         self._sync_one_table, conn_pool, db, tbl, mode, scd, sd,
                     ): idx
-                    for idx, db, tbl, mode, scd, sd in work
+                    for idx, db, tbl, mode, scd, sd in work_to_run
                 }
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]

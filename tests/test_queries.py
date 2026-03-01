@@ -193,3 +193,67 @@ class TestSpecialTableNames:
         """A name containing a dot is never prefixed with 'dbo.'."""
         result = queries.resolve_table("catalog.dbo.T", ["catalog.dbo.T"])
         assert result == "catalog.dbo.T"
+
+
+class TestBuildChangeCheckQuery:
+    def test_empty_dict_returns_empty_string(self):
+        assert queries.build_change_check_query({}) == ""
+
+    def test_single_table(self):
+        sql = queries.build_change_check_query({"dbo.Orders": 2248})
+        assert "SELECT 'dbo.Orders' AS table_name" in sql
+        assert "CHANGETABLE(CHANGES dbo.Orders, 2248)" in sql
+
+    def test_multiple_tables_different_versions(self):
+        sql = queries.build_change_check_query({
+            "dbo.orders": 2248,
+            "dbo.customers": 2100,
+        })
+        assert "UNION ALL" in sql
+        assert "dbo.orders" in sql and "2248" in sql
+        assert "dbo.customers" in sql and "2100" in sql
+
+    def test_uses_exists_for_short_circuit(self):
+        sql = queries.build_change_check_query({"dbo.T": 1})
+        assert "EXISTS(SELECT 1 FROM CHANGETABLE" in sql
+
+
+class TestFetchTablesWithChanges:
+    def test_returns_set_of_table_names(self, fake_cursor):
+        cur = fake_cursor(results=[[("dbo.orders",), ("dbo.customers",)]])
+        result = queries.fetch_tables_with_changes(
+            cur, {"dbo.orders": 100, "dbo.customers": 200},
+        )
+        assert result == {"dbo.orders", "dbo.customers"}
+
+    def test_empty_watermarks_returns_empty_set(self, fake_cursor):
+        cur = fake_cursor()
+        result = queries.fetch_tables_with_changes(cur, {})
+        assert result == set()
+
+    def test_empty_result_when_no_changes(self, fake_cursor):
+        cur = fake_cursor(results=[[]])
+        result = queries.fetch_tables_with_changes(cur, {"dbo.T": 100})
+        assert result == set()
+
+
+class TestMinValidVersionsBatch:
+    def test_returns_dict(self, fake_cursor):
+        cur = fake_cursor(results=[[("dbo.T1", 10), ("dbo.T2", 20)]])
+        result = queries.min_valid_versions_batch(cur, ["dbo.T1", "dbo.T2"])
+        assert result == {"dbo.T1": 10, "dbo.T2": 20}
+
+    def test_handles_null_as_zero(self, fake_cursor):
+        cur = fake_cursor(results=[[("dbo.T", None)]])
+        result = queries.min_valid_versions_batch(cur, ["dbo.T"])
+        assert result == {"dbo.T": 0}
+
+    def test_empty_list_returns_empty_dict(self, fake_cursor):
+        cur = fake_cursor()
+        result = queries.min_valid_versions_batch(cur, [])
+        assert result == {}
+
+    def test_missing_tables_use_zero(self, fake_cursor):
+        cur = fake_cursor(results=[[("dbo.T1", 5)]])
+        result = queries.min_valid_versions_batch(cur, ["dbo.T1", "dbo.Missing"])
+        assert result == {"dbo.T1": 5}
