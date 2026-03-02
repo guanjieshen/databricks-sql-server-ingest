@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from azsql_ct.config import (
@@ -9,6 +12,8 @@ from azsql_ct.config import (
     _flatten_table_map,
     _normalize_table_map,
     _validate_table_map,
+    resolve_secrets,
+    resolve_value,
 )
 
 
@@ -280,3 +285,59 @@ class TestExtractUcMetadata:
         assert "db2" not in result
         assert result["db1"]["uc_catalog"] == "cat1"
         assert result["db1"]["schemas"]["dbo"] == "s1"
+
+
+class TestResolveSecrets:
+    """Tests for resolve_secrets -- Databricks {{secrets/scope/key}} resolution."""
+
+    def test_happy_path(self):
+        mock_main = MagicMock()
+        mock_main.dbutils.secrets.get.return_value = "s3cret"
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            assert resolve_secrets("{{secrets/my-scope/my-key}}") == "s3cret"
+        mock_main.dbutils.secrets.get.assert_called_once_with(
+            scope="my-scope", key="my-key",
+        )
+
+    def test_multiple_references(self):
+        mock_main = MagicMock()
+        mock_main.dbutils.secrets.get.side_effect = lambda scope, key: f"{scope}:{key}"
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            result = resolve_secrets(
+                "user={{secrets/s/user}}&pass={{secrets/s/pass}}"
+            )
+        assert result == "user=s:user&pass=s:pass"
+
+    def test_no_dbutils_raises(self):
+        mock_main = MagicMock(spec=[])  # no dbutils attribute
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            with pytest.raises(RuntimeError, match="Databricks runtime"):
+                resolve_secrets("{{secrets/scope/key}}")
+
+    def test_no_pattern_passthrough(self):
+        assert resolve_secrets("plain_password") == "plain_password"
+
+    def test_no_pattern_does_not_require_dbutils(self):
+        mock_main = MagicMock(spec=[])  # no dbutils
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            assert resolve_secrets("no-secrets-here") == "no-secrets-here"
+
+    def test_env_var_syntax_ignored(self):
+        assert resolve_secrets("${ADMIN_PASSWORD}") == "${ADMIN_PASSWORD}"
+
+
+class TestResolveValue:
+    """Tests for resolve_value -- chained secret + env-var resolution."""
+
+    def test_resolves_secret(self):
+        mock_main = MagicMock()
+        mock_main.dbutils.secrets.get.return_value = "secret_val"
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            assert resolve_value("{{secrets/s/k}}") == "secret_val"
+
+    def test_resolves_env_var(self):
+        with patch.dict("os.environ", {"MY_VAR": "from_env"}):
+            assert resolve_value("${MY_VAR}") == "from_env"
+
+    def test_plain_passthrough(self):
+        assert resolve_value("literal_password") == "literal_password"

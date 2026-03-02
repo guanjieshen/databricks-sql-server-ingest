@@ -1,7 +1,7 @@
 connection:
   server: INSERT_SERVERNAME_HERE
   sql_login: INSERT_LOGIN_HERE
-  password: INSERT_PASSWORD_HERE
+  password: INSERT_PASSWORD_HERE          # or: {{secrets/my-scope/sql-password}}
 
 
 # Number of tables to sync in parallel (default: 1 = sequential).
