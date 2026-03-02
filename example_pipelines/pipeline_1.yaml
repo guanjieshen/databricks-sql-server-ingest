@@ -5,7 +5,7 @@ connection:
 
 
 # Number of tables to sync in parallel (default: 1 = sequential).
-parallelism: 4
+parallelism: 12
 
 # Single directory for this pipeline: data, watermarks, and output manifest are written under it.
 storage:
