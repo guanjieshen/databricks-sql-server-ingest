@@ -155,7 +155,7 @@ class TestPipelineResource:
     def test_libraries_point_to_lakeflow_pipeline(self):
         data = _pipeline_resource("p1", "p1.yaml")
         libs = data["resources"]["pipelines"]["sdp_p1"]["libraries"]
-        paths = [lib["notebook"]["path"] for lib in libs]
+        paths = [lib["glob"]["include"] for lib in libs]
         assert any("ingestion_pipeline_materialized.py" in p for p in paths)
         assert any("metadata_helper.py" in p for p in paths)
 
@@ -358,6 +358,27 @@ class TestMain:
 
         main()
         assert not (resources / "pipelines").exists() or not list((resources / "pipelines").glob("*.yml"))
+
+    def test_dry_run_does_not_remove_stale(self, tmp_path: Path, monkeypatch):
+        pipelines, resources = self._setup_dirs(tmp_path)
+        stale_pls = resources / "pipelines"
+        stale_pls.mkdir(parents=True, exist_ok=True)
+        (stale_pls / "sdp_old.yml").touch()
+        stale_jobs = resources / "jobs"
+        stale_jobs.mkdir(parents=True, exist_ok=True)
+        (stale_jobs / "job_old.yml").touch()
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gen", "--pipelines-dir", str(pipelines), "--resources-dir", str(resources), "--dry-run"],
+        )
+        import dab.generate_jobs as mod
+        monkeypatch.setattr(mod, "_SCRIPT_PATH", Path(__file__))
+
+        rc = main()
+        assert rc == 0
+        assert (stale_pls / "sdp_old.yml").exists()
+        assert (stale_jobs / "job_old.yml").exists()
 
     def test_no_configs_returns_zero(self, tmp_path: Path, monkeypatch):
         empty_pipelines = tmp_path / "empty"
