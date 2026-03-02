@@ -1,207 +1,247 @@
 # azsql_ct — Azure SQL Change Tracking Sync
 
-Incrementally sync change-tracked tables from Azure SQL Server to local Parquet files. Built for batch ETL workflows that land Azure SQL data into a lakehouse (e.g. Databricks / Spark).
-
-Uses [mssql-python](https://github.com/microsoft/mssql-python) — Microsoft's official driver that bundles its own TDS layer, so **no system ODBC driver is needed**.
+Incrementally sync change-tracked tables from Azure SQL Server to Parquet files, then ingest into Databricks via Lakeflow DLT pipelines. Uses [mssql-python](https://github.com/microsoft/mssql-python) — Microsoft's official driver that bundles its own TDS layer, so **no system ODBC driver is needed**.
 
 ---
 
-## What This Repo Does
+## How to Use This Repo
 
-`azsql_ct` connects to one or more Azure SQL databases, reads tables that have SQL Server Change Tracking enabled, and writes the results as Parquet files to a local (or mounted) directory. On subsequent runs it uses change-tracking watermarks to fetch only the rows that changed, dramatically reducing data transfer and processing time.
+### Step 1 — Create a pipeline config
 
-Key capabilities:
+Each SQL Server you want to sync gets its own YAML config file under `pipelines/`. Start from the template in `example_pipelines/`:
 
-- **Incremental extraction** via SQL Server Change Tracking (`CHANGETABLE`).
-- **Parallel table sync** with configurable worker count.
-- **Two output formats**: native per-table Parquet or a Lakeflow-Connect-style unified bronze envelope.
-- **Watermark management** — persists sync state (version, rows, duration, files) per table so runs are resumable.
-- **Schema evolution** — append-only column tracking with type change detection, `previous_type` auditability, and `last_seen` timestamps for column activity.
-- **Output manifest** — YAML manifest of synced tables for downstream orchestration.
-- **SCD Type 1 & 2** support, configurable per table.
-- **Soft-delete support** — optionally preserve deleted rows with an `_is_deleted` flag.
-- **Atomic writes** — write-then-rename strategy prevents downstream readers from seeing partial files.
+```bash
+cp example_pipelines/pipeline_1.yaml pipelines/my_server.yaml
+```
+
+Open `pipelines/my_server.yaml` and fill in the placeholders:
+
+```yaml
+connection:
+  server: my-server.database.windows.net
+  sql_login: sync_user
+  password: ${ADMIN_PASSWORD}          # resolved from .env or environment
+
+parallelism: 4                         # tables synced in parallel
+
+storage:
+  ingest_pipeline: /Volumes/my_catalog/my_schema/my_volume/my_server
+  # output_format: per_table           # (default) or "unified" for Lakeflow-Connect-style bronze
+  # parquet_compression: zstd          # (default) or snappy, gzip, brotli, lz4, none
+  # row_group_size: 500000             # rows per Parquet row group; smaller = less memory
+
+databases:
+  my_database:
+    uc_catalog: my_catalog             # Unity Catalog name (used by downstream DLT, not sync)
+    schemas:
+      dbo:
+        uc_schema: my_schema           # Unity Catalog schema (used by downstream DLT, not sync)
+        tables:
+          orders:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: true
+          customers:
+            mode: full_incremental
+            scd_type: 2               # SCD Type II — track historical changes
+```
+
+> The `pipelines/` directory is gitignored because configs contain real connection info. Templates in `example_pipelines/` are safe to commit.
+
+#### Config reference
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `connection.server` | Yes | SQL Server hostname |
+| `connection.sql_login` | Yes | Login name |
+| `connection.password` | Yes | Password (supports `${VAR}` env expansion) |
+| `parallelism` | No | Tables synced in parallel (default: 1) |
+| `storage.ingest_pipeline` | Yes | Root directory for data, watermarks, and output manifest |
+| `storage.output_format` | No | `per_table` (default) or `unified` |
+| `databases.<db>.uc_catalog` | No | Unity Catalog name for downstream DLT |
+| `databases.<db>.schemas.<s>.uc_schema` | No | Unity Catalog schema for downstream DLT |
+| `tables.<t>.mode` | No | `full`, `incremental`, or `full_incremental` (default) |
+| `tables.<t>.scd_type` | No | `1` (default, overwrite) or `2` (historical tracking) |
+| `tables.<t>.soft_delete` | No | `true` to keep deleted rows with `_is_deleted` flag |
+
+### Step 2 — Generate DAB resources
+
+The `dab/` directory contains a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/index.html) with a **1:1 mapping** — one DLT pipeline + one job per pipeline config. Resource files are generated automatically; never edit them by hand.
+
+After adding, renaming, or removing a file in `pipelines/`, regenerate the DAB resources:
+
+```bash
+python dab/generate_jobs.py
+```
+
+This reads every `pipelines/*.yaml` / `*.yml` and writes two files per config:
+
+| Generated file | Purpose |
+|----------------|---------|
+| `dab/resources/pipelines/sdp_<name>.yml` | DLT pipeline resource |
+| `dab/resources/jobs/job_<name>.yml` | Job resource that runs sync then triggers the DLT pipeline |
+
+Stale resource files (whose pipeline config no longer exists) are removed automatically.
+
+Useful flags:
+
+```bash
+python dab/generate_jobs.py --dry-run      # preview without writing
+python dab/generate_jobs.py --no-clean     # keep stale files
+```
+
+#### What gets generated
+
+For a config file `pipelines/my_server.yaml`, the generator creates:
+
+- **`dab/resources/pipelines/sdp_my_server.yml`** — a DLT pipeline that runs the Lakeflow ingestion code against the sync output.
+- **`dab/resources/jobs/job_my_server.yml`** — a multi-task job with this flow:
+
+```
+gateway (sync.py)
+  ├── check_record_changed ──→ ingestion (DLT pipeline)
+  └── schema_change_detected
+```
+
+The `gateway` task runs `scripts/sync.py` with your pipeline config, sets task values (`total_rows_changed`, `schema_changes_detected`), and downstream tasks branch on those values.
+
+### Step 3 — Configure the bundle variables
+
+Open `dab/databricks.yml` and set the variables for your environment:
+
+| Variable | Description |
+|----------|-------------|
+| `workspace_root` | Full workspace path to the repo (e.g. `/Workspace/Repos/my-org/sql_server_permissions`) |
+| `catalog` | Unity Catalog name for DLT pipelines |
+| `manifest_file` | Manifest filename (default: `incremental_output.yaml`) |
+
+You can set `workspace_root` per target or via CLI (see Step 4).
+
+### Step 4 — Validate and deploy
+
+From inside the `dab/` directory:
+
+```bash
+cd dab
+
+# Validate the bundle
+databricks bundle validate -t dev
+
+# Deploy to dev
+databricks bundle deploy -t dev \
+  --var workspace_root=/Workspace/Repos/my-org/sql_server_permissions
+
+# Deploy to prod
+databricks bundle deploy -t prod \
+  --var workspace_root=/Workspace/Repos/my-org/sql_server_permissions
+```
+
+### End-to-end example
+
+Add a second SQL Server pipeline from scratch:
+
+```bash
+# 1. Create the config from the template
+cp example_pipelines/pipeline_1.yaml pipelines/finance_db.yaml
+# Edit pipelines/finance_db.yaml with your connection and table details
+
+# 2. Generate DAB resources
+python dab/generate_jobs.py
+# Output:
+#   Wrote dab/resources/pipelines/sdp_finance_db.yml
+#   Wrote dab/resources/jobs/job_finance_db.yml
+
+# 3. Deploy
+cd dab
+databricks bundle deploy -t dev \
+  --var workspace_root=/Workspace/Repos/my-org/sql_server_permissions
+```
 
 ---
 
-## Supported Features
+## Running Sync Locally
 
-### Sync Modes
+You can run the sync outside of Databricks for testing. Requires **Python 3.10+** (3.11 recommended).
+
+```bash
+# Install dependencies
+python3.11 -m pip install mssql-python pyarrow pyyaml
+
+# Run sync (set PYTHONPATH so the local azsql_ct package is found)
+PYTHONPATH=$(pwd) python3.11 scripts/sync.py pipelines/my_server.yaml
+```
+
+Or use the CLI entry point:
+
+```bash
+pip install -e .
+azsql-ct --config pipelines/my_server.yaml
+```
+
+---
+
+## Prerequisites — SQL Server
+
+Change tracking must be enabled at both the **database** and **table** level. Run these as a database admin:
+
+```sql
+-- 1. Enable change tracking on the database (once per database)
+ALTER DATABASE [my_database]
+SET CHANGE_TRACKING = ON
+(CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
+
+-- 2. Enable change tracking on each table
+ALTER TABLE dbo.orders ENABLE CHANGE_TRACKING;
+ALTER TABLE dbo.customers ENABLE CHANGE_TRACKING;
+
+-- 3. Grant permissions to the sync user
+GRANT VIEW CHANGE TRACKING ON SCHEMA::dbo TO [sync_user];
+```
+
+---
+
+## Sync Modes
 
 | Mode | Behaviour |
-|---|---|
+|------|-----------|
 | `full` | Reload the entire table every run |
 | `incremental` | Only fetch rows changed since the last watermark (requires a prior sync) |
 | `full_incremental` | Full load on first run, incremental on subsequent runs *(default)* |
 
 If a watermark is older than `CHANGE_TRACKING_MIN_VALID_VERSION()`, the engine automatically falls back to a full sync.
 
-### Output Formats
+## Output Formats
 
 | Format | Description |
-|---|---|
-| `per_table` *(default)* | One Parquet file per table with original columns plus change-tracking metadata (`SYS_CHANGE_VERSION`, `SYS_CHANGE_CREATION_VERSION`, `SYS_CHANGE_OPERATION`) |
-| `unified` | Lakeflow-Connect-style bronze envelope: `data` (JSON), `table_id` (struct), `cursor` (struct), `extractionTimestamp`, `operation`, `schemaVersion` |
+|--------|-------------|
+| `per_table` *(default)* | One Parquet file per table with original columns plus CT metadata |
+| `unified` | Lakeflow-Connect-style bronze envelope: `data` (JSON), `table_id`, `cursor`, `extractionTimestamp`, `operation`, `schemaVersion` |
 
-### SCD Types
+## SCD Types
 
 | Type | Behaviour |
-|---|---|
+|------|-----------|
 | SCD Type 1 *(default)* | Overwrite — latest value wins |
 | SCD Type 2 | Historical tracking — preserves prior versions of a row |
 
-### Configuration
-
-- **YAML** (recommended) and **JSON** config files.
-- Environment-variable expansion (`${VAR}` syntax) and `.env` file support.
-- Credential resolution order: explicit arguments → `${VAR}` expansion → environment variables → defaults.
-- Legacy flat-format configs are still supported for backward compatibility.
-
-### Other
-
-- Snapshot isolation for point-in-time consistent reads.
-- File-based advisory locking prevents concurrent syncs of the same table.
-- Streaming row groups via `pyarrow.parquet.ParquetWriter` keep peak memory proportional to `row_group_size` (default 500 K rows), not total table size.
-- Per-table sync history log (`sync_history.jsonl`).
-
 ---
 
-## What Is **Not** Supported
+## Project Structure
 
-| Limitation | Detail |
-|---|---|
-| **Change Data Capture (CDC)** | Only SQL Server Change Tracking is supported — not CDC, temporal tables, or transaction-log reading. |
-| **Primary-key requirement** | Incremental sync requires a primary key on each table (used for the `CHANGETABLE` join). |
-| **Strict incremental without prior state** | `incremental` mode raises an error if no watermark exists; use `full_incremental` for the first run. |
-| **Column renames** | Column names are append-only — renamed columns appear as a new column + the old column filled with nulls. No rename tracking. |
-| **Retry / back-off** | No automatic retry on transient failures; the caller is responsible for re-running. |
-| **Streaming** | Processes result sets in batches, not a continuous streaming solution. |
-| **Windows file locking** | File-based locking uses POSIX `fcntl.flock`; behaviour on Windows is untested. |
-| **Parquet compression** | Configurable via `storage.parquet_compression` (default: `zstd`). Supports `none`, `snappy`, `gzip`, `brotli`, `lz4`, `zstd`. |
-| **Monitoring / alerting** | No built-in metrics, dashboards, or alerting. |
-| **Output formats other than Parquet** | The writer interface is pluggable (`OutputWriter` protocol), but only Parquet implementations ship today. |
-
----
-
-## Installation
-
-```bash
-pip install -e .
-
-# For YAML config support (recommended):
-pip install -e ".[yaml]"
-
-# For development / tests:
-pip install -e ".[dev]"
 ```
-
-> **Python 3.10+** is required (`mssql-python` has no wheel for earlier versions). Python 3.11 is recommended.
-
-### Core Dependencies
-
-| Package | Purpose |
-|---|---|
-| `mssql-python` | Azure SQL / SQL Server connectivity (bundles TDS — no ODBC driver needed) |
-| `pyarrow` | Parquet file writing |
-| `pyyaml` *(optional)* | YAML config parsing |
-| `orjson` *(optional)* | Faster JSON serialization for unified output format; falls back to stdlib if absent |
-
----
-
-## Configuration
-
-### 1. Set up credentials
-
-Copy `.env.example` to `.env` and fill in your connection details:
-
-```bash
-cp .env.example .env
+example_pipelines/      Template YAML configs (safe to commit)
+pipelines/              Your pipeline configs (gitignored)
+azsql_ct/               Core sync package
+scripts/                Runnable utilities (sync.py, connect.py, parse_output.py)
+lakeflow_pipeline/      Databricks DLT ingestion code
+dab/                    Databricks Asset Bundle
+  databricks.yml          Bundle definition, targets, variables
+  generate_jobs.py        Generator: pipelines/ → DAB resources
+  resources/
+    pipelines/            Generated DLT pipeline resources
+    jobs/                 Generated job resources
+tests/                  Unit and integration tests
 ```
-
-### 2. Create a pipeline config
-
-See `example_pipelines/pipeline_1.yaml` for a full example. The minimal structure is:
-
-```yaml
-connection:
-  server: <your-server>.database.windows.net
-  sql_login: <login>
-  password: ${ADMIN_PASSWORD}        # resolved from environment
-
-storage:
-  ingest_pipeline: ./my_pipeline     # data, watermarks, and manifest go here
-  # output_format: per_table         # (default) or "unified"
-  # parquet_compression: zstd        # (default) or snappy, gzip, brotli, lz4, none
-  # parquet_compression_level: 3     # optional; ZSTD 1-22, higher = smaller files
-  # row_group_size: 500000           # (default) rows per Parquet row group; smaller = less memory
-
-parallelism: 4                       # tables synced in parallel
-
-databases:
-  <database_name>:
-    uc_catalog: <catalog>            # informational Unity Catalog mapping (not used by sync)
-    schemas:
-      dbo:
-        uc_schema: <schema>          # informational Unity Catalog mapping (not used by sync)
-        tables:
-          orders:
-            mode: full_incremental
-            scd_type: 1
-            soft_delete: true
-          audit_log: incremental     # short-hand when no extra options needed
-```
-
-The `uc_catalog` and `uc_schema` fields are metadata for downstream Databricks Unity Catalog mapping — they are **not** consumed by the sync engine.
-
----
-
-## Quick Start
-
-### CLI
-
-```bash
-# Sync using a YAML config:
-azsql-ct --config example_pipelines/pipeline_1.yaml
-
-# Override workers and enable verbose logging:
-azsql-ct --config example_pipelines/pipeline_1.yaml --workers 8 -v
-
-# JSON config works too:
-azsql-ct --config sync_config.json
-```
-
-### Python SDK
-
-```python
-from azsql_ct import ChangeTracker
-
-# Load from a config file (YAML or JSON):
-ct = ChangeTracker.from_config("example_pipelines/pipeline_1.yaml")
-results = ct.sync()
-
-# Or configure programmatically:
-ct = ChangeTracker("<server>", "<login>", "<password>")
-ct.tables = {
-    "my_database": {
-        "dbo": {
-            "orders": "full_incremental",
-            "customers": "full",
-        }
-    }
-}
-results = ct.sync()
-```
-
-### Databricks task values
-
-When the sync is run as a Databricks job task and `set_databricks_task_values(results)` is called (as in `scripts/sync.py` or `python -m azsql_ct`), two task values are set for downstream tasks:
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `total_rows_changed` | int | Sum of `rows_written` across all non-error table results. |
-| `schema_changes_detected` | bool | `True` if any synced table had a schema change (columns added, removed, or type changed) compared to the previous run. |
-
-Reference them in the job as `{{tasks.<sync_task_name>.values.total_rows_changed}}` and `{{tasks.<sync_task_name>.values.schema_changes_detected}}`. For example, add a conditional notification task that runs only when `schema_changes_detected` is true.
 
 ---
 
@@ -210,113 +250,26 @@ Reference them in the job as `{{tasks.<sync_task_name>.values.total_rows_changed
 ```
 {ingest_pipeline}/
 ├── data/
-│   └── {database}/
-│       └── {schema}/
-│           └── {table}/
-│               └── {YYYY-MM-DD}/
-│                   └── {schema}_{table}_{timestamp}_part{N}.parquet
+│   └── {database}/{schema}/{table}/{YYYY-MM-DD}/
+│       └── {schema}_{table}_{timestamp}_part{N}.parquet
 ├── watermarks/
-│   └── {database}/
-│       └── {schema}/
-│           └── {table}/
-│               ├── watermarks.json
-│               ├── sync_history.jsonl
-│               └── schema.json
-└── output.yaml          # output manifest
+│   └── {database}/{schema}/{table}/
+│       ├── watermarks.json
+│       ├── sync_history.jsonl
+│       └── schema.json
+└── output.yaml          # output manifest for downstream DLT
 ```
 
 ---
 
-## Schema Evolution
+## Troubleshooting
 
-Each table's watermark directory contains a `schema.json` file that tracks the cumulative column set across syncs. The sync engine detects and logs schema changes at `WARNING` level.
-
-### Column Changes
-
-| Change | Behaviour |
-|---|---|
-| **Column added** | Appended to `schema.json`; downstream sees nulls for historical rows |
-| **Column removed** | Retained in `schema.json` (never deleted); new rows have nulls for the removed column |
-| **Column renamed** | Treated as a removal + addition — old name stays, new name appended |
-
-### Type Changes
-
-When a column's SQL Server type changes (e.g. `int` → `bigint`), the sync engine:
-
-1. Updates the `type` in `schema.json` to the new value.
-2. Records the old type as `previous_type` for auditability.
-3. Clears stale `precision`/`scale` and re-applies from the source if applicable.
-4. Logs a warning: `Column 'id' type changed: int -> bigint`.
-
-Precision and scale changes within the same type (e.g. `decimal(10,2)` → `decimal(19,4)`) are also detected and updated.
-
-### Column Activity Tracking
-
-Each column in `schema.json` carries a `last_seen` timestamp updated on every sync that includes it. Columns no longer in the source retain their previous `last_seen`, making it easy to identify stale/removed columns:
-
-```json
-{
-  "schema_version": 200,
-  "columns": [
-    {"name": "id", "type": "bigint", "previous_type": "int", "last_seen": "2026-03-01T12:00:00Z"},
-    {"name": "status", "type": "nvarchar", "last_seen": "2026-02-28T12:00:00Z"}
-  ],
-  "updated_at": "2026-03-01T12:00:00Z"
-}
-```
-
-Here `status` has a stale `last_seen` — it was dropped from the source after the Feb 28 sync.
-
-### Schema Version
-
-A deterministic `schemaVersion` hash (based on column names and types) is computed on each sync and embedded in every row of the unified bronze output. This allows downstream consumers to identify which schema version produced each row.
-
-### Downstream Integration
-
-For Databricks pipelines consuming the unified bronze output, see `lakeflow_pipeline/README.md` for details on how schema evolution interacts with `from_json` parsing and Delta type widening.
-
----
-
-## Change Tracking Permissions
-
-If change tracking is enabled on tables in your database, the read-only user needs this one-time grant from an admin:
-
-```sql
-GRANT VIEW CHANGE TRACKING ON SCHEMA::dbo TO [<user>];
-```
-
----
-
-## Project Structure
-
-```
-azsql_ct/               Core package
-  client.py               ChangeTracker facade + from_config()
-  connection.py           AzureSQLConnection wrapper
-  queries.py              SQL query builders
-  sync.py                 Sync engine (full / incremental)
-  watermark.py            JSON watermark store
-  writer.py               Pluggable Parquet output writers
-  schema.py               Schema evolution: type change detection, column activity tracking
-  output_manifest.py      YAML output manifest management
-  _constants.py           Shared constants and defaults
-  __main__.py             CLI entry point
-scripts/                Runnable utility scripts
-example_pipelines/      Sample YAML pipeline configs
-tests/                  Unit and integration tests
-```
-
----
-
-## Testing
-
-```bash
-# Unit tests (no database required):
-pytest
-
-# Integration tests (requires a live Azure SQL database):
-pytest -m integration -v
-```
+| Error | Fix |
+|-------|-----|
+| `ModuleNotFoundError: No module named 'mssql_python'` | Install with Python 3.10+: `python3.11 -m pip install mssql-python` |
+| `ChangeTracker has no attribute 'from_config'` | Run with `PYTHONPATH` set to project root |
+| `FileNotFoundError: pipelines/pipeline_1.yaml` | Create config from template or pass explicit path |
+| `Table is not change-tracked` | Enable change tracking at both database and table level (see Prerequisites above) |
 
 ---
 

@@ -3,7 +3,11 @@
 resources:
   jobs:
     sql_server_ct_pipeline_1:
-      name: SQL Server CT – pipeline_1
+      name: SQL Server CT – Job – pipeline_1
+      tags:
+        project: sql-server-ct
+        pipeline_config: pipeline_1.yaml
+        generated_by: dab/generate_jobs.py
       tasks:
       - task_key: gateway
         spark_python_task:

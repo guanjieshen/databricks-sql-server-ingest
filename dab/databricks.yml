@@ -4,7 +4,7 @@ bundle:
 variables:
   workspace_root:
     description: Workspace path where the full repo lives (e.g. /Workspace/Repos/<folder>/<repo>). Jobs and pipelines use this to resolve scripts, configs, and pipeline code outside the bundle root.
-    default: ""
+    default: /Workspace/Users/guanjie.shen@databricks.com/databricks-sql-server-ingest
   catalog:
     description: Unity Catalog name for DLT pipelines.
     default: guanjiemar1

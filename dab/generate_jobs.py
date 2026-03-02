@@ -77,14 +77,19 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
         "resources": {
             "pipelines": {
                 pk: {
-                    "name": f"lakeflow_pipeline – {base_name}",
+                    "name": f"SQL Server CT – SDP – {base_name}",
+                    "tags": {
+                        "project": "sql-server-ct",
+                        "pipeline_config": config_filename,
+                        "generated_by": "dab/generate_jobs.py",
+                    },
                     "configuration": {
                         "input_yaml": f"{ws}/pipelines/{config_filename}",
                         "manifest_file": "${var.manifest_file}",
                     },
                     "libraries": [
-                        {"glob": {"include": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
-                        {"glob": {"include": f"{ws}/lakeflow_pipeline/metadata_helper.py"}},
+                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
+                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/metadata_helper.py"}},
                     ],
                     "schema": "default",
                     "photon": True,
@@ -107,7 +112,12 @@ def _job_resource(base_name: str, config_filename: str) -> dict:
         "resources": {
             "jobs": {
                 jk: {
-                    "name": f"SQL Server CT – {base_name}",
+                    "name": f"SQL Server CT – Job – {base_name}",
+                    "tags": {
+                        "project": "sql-server-ct",
+                        "pipeline_config": config_filename,
+                        "generated_by": "dab/generate_jobs.py",
+                    },
                     "tasks": [
                         {
                             "task_key": "gateway",

@@ -128,11 +128,18 @@ class TestPipelineResource:
     def test_structure(self):
         data = _pipeline_resource("p1", "p1.yaml")
         pl = data["resources"]["pipelines"]["sdp_p1"]
-        assert pl["name"] == "lakeflow_pipeline – p1"
+        assert pl["name"] == "SQL Server CT – SDP – p1"
         assert pl["catalog"] == "${var.catalog}"
         assert pl["serverless"] is True
         assert pl["photon"] is True
         assert pl["schema"] == "default"
+
+    def test_tags(self):
+        data = _pipeline_resource("p1", "p1.yaml")
+        tags = data["resources"]["pipelines"]["sdp_p1"]["tags"]
+        assert tags["project"] == "sql-server-ct"
+        assert tags["pipeline_config"] == "p1.yaml"
+        assert tags["generated_by"] == "dab/generate_jobs.py"
 
     def test_workspace_root_path_used(self):
         data = _pipeline_resource("p1", "p1.yaml")
@@ -148,7 +155,7 @@ class TestPipelineResource:
     def test_libraries_point_to_lakeflow_pipeline(self):
         data = _pipeline_resource("p1", "p1.yaml")
         libs = data["resources"]["pipelines"]["sdp_p1"]["libraries"]
-        paths = [lib["glob"]["include"] for lib in libs]
+        paths = [lib["notebook"]["path"] for lib in libs]
         assert any("ingestion_pipeline_materialized.py" in p for p in paths)
         assert any("metadata_helper.py" in p for p in paths)
 
@@ -157,9 +164,16 @@ class TestJobResource:
     def test_structure(self):
         data = _job_resource("p1", "p1.yaml")
         job = data["resources"]["jobs"]["sql_server_ct_p1"]
-        assert job["name"] == "SQL Server CT – p1"
+        assert job["name"] == "SQL Server CT – Job – p1"
         assert job["queue"]["enabled"] is True
         assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
+
+    def test_tags(self):
+        data = _job_resource("p1", "p1.yaml")
+        tags = data["resources"]["jobs"]["sql_server_ct_p1"]["tags"]
+        assert tags["project"] == "sql-server-ct"
+        assert tags["pipeline_config"] == "p1.yaml"
+        assert tags["generated_by"] == "dab/generate_jobs.py"
 
     def test_task_keys(self):
         data = _job_resource("p1", "p1.yaml")
