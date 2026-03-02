@@ -161,10 +161,8 @@ def save(
 
     hp = _history_path(output_dir)
     line = json.dumps(entry).encode("utf-8") + b"\n"
-    with open(hp, "ab") as f:
-        f.write(line)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
+    existing = b""
+    if os.path.isfile(hp):
+        with open(hp, "rb") as f:
+            existing = f.read()
+    _atomic_write(hp, existing + line)
