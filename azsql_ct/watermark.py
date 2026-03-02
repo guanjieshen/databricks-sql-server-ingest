@@ -161,9 +161,10 @@ def save(
 
     hp = _history_path(output_dir)
     line = json.dumps(entry).encode("utf-8") + b"\n"
-    fd = os.open(hp, os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-    try:
-        os.write(fd, line)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    with open(hp, "ab") as f:
+        f.write(line)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
