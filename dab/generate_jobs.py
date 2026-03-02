@@ -88,8 +88,8 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                         "manifest_file": "${var.manifest_file}",
                     },
                     "libraries": [
-                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized"}},
-                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/metadata_helper"}},
+                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
+                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/metadata_helper.py"}},
                     ],
                     "schema": "default",
                     "photon": True,
