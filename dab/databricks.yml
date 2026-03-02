@@ -1,0 +1,24 @@
+# Databricks Asset Bundle root for SQL Server CT (1:1 pipeline config to job).
+# Deploy from repo root: databricks bundle deploy -t dev
+# Or from this directory: databricks bundle deploy -t dev (with bundle root = dab)
+
+bundle:
+  name: sql-server-ct
+
+variables:
+  workspace_root:
+    description: Workspace path where the repo lives (e.g. Repos path or bundle sync destination). Used by jobs and pipeline for scripts and config paths.
+    default: ""
+
+targets:
+  dev:
+    mode: development
+    variables:
+      workspace_root: ""  # Override per target, or use --var workspace_root=/Workspace/Repos/... when deploying
+  prod:
+    mode: production
+    variables:
+      workspace_root: ""
+
+include:
+  - resources/*.yml
