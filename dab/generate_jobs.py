@@ -17,9 +17,21 @@ import sys
 from pathlib import Path
 
 
-def _repo_root(script_path: Path) -> Path:
-    """Infer repo root as parent of the directory containing this script (dab/)."""
-    return script_path.resolve().parent.parent
+def _repo_root(start: Path | None = None) -> Path:
+    """Infer repo root.
+
+    When *start* is a file path (e.g. ``__file__`` inside ``dab/``), the repo
+    root is its grandparent.  When running inside a Databricks notebook where
+    ``__file__`` is unavailable, walk up from *cwd* looking for the ``dab/``
+    directory as a landmark.
+    """
+    if start is not None:
+        return start.resolve().parent.parent
+    cwd = Path.cwd().resolve()
+    for parent in (cwd, *cwd.parents):
+        if (parent / "dab").is_dir():
+            return parent
+    return cwd
 
 
 def _discover_pipeline_configs(pipelines_dir: Path) -> list[tuple[str, str]]:
@@ -189,7 +201,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate DAB pipeline + job resources from pipelines/ (1:1)."
     )
-    repo = _repo_root(Path(__file__))
+    try:
+        repo = _repo_root(Path(__file__))
+    except NameError:
+        repo = _repo_root()
     parser.add_argument(
         "--pipelines-dir",
         type=Path,
