@@ -201,9 +201,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate DAB pipeline + job resources from pipelines/ (1:1)."
     )
+    _in_notebook = False
     try:
         repo = _repo_root(Path(__file__))
     except NameError:
+        _in_notebook = True
         repo = _repo_root()
     parser.add_argument(
         "--pipelines-dir",
@@ -227,7 +229,7 @@ def main() -> int:
         action="store_true",
         help="Print what would be written/removed without making changes",
     )
-    args = parser.parse_args()
+    args = parser.parse_args([] if _in_notebook else None)
 
     pipelines_dir = args.pipelines_dir.resolve()
     resources_dir = args.resources_dir.resolve()
