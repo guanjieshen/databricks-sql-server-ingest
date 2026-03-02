@@ -640,8 +640,8 @@ class ChangeTracker:
                         )
                     )
                 except Exception as exc:
-                    logger.error(
-                        "Failed to sync %s.%s: %s", database, full_table_name, exc,
+                    logger.exception(
+                        "Failed to sync %s.%s", database, full_table_name,
                     )
                     results.append(self._error_result(database, full_table_name, exc, mode))
         finally:
@@ -687,7 +687,7 @@ class ChangeTracker:
             pool.release(database, az)
             return result
         except Exception as exc:
-            logger.error("Failed to sync %s.%s: %s", database, full_table_name, exc)
+            logger.exception("Failed to sync %s.%s", database, full_table_name)
             az.close()
             return self._error_result(database, full_table_name, exc, mode)
 

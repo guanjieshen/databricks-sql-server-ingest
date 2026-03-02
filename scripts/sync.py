@@ -24,7 +24,13 @@ if __name__ == "__main__":
         default="pipelines/pipeline_1.yaml",
         help="Path to YAML config file (default: pipelines/pipeline_1.yaml)",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging for troubleshooting",
+    )
     args = parser.parse_args()
+    if args.debug:
+        logging.getLogger("azsql_ct").setLevel(logging.DEBUG)
 
     ct = ChangeTracker.from_config(args.config)
     print(ct)

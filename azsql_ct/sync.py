@@ -76,8 +76,12 @@ def _iter_cursor(
 ) -> Generator[Tuple, None, None]:
     """Yield rows from *cursor* in batches of *batch_size* without
     materialising the entire result set in memory."""
+    batch_num = 0
     while True:
+        batch_num += 1
+        logger.debug("fetchmany batch %d (size=%d)", batch_num, batch_size)
         batch = cursor.fetchmany(batch_size)
+        logger.debug("fetchmany batch %d returned %d rows", batch_num, len(batch))
         if not batch:
             break
         yield from batch
@@ -257,7 +261,9 @@ def _sync_table_locked(
 
     do_full = mode == "full" or (mode == "full_incremental" and is_initial)
 
+    logger.debug("[%s.%s] Creating fresh data cursor", database, full_name)
     data_cur = conn.cursor()
+    logger.debug("[%s.%s] Data cursor created", database, full_name)
 
     if snapshot_isolation:
         data_cur.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
@@ -265,7 +271,9 @@ def _sync_table_locked(
     if do_full:
         logger.info("Full sync for %s.%s (version %d)", database, full_name, cur_ver)
         sql = queries.build_full_query(full_name)
+        logger.debug("[%s.%s] Executing full query", database, full_name)
         data_cur.execute(sql)
+        logger.debug("[%s.%s] Full query executed", database, full_name)
         actual_mode = "full"
     else:
         if not pk_cols:
@@ -279,7 +287,10 @@ def _sync_table_locked(
             "Incremental sync for %s.%s (since version %d)",
             database, full_name, since,
         )
+        logger.debug("[%s.%s] Executing incremental query", database, full_name)
         data_cur.execute(sql, (since,))
+        logger.debug("[%s.%s] Incremental query executed, description=%s",
+                      database, full_name, data_cur.description is not None)
         actual_mode = "incremental"
 
     day_dir = os.path.join(data_dir, date.today().isoformat())
@@ -305,10 +316,13 @@ def _sync_table_locked(
         "schema_version": schema_ver,
     }
 
+    logger.debug("[%s.%s] Starting writer.write", database, full_name)
     output_files, row_count = writer.write(
         row_iter, description, day_dir, safe_name,
         table_metadata=table_metadata,
     )
+    logger.debug("[%s.%s] writer.write completed: %d rows, %d files",
+                  database, full_name, row_count, len(output_files))
 
     if do_full:
         _clear_data_files(data_dir, keep=set(output_files))
@@ -316,6 +330,7 @@ def _sync_table_locked(
     elapsed = time.monotonic() - t0
     since_ver = since if actual_mode == "incremental" else None
 
+    logger.debug("[%s.%s] Saving watermark", database, full_name)
     watermark.save(
         wm_dir,
         full_name,
@@ -326,6 +341,7 @@ def _sync_table_locked(
         files=output_files,
         duration_seconds=elapsed,
     )
+    logger.debug("[%s.%s] Watermark saved", database, full_name)
 
     result = {
         "database": database,
@@ -345,6 +361,7 @@ def _sync_table_locked(
     }
 
     try:
+        logger.debug("[%s.%s] Creating metadata cursor", database, full_name)
         try:
             meta_cur = conn.cursor()
             columns = queries.column_metadata(meta_cur, full_name)
