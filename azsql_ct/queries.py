@@ -197,6 +197,50 @@ def column_metadata(cursor: Any, full_table_name: str) -> List[Dict[str, Any]]:
     return columns
 
 
+def fetch_all_ct_metadata(cursor: Any) -> Dict[str, Any]:
+    """Fetch DB version, tracked table names, and min valid versions in one query.
+
+    Returns ``{"db_version": int, "tables": {full_name: min_version, ...}}``.
+    Replaces separate calls to :func:`list_tracked_tables`,
+    :func:`current_version`, and :func:`min_valid_versions_batch`.
+    """
+    cursor.execute(
+        "SELECT CHANGE_TRACKING_CURRENT_VERSION() AS db_version, "
+        "OBJECT_SCHEMA_NAME(t.object_id) + '.' + OBJECT_NAME(t.object_id) AS table_name, "
+        "CHANGE_TRACKING_MIN_VALID_VERSION(t.object_id) AS min_version "
+        "FROM sys.change_tracking_tables t "
+        "ORDER BY table_name"
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return {"db_version": 0, "tables": {}}
+    return {"db_version": rows[0][0], "tables": {r[1]: r[2] for r in rows}}
+
+
+def fetch_all_primary_keys(cursor: Any) -> Dict[str, List[str]]:
+    """Fetch primary-key columns for every table in one query.
+
+    Returns ``{full_name: [col1, col2, ...], ...}``.
+    Replaces per-table calls to :func:`primary_key_columns`.
+    """
+    cursor.execute(
+        "SELECT "
+        "OBJECT_SCHEMA_NAME(i.object_id) + '.' + OBJECT_NAME(i.object_id) AS table_name, "
+        "c.name AS pk_col "
+        "FROM sys.indexes i "
+        "JOIN sys.index_columns ic "
+        "  ON i.object_id = ic.object_id AND i.index_id = ic.index_id "
+        "JOIN sys.columns c "
+        "  ON ic.object_id = c.object_id AND ic.column_id = c.column_id "
+        "WHERE i.is_primary_key = 1 "
+        "ORDER BY table_name, ic.key_ordinal"
+    )
+    pk_map: Dict[str, List[str]] = {}
+    for row in cursor.fetchall():
+        pk_map.setdefault(row[0], []).append(row[1])
+    return pk_map
+
+
 def min_valid_versions_batch(cursor: Any, table_names: List[str]) -> Dict[str, int]:
     """Return min valid version for each table in one query. Uses 0 for missing/NULL."""
     if not table_names:

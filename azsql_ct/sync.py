@@ -23,7 +23,7 @@ import logging
 import os
 import time
 from datetime import date
-from typing import Any, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from . import queries, schema, watermark
 from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES
@@ -155,6 +155,10 @@ def sync_table(
     scd_type: int = DEFAULT_SCD_TYPE,
     uc_catalog: Optional[str] = None,
     soft_delete: bool = False,
+    tracked_lookup: Optional[Dict[str, str]] = None,
+    db_version: Optional[int] = None,
+    min_ver: Optional[int] = None,
+    pk_cols: Optional[List[str]] = None,
 ) -> dict:
     """Sync one change-tracked table.
 
@@ -181,6 +185,19 @@ def sync_table(
         soft_delete:        If ``True``, deletes are tracked via an
                             ``_is_deleted`` flag rather than physical removal.
                             Passed through to the result dict and output manifest.
+        tracked_lookup:     Pre-fetched ``{lowercase: original}`` tracked-table
+                            lookup from :func:`queries.fetch_all_ct_metadata`.
+                            When provided, skips the per-table
+                            ``list_tracked_tables`` query.
+        db_version:         Pre-fetched CT version from
+                            :func:`queries.fetch_all_ct_metadata`.
+                            Skips the per-table ``current_version`` query.
+        min_ver:            Pre-fetched minimum valid version for this table.
+                            Skips the per-table ``min_valid_version_for_table``
+                            query.
+        pk_cols:            Pre-fetched primary-key column list from
+                            :func:`queries.fetch_all_primary_keys`.
+                            Skips the per-table ``primary_key_columns`` query.
 
     Returns:
         Summary dict.
@@ -194,13 +211,14 @@ def sync_table(
         writer = _DEFAULT_WRITER
 
     cur = conn.cursor()
-    tracked = queries.list_tracked_tables(cur)
-    tracked_lookup = queries.build_tracked_lookup(tracked)
+    if tracked_lookup is None:
+        tracked = queries.list_tracked_tables(cur)
+        tracked_lookup = queries.build_tracked_lookup(tracked)
     full_name = queries.resolve_table(table_name, tracked_lookup)
     if full_name is None:
         raise ValueError(
             f"Table '{table_name}' is not change-tracked in {database}. "
-            f"Tracked tables: {tracked}"
+            f"Tracked tables: {list(tracked_lookup.values())}"
         )
 
     data_dir = _sub_dir(output_dir, database, full_name)
@@ -214,6 +232,9 @@ def sync_table(
             scd_type=scd_type,
             uc_catalog=uc_catalog,
             soft_delete=soft_delete,
+            db_version=db_version,
+            min_ver=min_ver,
+            pk_cols=pk_cols,
         )
 
 
@@ -232,10 +253,13 @@ def _sync_table_locked(
     scd_type: int = DEFAULT_SCD_TYPE,
     uc_catalog: Optional[str] = None,
     soft_delete: bool = False,
+    db_version: Optional[int] = None,
+    min_ver: Optional[int] = None,
+    pk_cols: Optional[List[str]] = None,
 ) -> dict:
     """Inner sync logic, called while holding the per-table lock."""
-    cur_ver = queries.current_version(cur)
-    min_ver = queries.min_valid_version_for_table(cur, full_name)
+    cur_ver = db_version if db_version is not None else queries.current_version(cur)
+    min_ver_val = min_ver if min_ver is not None else queries.min_valid_version_for_table(cur, full_name)
     since = watermark.get(wm_dir, full_name)
 
     is_initial = since is None
@@ -247,17 +271,18 @@ def _sync_table_locked(
             f"followed by incremental syncs."
         )
 
-    if mode in ("incremental", "full_incremental") and not is_initial and since < min_ver:
+    if mode in ("incremental", "full_incremental") and not is_initial and since < min_ver_val:
         logger.warning(
             "Watermark (%d) for %s.%s is older than min valid version (%d); "
             "falling back to full sync.",
-            since, database, full_name, min_ver,
+            since, database, full_name, min_ver_val,
         )
         mode = "full"  # internal-only; not a user-facing mode
 
     t0 = time.monotonic()
 
-    pk_cols = queries.primary_key_columns(cur, full_name)
+    if pk_cols is None:
+        pk_cols = queries.primary_key_columns(cur, full_name)
 
     do_full = mode == "full" or (mode == "full_incremental" and is_initial)
 

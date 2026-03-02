@@ -196,18 +196,47 @@ def _load_watermarks_for_tables(
     return result
 
 
+def _fetch_db_metadata(conn: Any) -> Dict[str, Any]:
+    """Fetch all CT metadata and primary keys for a database in two queries.
+
+    Returns a dict with ``db_version``, ``tables`` (name -> min_version),
+    ``tracked_lookup`` (lowercase -> original), and ``pk_map`` (name -> [cols]).
+    """
+    cur = conn.cursor()
+    ct_meta = queries.fetch_all_ct_metadata(cur)
+    pk_map = queries.fetch_all_primary_keys(cur)
+    tracked_lookup = queries.build_tracked_lookup(list(ct_meta["tables"].keys()))
+    return {
+        "db_version": ct_meta["db_version"],
+        "tables": ct_meta["tables"],
+        "tracked_lookup": tracked_lookup,
+        "pk_map": pk_map,
+    }
+
+
 def _compute_tables_to_skip(
     database: str,
     conn: Any,
     flat_entries: List[FlatEntry],
     watermark_dir: str,
     mode_override: Optional[str],
+    db_metadata: Optional[Dict[str, Any]] = None,
 ) -> Set[str]:
-    """Return set of full_table_name (config names) to skip (incremental tables with no changes)."""
+    """Return set of full_table_name (config names) to skip (incremental tables with no changes).
+
+    When *db_metadata* is provided (from :func:`_fetch_db_metadata`), reuses
+    the pre-fetched tracked-table list and min valid versions instead of
+    querying them again.
+    """
     try:
-        cur = conn.cursor()
-        tracked = queries.list_tracked_tables(cur)
-        tracked_lookup = queries.build_tracked_lookup(tracked)
+        if db_metadata is not None:
+            tracked_lookup = db_metadata["tracked_lookup"]
+            ct_tables = db_metadata["tables"]
+        else:
+            cur = conn.cursor()
+            ct_meta = queries.fetch_all_ct_metadata(cur)
+            tracked_lookup = queries.build_tracked_lookup(list(ct_meta["tables"].keys()))
+            ct_tables = ct_meta["tables"]
 
         resolved_to_config: Dict[str, str] = {}
         for _db, full_table_name, table_mode, _scd, _soft in flat_entries:
@@ -231,18 +260,17 @@ def _compute_tables_to_skip(
         if not resolved_with_wm:
             return set()
 
-        min_vers = queries.min_valid_versions_batch(cur, resolved_with_wm)
-
         table_watermarks: Dict[str, int] = {}
         for resolved in resolved_with_wm:
             since = watermarks[resolved]
-            min_ver = min_vers.get(resolved, 0)
+            min_ver = ct_tables.get(resolved, 0)
             if since >= min_ver:
                 table_watermarks[resolved] = since
 
         if not table_watermarks:
             return set()
 
+        cur = conn.cursor()
         changed = queries.fetch_tables_with_changes(cur, table_watermarks)
         to_skip_resolved = {t for t in table_watermarks if t not in changed}
         return {resolved_to_config[r] for r in to_skip_resolved}
@@ -587,6 +615,7 @@ class ChangeTracker:
     def _run_sync_sequential(self, mode_override: Optional[str]) -> List[dict]:
         conns: Dict[str, Any] = {}
         skip_cache: Dict[str, Set[str]] = {}
+        metadata_cache: Dict[str, Dict[str, Any]] = {}
         results: List[dict] = []
 
         try:
@@ -604,16 +633,27 @@ class ChangeTracker:
                         )
                         results.append(self._error_result(database, full_table_name, exc))
                         continue
+                    try:
+                        metadata_cache[database] = _fetch_db_metadata(conns[database])
+                    except Exception as exc:
+                        logger.warning(
+                            "Batch metadata fetch failed for %s, "
+                            "falling back to per-table queries: %s",
+                            database, exc,
+                        )
+                        metadata_cache[database] = {}
                     db_entries = [
                         e for e in self._flat_tables
                         if e[0] == database
                     ]
+                    db_meta = metadata_cache.get(database) or None
                     skip_cache[database] = _compute_tables_to_skip(
                         database,
                         conns[database],
                         db_entries,
                         self.watermark_dir,
                         mode_override,
+                        db_metadata=db_meta,
                     )
 
                 mode = mode_override or table_mode or "full_incremental"
@@ -622,6 +662,12 @@ class ChangeTracker:
                     continue
 
                 uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
+                db_meta = metadata_cache.get(database, {})
+                tracked_lookup = db_meta.get("tracked_lookup")
+                resolved_name = (
+                    queries.resolve_table(full_table_name, tracked_lookup)
+                    if tracked_lookup else None
+                )
                 try:
                     results.append(
                         sync_table(
@@ -637,6 +683,18 @@ class ChangeTracker:
                             scd_type=scd_type,
                             uc_catalog=uc_catalog,
                             soft_delete=soft_delete,
+                            tracked_lookup=tracked_lookup,
+                            db_version=db_meta.get("db_version"),
+                            min_ver=(
+                                db_meta["tables"].get(resolved_name, 0)
+                                if db_meta.get("tables") and resolved_name
+                                else None
+                            ),
+                            pk_cols=(
+                                db_meta["pk_map"].get(resolved_name)
+                                if db_meta.get("pk_map") and resolved_name
+                                else None
+                            ),
                         )
                     )
                 except Exception as exc:
@@ -660,6 +718,7 @@ class ChangeTracker:
         mode: str,
         scd_type: int,
         soft_delete: bool = False,
+        db_metadata: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Sync a single table using a connection from *pool*. Thread-safe."""
         try:
@@ -669,6 +728,12 @@ class ChangeTracker:
             return self._error_result(database, full_table_name, exc)
 
         uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
+        db_meta = db_metadata or {}
+        tracked_lookup = db_meta.get("tracked_lookup")
+        resolved_name = (
+            queries.resolve_table(full_table_name, tracked_lookup)
+            if tracked_lookup else None
+        )
         try:
             result = sync_table(
                 conn,
@@ -683,6 +748,18 @@ class ChangeTracker:
                 scd_type=scd_type,
                 uc_catalog=uc_catalog,
                 soft_delete=soft_delete,
+                tracked_lookup=tracked_lookup,
+                db_version=db_meta.get("db_version"),
+                min_ver=(
+                    db_meta["tables"].get(resolved_name, 0)
+                    if db_meta.get("tables") and resolved_name
+                    else None
+                ),
+                pk_cols=(
+                    db_meta["pk_map"].get(resolved_name)
+                    if db_meta.get("pk_map") and resolved_name
+                    else None
+                ),
             )
             pool.release(database, az)
             return result
@@ -711,12 +788,27 @@ class ChangeTracker:
                 (database, full_table_name, table_mode, scd_type, soft_delete),
             )
 
+        metadata_cache: Dict[str, Dict[str, Any]] = {}
+        metadata_lock = threading.Lock()
+
         def _check_db(database: str, entries: List[FlatEntry]) -> Set[str]:
             try:
                 az, conn = conn_pool.acquire(database)
+                try:
+                    db_meta = _fetch_db_metadata(conn)
+                except Exception as exc:
+                    logger.warning(
+                        "Batch metadata fetch failed for %s, "
+                        "falling back to per-table queries: %s",
+                        database, exc,
+                    )
+                    db_meta = {}
+                with metadata_lock:
+                    metadata_cache[database] = db_meta
                 to_skip = _compute_tables_to_skip(
                     database, conn, entries,
                     self.watermark_dir, mode_override,
+                    db_metadata=db_meta or None,
                 )
                 conn_pool.release(database, az)
                 return to_skip
@@ -748,6 +840,7 @@ class ChangeTracker:
                 future_to_idx = {
                     executor.submit(
                         self._sync_one_table, conn_pool, db, tbl, mode, scd, sd,
+                        db_metadata=metadata_cache.get(db),
                     ): idx
                     for idx, db, tbl, mode, scd, sd in work_to_run
                 }

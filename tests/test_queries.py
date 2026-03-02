@@ -262,6 +262,58 @@ class TestFetchTablesWithChanges:
         assert result == set()
 
 
+class TestFetchAllCtMetadata:
+    def test_returns_db_version_and_tables(self, fake_cursor):
+        cur = fake_cursor(results=[[(42, "dbo.A", 10), (42, "dbo.B", 20)]])
+        result = queries.fetch_all_ct_metadata(cur)
+        assert result["db_version"] == 42
+        assert result["tables"] == {"dbo.A": 10, "dbo.B": 20}
+
+    def test_empty_database_returns_zero_version(self, fake_cursor):
+        cur = fake_cursor(results=[[]])
+        result = queries.fetch_all_ct_metadata(cur)
+        assert result == {"db_version": 0, "tables": {}}
+
+    def test_single_table(self, fake_cursor):
+        cur = fake_cursor(results=[[(100, "dbo.Orders", 5)]])
+        result = queries.fetch_all_ct_metadata(cur)
+        assert result["db_version"] == 100
+        assert result["tables"] == {"dbo.Orders": 5}
+
+    def test_db_version_taken_from_first_row(self, fake_cursor):
+        cur = fake_cursor(results=[[(99, "dbo.X", 1), (99, "dbo.Y", 2)]])
+        assert queries.fetch_all_ct_metadata(cur)["db_version"] == 99
+
+
+class TestFetchAllPrimaryKeys:
+    def test_returns_pk_map(self, fake_cursor):
+        cur = fake_cursor(results=[[("dbo.A", "id"), ("dbo.B", "pk")]])
+        result = queries.fetch_all_primary_keys(cur)
+        assert result == {"dbo.A": ["id"], "dbo.B": ["pk"]}
+
+    def test_composite_pk(self, fake_cursor):
+        cur = fake_cursor(results=[[
+            ("dbo.T", "tenant_id"),
+            ("dbo.T", "order_id"),
+        ]])
+        result = queries.fetch_all_primary_keys(cur)
+        assert result == {"dbo.T": ["tenant_id", "order_id"]}
+
+    def test_empty_result(self, fake_cursor):
+        cur = fake_cursor(results=[[]])
+        assert queries.fetch_all_primary_keys(cur) == {}
+
+    def test_multiple_tables_with_composite_keys(self, fake_cursor):
+        cur = fake_cursor(results=[[
+            ("dbo.A", "id"),
+            ("dbo.B", "k1"),
+            ("dbo.B", "k2"),
+            ("dbo.C", "pk"),
+        ]])
+        result = queries.fetch_all_primary_keys(cur)
+        assert result == {"dbo.A": ["id"], "dbo.B": ["k1", "k2"], "dbo.C": ["pk"]}
+
+
 class TestMinValidVersionsBatch:
     def test_returns_dict(self, fake_cursor):
         cur = fake_cursor(results=[[("dbo.T1", 10), ("dbo.T2", 20)]])

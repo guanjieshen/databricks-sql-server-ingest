@@ -429,6 +429,150 @@ class TestSyncTable:
             )
 
 
+class TestSyncTableWithPrefetchedMetadata:
+    """When pre-fetched metadata is provided, sync_table skips redundant queries."""
+
+    def _make_data_only_cursor(self, rows, desc, table_cols=None, pk_cols=None,
+                               column_metadata_rows=None):
+        """Build a cursor that only needs to handle the data query and
+        post-sync metadata -- no tracked-table/version/PK queries."""
+        cursor = MagicMock()
+        exec_count = {"n": 0}
+        call_count = {"n": 0}
+
+        needs_table_cols = pk_cols and table_cols is not None
+        table_cols_desc = [(c,) for c in table_cols] if table_cols else None
+
+        results_sequence = []
+        if column_metadata_rows is not None:
+            _cm_rows = column_metadata_rows
+        elif desc:
+            _cm_rows = [
+                (col[0], "nvarchar", None, None)
+                for col in desc if col[0] not in _CT_COLS
+            ]
+        else:
+            _cm_rows = []
+        results_sequence.append(_cm_rows)
+
+        def side_effect_execute(sql, params=None):
+            idx = exec_count["n"]
+            exec_count["n"] += 1
+            if needs_table_cols and idx == 0:
+                cursor.description = table_cols_desc
+                return
+            elif needs_table_cols and idx == 1:
+                cursor.description = desc
+                return
+            cursor.description = desc
+
+        cursor.execute = MagicMock(side_effect=side_effect_execute)
+
+        def side_effect_fetchall():
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx < len(results_sequence):
+                return results_sequence[idx]
+            return []
+
+        cursor.fetchall = MagicMock(side_effect=side_effect_fetchall)
+
+        _fetchmany_exhausted = {"done": False}
+
+        def side_effect_fetchmany(size=1):
+            if _fetchmany_exhausted["done"]:
+                return []
+            _fetchmany_exhausted["done"] = True
+            return rows
+
+        cursor.fetchmany = MagicMock(side_effect=side_effect_fetchmany)
+        cursor.description = desc
+
+        _fake_conn = MagicMock()
+        _fake_conn.cursor.return_value = cursor
+        cursor.connection = _fake_conn
+        return cursor, _fake_conn
+
+    def test_full_sync_with_prefetched_metadata(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+                ("SYS_CHANGE_OPERATION",), ("id",), ("name",)]
+        rows = [(100, None, "L", 1, "Alice")]
+        cursor, conn = self._make_data_only_cursor(rows, desc)
+
+        tracked_lookup = {"dbo.foo": "dbo.Foo"}
+        writer = StubWriter()
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=writer,
+            tracked_lookup=tracked_lookup,
+            db_version=100, min_ver=1, pk_cols=None,
+        )
+
+        assert result["mode"] == "full"
+        assert result["rows_written"] == 1
+        assert result["current_version"] == 100
+
+    def test_incremental_sync_with_prefetched_metadata(self, tmp_path):
+        wm_dir = tmp_path / "wm" / "db1" / "dbo" / "T"
+        wm_dir.mkdir(parents=True)
+        watermark.save(str(wm_dir), "dbo.T", 20)
+
+        desc = [("SYS_CHANGE_VERSION",), ("id",)]
+        rows = [(25, 1)]
+        cursor, conn = self._make_data_only_cursor(
+            rows, desc, table_cols=["id"], pk_cols=["id"],
+        )
+
+        tracked_lookup = {"dbo.t": "dbo.T"}
+        writer = StubWriter()
+        result = sync_table(
+            conn, "dbo.T", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="incremental", writer=writer,
+            tracked_lookup=tracked_lookup,
+            db_version=30, min_ver=10, pk_cols=["id"],
+        )
+
+        assert result["mode"] == "incremental"
+        assert result["since_version"] == 20
+        assert result["current_version"] == 30
+
+    def test_prefetched_db_version_used_as_watermark(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+                ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(200, None, "L", 1)]
+        cursor, conn = self._make_data_only_cursor(rows, desc)
+
+        tracked_lookup = {"dbo.t": "dbo.T"}
+        sync_table(
+            conn, "dbo.T", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=StubWriter(),
+            tracked_lookup=tracked_lookup,
+            db_version=200, min_ver=1, pk_cols=None,
+        )
+
+        wm_path = tmp_path / "wm" / "db1" / "dbo" / "T"
+        assert watermark.get(str(wm_path), "dbo.T") == 200
+
+    def test_untracked_table_raises_with_prefetched_lookup(self, tmp_path):
+        cursor, conn = self._make_data_only_cursor([], None)
+        tracked_lookup = {"dbo.other": "dbo.Other"}
+
+        with pytest.raises(ValueError, match="not change-tracked"):
+            sync_table(
+                conn, "dbo.Missing", database="db1",
+                output_dir=str(tmp_path / "data"),
+                watermark_dir=str(tmp_path / "wm"),
+                tracked_lookup=tracked_lookup,
+                db_version=1, min_ver=0,
+            )
+
+
 class TestClearDataFilesOnFullSync:
     """Full sync should clean old day directories, not just today's."""
 
