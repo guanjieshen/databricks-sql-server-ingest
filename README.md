@@ -273,7 +273,7 @@ A deterministic `schemaVersion` hash (based on column names and types) is comput
 
 ### Downstream Integration
 
-For Databricks pipelines consuming the unified bronze output, see `ingestion_pipeline/README.md` for details on how schema evolution interacts with `from_json` parsing and Delta type widening.
+For Databricks pipelines consuming the unified bronze output, see `lakeflow_pipeline/README.md` for details on how schema evolution interacts with `from_json` parsing and Delta type widening.
 
 ---
 

@@ -1,11 +1,9 @@
 """Materialized landing pipeline for the unified bronze schema.
 
-Differs by materializing landing_raw as a
-temporary Delta table instead of a view. Cloud storage is read once;
-downstream views read from Delta with data skipping.
-
-For large table counts (50+) this provides a significant performance
-improvement -- ingestion_pipeline.py re-reads all Parquet N times.
+Materializes landing_raw as a temporary Delta table instead of a view.
+Cloud storage is read once; downstream views read from Delta with data
+skipping. For large table counts (50+) this avoids re-reading all
+Parquet N times.
 """
 
 from pyspark import pipelines as dp

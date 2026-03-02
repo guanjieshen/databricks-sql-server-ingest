@@ -9,8 +9,7 @@ import pytest
 
 from azsql_ct.writer import _make_uoid as writer_uoid
 
-# Import from ingestion_pipeline_examples (run pytest from project root)
-from ingestion_pipeline_examples.metadata_helper import _make_uoid as metadata_uoid
+from lakeflow_pipeline.metadata_helper import _make_uoid as metadata_uoid
 
 
 class TestUoidConsistency:

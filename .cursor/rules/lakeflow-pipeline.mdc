@@ -1,10 +1,10 @@
 ---
-description: Guide for the ingestion_pipeline_examples directory — Databricks DLT pipeline that consumes azsql_ct unified bronze output
-globs: ingestion_pipeline_examples/**/*.py
+description: Guide for the lakeflow_pipeline directory — Databricks DLT pipeline that consumes azsql_ct unified bronze output
+globs: lakeflow_pipeline/**/*.py
 alwaysApply: false
 ---
 
-# Ingestion Pipeline Examples
+# Lakeflow Pipeline
 
 Databricks Lakeflow Declarative Pipelines (DLT) code that reads the Parquet files produced by `azsql_ct` (unified output format) and materializes bronze + silver Delta tables with auto CDC.
 

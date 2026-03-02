@@ -1,4 +1,4 @@
-# ingestion_pipeline_examples — Databricks DLT Downstream Pipelines
+# lakeflow_pipeline — Databricks DLT Downstream Pipelines
 
 Databricks Lakeflow Declarative Pipelines (DLT) that consume Parquet output from `azsql_ct` and materialize bronze + silver Delta tables with auto CDC.
 
@@ -112,6 +112,6 @@ See the [supported type widening rules](https://docs.databricks.com/aws/en/delta
 
 ## Related
 
-- `.cursor/rules/ingestion-pipeline-examples.mdc` — Detailed agent-oriented guide (UOID, soft-delete, etc.)
+- `.cursor/rules/lakeflow-pipeline.mdc` — Detailed agent-oriented guide (UOID, soft-delete, etc.)
 - `azsql_ct/writer.py` — `UnifiedParquetWriter` produces the bronze envelope
 - `scripts/parse_output.py` — Alternative parser for `output.yaml` (flat table list)

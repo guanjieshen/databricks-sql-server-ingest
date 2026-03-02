@@ -1,13 +1,13 @@
 # Databricks Asset Bundle (DAB) – SQL Server CT
 
-This directory defines a Databricks Asset Bundle with **1:1 mapping**: one job per pipeline config under `pipelines/`. All jobs share a single DLT ingestion pipeline.
+This directory defines a Databricks Asset Bundle with **1:1 mapping**: one DLT pipeline + one job per pipeline config under `pipelines/`.
 
 ## Workspace path
 
 Set **`workspace_root`** to the workspace path where this repo lives so job tasks and the pipeline resolve scripts and configs:
 
 - Job gateway task: `scripts/sync.py`, `pipelines/pipeline_1.yaml`
-- Pipeline: `ingestion_pipeline/` code and `root_path`
+- Pipeline: `lakeflow_pipeline/` code and `root_path`
 
 Examples:
 
@@ -43,14 +43,19 @@ Job files under `resources/job_*.yml` are **generated** from the pipeline config
 python dab/generate_jobs.py
 ```
 
-This discovers all `pipelines/*.yaml` and `pipelines/*.yml`, writes or overwrites `dab/resources/job_<base>.yml` for each, and removes any `job_*.yml` whose pipeline config no longer exists. Options: `--dry-run` (print only), `--no-clean` (do not remove stale job files), `--pipelines-dir`, `--resources-dir`.
+This discovers all `pipelines/*.yaml` and `pipelines/*.yml` and writes two files per config:
+
+- `dab/resources/pipelines/sdp_<base>.yml` — DLT pipeline resource
+- `dab/resources/jobs/job_<base>.yml` — job resource referencing that pipeline
+
+Stale files whose pipeline config no longer exists are removed automatically. Options: `--dry-run` (print only), `--no-clean` (do not remove stale files), `--pipelines-dir`, `--resources-dir`.
 
 You can run the generator in CI before `databricks bundle deploy` so the bundle always reflects `pipelines/`. Requires PyYAML (`pip install pyyaml`).
 
 ## Layout
 
 - `databricks.yml` – bundle name, targets, `workspace_root` variable, `include` for resources
-- `resources/ingestion_pipeline.yml` – shared DLT pipeline
-- `resources/job_*.yml` – generated jobs (one per `pipelines/*.yaml`); do not edit by hand
+- `resources/pipelines/sdp_*.yml` – generated DLT pipeline resources; do not edit by hand
+- `resources/jobs/job_*.yml` – generated job resources; do not edit by hand
 
-To add another pipeline: add `pipelines/pipeline_2.yaml`, then run `python dab/generate_jobs.py` to create `resources/job_pipeline_2.yml`.
+To add another pipeline: add `pipelines/pipeline_2.yaml`, then run `python dab/generate_jobs.py` to create `resources/pipelines/sdp_pipeline_2.yml` and `resources/jobs/job_pipeline_2.yml`.

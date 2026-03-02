@@ -109,6 +109,6 @@ Tests live in `tests/` and use pytest. Key fixtures are in `conftest.py` — mos
 
 ## Integration with Downstream Pipelines
 
-See `ingestion_pipeline_examples/` for Databricks integration patterns:
+See `lakeflow_pipeline/` for Databricks integration patterns:
 - `ingestion_pipeline_materialized.py` reads `output.yaml` + `schema.json` to create bronze Delta tables and per-table silver views with auto CDC (SCD Type 1/2)
 - `metadata_helper.py` provides helpers for reading manifest and schema metadata

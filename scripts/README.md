@@ -128,7 +128,7 @@ scripts/
 
 ## Downstream Integration
 
-- **`ingestion_pipeline_examples/`** — Databricks bronze/silver patterns that consume `output.yaml` and `schema.json`
+- **`lakeflow_pipeline/`** — Databricks bronze/silver patterns that consume `output.yaml` and `schema.json`
 - **`metadata_helper.py`** — `parse_output_yaml()` for pipeline config + output manifest + schema.json
 
 ---

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ingestion_pipeline_examples.metadata_helper import parse_output_yaml
+from lakeflow_pipeline.metadata_helper import parse_output_yaml
 
 # Minimal output manifest with one table
 OUTPUT_YAML_CONTENT = """databases:
