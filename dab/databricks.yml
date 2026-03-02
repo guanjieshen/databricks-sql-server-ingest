@@ -6,17 +6,25 @@ variables:
     description: Workspace path where the full repo lives (e.g. /Workspace/Repos/<folder>/<repo>). Jobs and pipelines use this to resolve scripts, configs, and pipeline code outside the bundle root.
     default: /Workspace/Users/guanjie.shen@databricks.com/databricks-sql-server-ingest
   catalog:
-    description: Unity Catalog name for DLT pipelines.
+    description: Unity Catalog default location for SDP pipelines.
     default: guanjiemar1
   manifest_file:
-    description: Manifest filename used by DLT pipeline configuration.
+    description: "Manifest filename for SDP pipeline: 'output.yaml' (all synced tables) or 'incremental_output.yaml' (only tables changed in last sync; falls back to output.yaml if missing or empty)."
     default: incremental_output.yaml
 
 targets:
   dev:
     mode: development
+    variables:
+      workspace_root: /Workspace/Users/guanjie.shen@databricks.com/databricks-sql-server-ingest
+      catalog: guanjiemar1
+      manifest_file: output.yaml
   prod:
     mode: production
+    variables:
+      workspace_root: /Workspace/Repos/prod/databricks-sql-server-ingest
+      catalog: prod_catalog
+      manifest_file: incremental_output.yaml
 
 include:
   - resources/pipelines/*.yml

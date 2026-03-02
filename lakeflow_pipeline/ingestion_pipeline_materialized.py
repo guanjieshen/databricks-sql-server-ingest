@@ -96,6 +96,7 @@ table_configs, data_path = parse_output_yaml(input_yaml, manifest_file=manifest_
     name="landing_raw",
     temporary=True,
     comment="Bronze: materialized unified envelope from all source tables",
+    partition_cols=["_uoid"],
     table_properties={
         "delta.autoOptimize.optimizeWrite": "true",
     },
@@ -106,6 +107,7 @@ def landing_raw():
         .option("cloudFiles.format", "parquet")
         .option("recursiveFileLookup", "true")
         .load(data_path)
+        .withColumn("_uoid", F.col("table_id.uoid"))
     )
 
 
@@ -132,7 +134,7 @@ for tc in table_configs:
         def _view():
             df = (
                 dp.read_stream("landing_raw")
-                .filter(F.col("table_id.uoid") == uoid_val)
+                .filter(F.col("_uoid") == uoid_val)
                 .withColumn("parsed", F.from_json("data", schema))
             )
             select_cols = [
