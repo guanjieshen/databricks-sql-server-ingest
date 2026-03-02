@@ -123,6 +123,11 @@ class AzureSQLConnection:
         )
         return self._conn
 
+    def reconnect(self) -> Any:
+        """Close any existing connection and open a fresh one."""
+        self.close()
+        return self.connect()
+
     def close(self) -> None:
         """Close the underlying connection if open."""
         if self._conn is not None:

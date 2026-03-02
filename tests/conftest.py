@@ -33,6 +33,8 @@ class FakeCursor:
 
     def execute(self, sql: str, params: Any = None) -> None:
         self._call_idx += 1
+        self.last_sql = sql
+        self.last_params = params
         if self._call_idx < len(self._results):
             self._rows = list(self._results[self._call_idx])
         else:

@@ -160,9 +160,9 @@ def save(
     _atomic_write(_path(output_dir), payload)
 
     hp = _history_path(output_dir)
+    line = json.dumps(entry).encode("utf-8") + b"\n"
     existing = b""
     if os.path.isfile(hp):
         with open(hp, "rb") as f:
             existing = f.read()
-    history_payload = existing + json.dumps(entry).encode("utf-8") + b"\n"
-    _atomic_write(hp, history_payload)
+    _atomic_write(hp, existing + line)

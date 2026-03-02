@@ -154,28 +154,29 @@ class TestMergeAdd:
         tbl = manifest["databases"]["db1"]["dbo"]["orders"]
         assert "scd_type" not in tbl
 
-    def test_skips_table_with_zero_rows_written(self):
+    @pytest.mark.parametrize("result_extra,expect_key,expect_value", [
+        ({"soft_delete": True}, True, True),
+        ({"soft_delete": False}, False, None),
+        ({}, False, None),
+    ], ids=["true_stored", "false_omitted", "absent_omitted"])
+    def test_soft_delete_in_manifest(self, result_extra, expect_key, expect_value):
         manifest = {"databases": {}}
-        results = [
-            {"database": "db1", "table": "dbo.empty_table", "rows_written": 0, "files": []},
-        ]
-        merge_add(manifest, results, "/data", "parquet")
-        assert manifest["databases"] == {}
+        result = {"database": "db1", "table": "dbo.orders", "rows_written": 10, **result_extra}
+        merge_add(manifest, [result], "/data", "parquet")
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        if expect_key:
+            assert tbl["soft_delete"] is expect_value
+        else:
+            assert "soft_delete" not in tbl
 
-    def test_skips_table_with_empty_files_list(self):
+    @pytest.mark.parametrize("result_dict", [
+        {"database": "db1", "table": "dbo.empty_table", "rows_written": 0, "files": []},
+        {"database": "db1", "table": "dbo.empty_table", "files": []},
+        {"database": "db1", "table": "dbo.empty_table", "rows_written": 0},
+    ], ids=["zero_rows_with_files", "empty_files_no_rows", "zero_rows_no_files_key"])
+    def test_skips_table_with_no_output(self, result_dict):
         manifest = {"databases": {}}
-        results = [
-            {"database": "db1", "table": "dbo.empty_table", "files": []},
-        ]
-        merge_add(manifest, results, "/data", "parquet")
-        assert manifest["databases"] == {}
-
-    def test_skips_table_with_rows_written_zero_no_files_key(self):
-        manifest = {"databases": {}}
-        results = [
-            {"database": "db1", "table": "dbo.empty_table", "rows_written": 0},
-        ]
-        merge_add(manifest, results, "/data", "parquet")
+        merge_add(manifest, [result_dict], "/data", "parquet")
         assert manifest["databases"] == {}
 
     def test_only_empty_table_excluded_from_mixed_results(self):
@@ -187,6 +188,38 @@ class TestMergeAdd:
         merge_add(manifest, results, "/data", "parquet")
         assert "orders" in manifest["databases"]["db1"]["dbo"]
         assert "empty_table" not in manifest["databases"]["db1"]["dbo"]
+
+    def test_soft_delete_true_with_scd_type_2(self):
+        """Both soft_delete and scd_type are stored when present."""
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5,
+              "scd_type": 2, "soft_delete": True}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["scd_type"] == 2
+        assert tbl["soft_delete"] is True
+
+    def test_manifest_preserves_soft_delete_on_second_merge(self):
+        """Adding a second table does not clobber an existing table's soft_delete flag."""
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5, "soft_delete": True}],
+            "/data",
+            "parquet",
+        )
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.customers", "rows_written": 3}],
+            "/data",
+            "parquet",
+        )
+        assert manifest["databases"]["db1"]["dbo"]["orders"]["soft_delete"] is True
+        assert "customers" in manifest["databases"]["db1"]["dbo"]
 
 
 class TestSave:

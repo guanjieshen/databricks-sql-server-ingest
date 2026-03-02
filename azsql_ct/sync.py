@@ -19,16 +19,16 @@ from __future__ import annotations
 
 import errno
 import fcntl
-import glob
 import logging
 import os
 import time
 from datetime import date
-from typing import Any, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
-from . import queries, watermark
+from . import queries, schema, watermark
 from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES
-from .writer import OutputWriter, ParquetWriter
+from .schema import columns_from_description
+from .writer import OutputWriter, ParquetWriter, _compute_schema_version, _make_uoid
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +76,12 @@ def _iter_cursor(
 ) -> Generator[Tuple, None, None]:
     """Yield rows from *cursor* in batches of *batch_size* without
     materialising the entire result set in memory."""
+    batch_num = 0
     while True:
+        batch_num += 1
+        logger.debug("fetchmany batch %d (size=%d)", batch_num, batch_size)
         batch = cursor.fetchmany(batch_size)
+        logger.debug("fetchmany batch %d returned %d rows", batch_num, len(batch))
         if not batch:
             break
         yield from batch
@@ -149,6 +153,12 @@ def sync_table(
     batch_size: int = DEFAULT_BATCH_SIZE,
     snapshot_isolation: bool = False,
     scd_type: int = DEFAULT_SCD_TYPE,
+    uc_catalog: Optional[str] = None,
+    soft_delete: bool = False,
+    tracked_lookup: Optional[Dict[str, str]] = None,
+    db_version: Optional[int] = None,
+    min_ver: Optional[int] = None,
+    pk_cols: Optional[List[str]] = None,
 ) -> dict:
     """Sync one change-tracked table.
 
@@ -158,7 +168,7 @@ def sync_table(
         database:           Database name (used for directory layout).
         output_dir:         Root directory for data files.
         watermark_dir:      Root directory for watermark files (mirrors data layout).
-        mode:               ``"full_incremental"`` (default), ``"full"``, or
+        mode:               ``"full_incremental"`` (default) or
                             ``"incremental"``.
         writer:             An ``OutputWriter`` instance; defaults to ``ParquetWriter()``.
         batch_size:         Number of rows fetched from the database at a time
@@ -170,6 +180,24 @@ def sync_table(
         scd_type:           SCD type for this table (``1`` = overwrite,
                             ``2`` = historical tracking).  Passed through to
                             the result dict and output manifest.
+        uc_catalog:         Optional Unity Catalog name; passed through to
+                            the writer as ``table_metadata["catalog"]``.
+        soft_delete:        If ``True``, deletes are tracked via an
+                            ``_is_deleted`` flag rather than physical removal.
+                            Passed through to the result dict and output manifest.
+        tracked_lookup:     Pre-fetched ``{lowercase: original}`` tracked-table
+                            lookup from :func:`queries.fetch_all_ct_metadata`.
+                            When provided, skips the per-table
+                            ``list_tracked_tables`` query.
+        db_version:         Pre-fetched CT version from
+                            :func:`queries.fetch_all_ct_metadata`.
+                            Skips the per-table ``current_version`` query.
+        min_ver:            Pre-fetched minimum valid version for this table.
+                            Skips the per-table ``min_valid_version_for_table``
+                            query.
+        pk_cols:            Pre-fetched primary-key column list from
+                            :func:`queries.fetch_all_primary_keys`.
+                            Skips the per-table ``primary_key_columns`` query.
 
     Returns:
         Summary dict.
@@ -183,12 +211,14 @@ def sync_table(
         writer = _DEFAULT_WRITER
 
     cur = conn.cursor()
-    tracked = queries.list_tracked_tables(cur)
-    full_name = queries.resolve_table(table_name, tracked)
+    if tracked_lookup is None:
+        tracked = queries.list_tracked_tables(cur)
+        tracked_lookup = queries.build_tracked_lookup(tracked)
+    full_name = queries.resolve_table(table_name, tracked_lookup)
     if full_name is None:
         raise ValueError(
             f"Table '{table_name}' is not change-tracked in {database}. "
-            f"Tracked tables: {tracked}"
+            f"Tracked tables: {list(tracked_lookup.values())}"
         )
 
     data_dir = _sub_dir(output_dir, database, full_name)
@@ -196,14 +226,20 @@ def sync_table(
 
     with _TableLock(wm_dir):
         return _sync_table_locked(
-            cur, full_name, database, data_dir, wm_dir,
+            conn, cur, full_name, database, data_dir, wm_dir,
             mode=mode, writer=writer, batch_size=batch_size,
             snapshot_isolation=snapshot_isolation,
             scd_type=scd_type,
+            uc_catalog=uc_catalog,
+            soft_delete=soft_delete,
+            db_version=db_version,
+            min_ver=min_ver,
+            pk_cols=pk_cols,
         )
 
 
 def _sync_table_locked(
+    conn: Any,
     cur: Any,
     full_name: str,
     database: str,
@@ -215,10 +251,15 @@ def _sync_table_locked(
     batch_size: int,
     snapshot_isolation: bool = False,
     scd_type: int = DEFAULT_SCD_TYPE,
+    uc_catalog: Optional[str] = None,
+    soft_delete: bool = False,
+    db_version: Optional[int] = None,
+    min_ver: Optional[int] = None,
+    pk_cols: Optional[List[str]] = None,
 ) -> dict:
     """Inner sync logic, called while holding the per-table lock."""
-    cur_ver = queries.current_version(cur)
-    min_ver = queries.min_valid_version_for_table(cur, full_name)
+    cur_ver = db_version if db_version is not None else queries.current_version(cur)
+    min_ver_val = min_ver if min_ver is not None else queries.min_valid_version_for_table(cur, full_name)
     since = watermark.get(wm_dir, full_name)
 
     is_initial = since is None
@@ -227,30 +268,37 @@ def _sync_table_locked(
         raise RuntimeError(
             f"No watermark exists for {database}.{full_name} and mode is "
             f"'incremental'. Use mode='full_incremental' for initial load "
-            f"followed by incremental syncs, or mode='full' for a full reload."
+            f"followed by incremental syncs."
         )
 
-    if mode in ("incremental", "full_incremental") and not is_initial and since < min_ver:
+    if mode in ("incremental", "full_incremental") and not is_initial and since < min_ver_val:
         logger.warning(
             "Watermark (%d) for %s.%s is older than min valid version (%d); "
             "falling back to full sync.",
-            since, database, full_name, min_ver,
+            since, database, full_name, min_ver_val,
         )
-        mode = "full"
+        mode = "full"  # internal-only; not a user-facing mode
 
     t0 = time.monotonic()
 
-    pk_cols = queries.primary_key_columns(cur, full_name)
+    if pk_cols is None:
+        pk_cols = queries.primary_key_columns(cur, full_name)
 
     do_full = mode == "full" or (mode == "full_incremental" and is_initial)
 
+    logger.debug("[%s.%s] Creating fresh data cursor", database, full_name)
+    data_cur = conn.cursor()
+    logger.debug("[%s.%s] Data cursor created", database, full_name)
+
     if snapshot_isolation:
-        cur.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
+        data_cur.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
 
     if do_full:
         logger.info("Full sync for %s.%s (version %d)", database, full_name, cur_ver)
         sql = queries.build_full_query(full_name)
-        cur.execute(sql)
+        logger.debug("[%s.%s] Executing full query", database, full_name)
+        data_cur.execute(sql)
+        logger.debug("[%s.%s] Full query executed", database, full_name)
         actual_mode = "full"
     else:
         if not pk_cols:
@@ -258,12 +306,16 @@ def _sync_table_locked(
                 f"Could not determine primary key for {full_name}. "
                 "A primary key is required for incremental change tracking JOINs."
             )
-        sql = queries.build_incremental_query(full_name, pk_cols)
+        all_cols = queries.table_columns(cur, full_name)
+        sql = queries.build_incremental_query(full_name, pk_cols, all_cols)
         logger.info(
             "Incremental sync for %s.%s (since version %d)",
             database, full_name, since,
         )
-        cur.execute(sql, (since,))
+        logger.debug("[%s.%s] Executing incremental query", database, full_name)
+        data_cur.execute(sql, (since,))
+        logger.debug("[%s.%s] Incremental query executed, description=%s",
+                      database, full_name, data_cur.description is not None)
         actual_mode = "incremental"
 
     day_dir = os.path.join(data_dir, date.today().isoformat())
@@ -271,17 +323,39 @@ def _sync_table_locked(
 
     _clean_temp_files(day_dir)
 
-    description = cur.description
+    description = data_cur.description
     safe_name = full_name.replace(".", "_")
-    row_iter = _iter_cursor(cur, batch_size)
-    output_files, row_count = writer.write(row_iter, description, day_dir, safe_name)
+    row_iter = _iter_cursor(data_cur, batch_size)
+
+    schema_name, table_only = full_name.split(".", 1)
+    schema_ver = _compute_schema_version(description) if description else 0
+    extraction_ts = int(time.time() * 1000)
+
+    table_metadata = {
+        "database": database,
+        "schema": schema_name,
+        "table": table_only,
+        "catalog": uc_catalog or database,
+        "uoid": _make_uoid(database, schema_name, table_only),
+        "extraction_timestamp": extraction_ts,
+        "schema_version": schema_ver,
+    }
+
+    logger.debug("[%s.%s] Starting writer.write", database, full_name)
+    output_files, row_count = writer.write(
+        row_iter, description, day_dir, safe_name,
+        table_metadata=table_metadata,
+    )
+    logger.debug("[%s.%s] writer.write completed: %d rows, %d files",
+                  database, full_name, row_count, len(output_files))
 
     if do_full:
-        _clear_data_files(day_dir, keep=set(output_files))
+        _clear_data_files(data_dir, keep=set(output_files))
 
     elapsed = time.monotonic() - t0
     since_ver = since if actual_mode == "incremental" else None
 
+    logger.debug("[%s.%s] Saving watermark", database, full_name)
     watermark.save(
         wm_dir,
         full_name,
@@ -292,20 +366,95 @@ def _sync_table_locked(
         files=output_files,
         duration_seconds=elapsed,
     )
+    logger.debug("[%s.%s] Watermark saved", database, full_name)
 
-    logger.info(
-        "%s.%s: %d rows written, watermark -> %d (%.1fs)",
-        database, full_name, row_count, cur_ver, elapsed,
-    )
-    return {
+    result = {
         "database": database,
         "table": full_name,
         "mode": actual_mode,
         "scd_type": scd_type,
+        "soft_delete": soft_delete,
         "since_version": since_ver,
         "current_version": cur_ver,
         "rows_written": row_count,
         "files": output_files,
         "duration_seconds": round(elapsed, 2),
         "primary_key": pk_cols,
+        "columns": [],
+        "schema_version": schema_ver,
+        "schema_changed": False,
     }
+
+    try:
+        logger.debug("[%s.%s] Creating metadata cursor", database, full_name)
+        try:
+            meta_cur = conn.cursor()
+            columns = queries.column_metadata(meta_cur, full_name)
+        except Exception:
+            logger.debug(
+                "INFORMATION_SCHEMA lookup failed for %s.%s; "
+                "falling back to cursor.description",
+                database, full_name,
+            )
+            columns = columns_from_description(description)
+
+        existing_schema = schema.load(wm_dir)
+        schema_changed = False
+        if existing_schema:
+            existing_by_name = {
+                c["name"]: c for c in existing_schema.get("columns", [])
+            }
+            incoming_names = {c["name"] for c in columns}
+            existing_names = set(existing_by_name)
+
+            added = incoming_names - existing_names
+            removed = existing_names - incoming_names
+            type_changed = [
+                (c["name"], existing_by_name[c["name"]]["type"], c["type"])
+                for c in columns
+                if c["name"] in existing_by_name
+                and c.get("type") != existing_by_name[c["name"]].get("type")
+            ]
+
+            if added or removed or type_changed:
+                schema_changed = True
+                logger.warning(
+                    "Schema change detected for %s.%s (version %d -> %d)",
+                    database, full_name,
+                    existing_schema.get("schema_version", 0), schema_ver,
+                )
+                if added:
+                    logger.warning("  Columns added: %s", sorted(added))
+                if removed:
+                    logger.warning(
+                        "  Columns removed (retained as null): %s", sorted(removed),
+                    )
+                for col_name, old_type, new_type in type_changed:
+                    logger.warning(
+                        "  Column %r type changed: %s -> %s",
+                        col_name, old_type, new_type,
+                    )
+            elif schema_ver != existing_schema.get("schema_version"):
+                logger.info(
+                    "Schema version changed for %s.%s (%d -> %d) "
+                    "but columns unchanged",
+                    database, full_name,
+                    existing_schema.get("schema_version", 0), schema_ver,
+                )
+
+        schema.save(wm_dir, columns, schema_ver)
+        result["columns"] = columns
+        result["schema_changed"] = schema_changed
+    except Exception as exc:
+        logger.warning(
+            "Post-sync metadata update failed for %s.%s: %s "
+            "(data was written successfully)",
+            database, full_name, exc,
+        )
+        result["columns"] = columns_from_description(description) if description else []
+
+    logger.info(
+        "%s.%s: %d rows written, watermark -> %d (%.1fs)",
+        database, full_name, row_count, cur_ver, elapsed,
+    )
+    return result

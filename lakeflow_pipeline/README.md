@@ -1,0 +1,117 @@
+# lakeflow_pipeline — Databricks DLT Downstream Pipelines
+
+Databricks Lakeflow Declarative Pipelines (DLT) that consume Parquet output from `azsql_ct` and materialize bronze + silver Delta tables with auto CDC.
+
+> **Prerequisite**: Run `azsql_ct` sync with `output_format: unified` so Parquet files use the bronze envelope schema. See root `README.md` and `scripts/README.md`.
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `ingestion_pipeline_materialized.py` | Main DLT pipeline: bronze materialized temp table → per-table silver streaming tables with `create_auto_cdc_flow` |
+| `metadata_helper.py` | Reads pipeline YAML → manifest (`output.yaml` or `incremental_output.yaml`) → per-table `schema.json`; returns `(table_configs, data_path)` for downstream use |
+
+---
+
+## Architecture
+
+```
+Cloud Storage (Parquet from azsql_ct)
+  └─ landing_raw  [Bronze — temporary materialized Delta table]
+       └─ _view_{catalog}_{schema}_{table}  [per-table filter + from_json]
+            └─ {catalog}.{schema}.{table}   [Silver — streaming Delta with auto CDC]
+```
+
+- **Bronze** (`landing_raw`): `@dp.table(temporary=True)` — materialized as Delta but not published to Unity Catalog. Reads all Parquet under `data_path` via Auto Loader (`cloudFiles`). Materializing once avoids re-reading cloud storage N times for N tables.
+- **Silver**: Per-table streaming tables generated from `table_configs`. Each table gets a view (filter by `table_id.uoid`, `from_json` on `data`) and a streaming table with `create_auto_cdc_flow` for SCD Type 1 or 2.
+
+---
+
+## Config Flow
+
+```
+pipeline YAML (spark conf `input_yaml`)
+  → storage.ingest_pipeline path
+    → {ingest_pipeline}/output.yaml or incremental_output.yaml  (which tables, UC names, PKs, SCD types)
+    → {ingest_pipeline}/watermarks/{db}/{schema}/{table}/schema.json  (column definitions)
+    → {ingest_pipeline}/data/          (Parquet files — Auto Loader source)
+```
+
+`parse_output_yaml()` walks the nested manifest structure and joins each table with its `schema.json` columns.
+
+### Manifest selection (`manifest_file`)
+
+By default, the pipeline uses `output.yaml` (all synced tables). You can optionally use `incremental_output.yaml` (only tables with changes from the last sync) by setting the Spark config:
+
+```python
+spark.conf.set("manifest_file", "incremental_output.yaml")
+```
+
+**Fallback behavior**: When `manifest_file` is `incremental_output.yaml`, the pipeline falls back to `output.yaml` if:
+- `incremental_output.yaml` does not exist (e.g. before first sync)
+- `incremental_output.yaml` exists but contains no tables (no changes in last sync)
+
+---
+
+## Unified Bronze Envelope Schema (Parquet)
+
+The Parquet files from `azsql_ct` (unified format) use:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `data` | `string` | JSON-serialized row (all non-CT columns) |
+| `table_id` | `struct{catalog, schema, name, uoid}` | Source table identifier; `uoid` is a deterministic UUID5 |
+| `cursor` | `struct{lsn, seqNum, sequence, timestamp}` | Change tracking position; `seqNum` = `SYS_CHANGE_VERSION` |
+| `extractionTimestamp` | `int64` | Epoch milliseconds when sync ran |
+| `operation` | `string` | `INSERT`, `UPDATE`, `DELETE`, or `LOAD` (full sync) |
+| `schemaVersion` | `int64` | Deterministic hash of source column names/types |
+
+---
+
+## Running the Pipeline
+
+1. Run `azsql_ct` sync to produce Parquet under `{ingest_pipeline}/data/`.
+2. Set Spark config `input_yaml` to the path of your pipeline YAML (the same config used by sync, or one that points to the same `storage.ingest_pipeline`).
+3. Optionally set `manifest_file` to `"incremental_output.yaml"` to process only tables with changes (falls back to `output.yaml` if incremental is missing or empty).
+4. Run the DLT pipeline in Databricks (or compatible Spark environment).
+
+---
+
+## Schema Evolution and Type Widening
+
+`azsql_ct` tracks schema changes in `schema.json` using append-only column semantics:
+
+- **New columns** are appended; downstream sees nulls for historical rows.
+- **Removed columns** are retained so downstream sees nulls instead of missing fields.
+- **Type changes** are updated in-place; the previous type is preserved as `previous_type` for auditability. Each column carries a `last_seen` timestamp.
+
+Because the unified bronze format stores row data as a JSON string in the `data` column, the Parquet schema is stable regardless of source schema evolution. Type information only matters at the `from_json` parsing stage in the pipeline, where `_build_spark_schema` reads the latest `schema.json` to construct the Spark schema.
+
+### Delta Type Widening
+
+For numeric type widenings (e.g., SQL Server `int` -> `bigint`) to flow through to the silver streaming tables without a full refresh, enable [Delta type widening](https://docs.databricks.com/aws/en/delta/type-widening) on the pipeline. Add the following to your Databricks pipeline configuration:
+
+```yaml
+configuration:
+  pipelines.enableTypeWidening: "true"
+```
+
+This allows the silver Delta tables to automatically widen column types (e.g., `INT` -> `BIGINT`) when the parsed view produces a wider type after a source schema change. Without type widening, a type change in the source requires a full refresh of the affected silver table.
+
+See the [supported type widening rules](https://docs.databricks.com/aws/en/delta/type-widening#supported-type-changes) for which widenings are handled automatically. Unsupported type changes (e.g., `int` -> `nvarchar`) still require a full refresh.
+
+---
+
+## MSSQL-to-Spark Type Mapping
+
+`MSSQL_TO_SPARK` in `ingestion_pipeline_materialized.py` maps SQL Server type names (from `schema.json`) to PySpark types for `from_json` parsing. Unknown types fall back to `StringType()`.
+
+---
+
+## Related
+
+- `.cursor/rules/lakeflow-pipeline.mdc` — Detailed agent-oriented guide (UOID, soft-delete, etc.)
+- `azsql_ct/writer.py` — `UnifiedParquetWriter` produces the bronze envelope
+- `scripts/parse_output.py` — Alternative parser for `output.yaml` (flat table list)

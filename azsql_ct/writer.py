@@ -1,6 +1,11 @@
 """Output writers for sync results.
 
-Defines the ``OutputWriter`` protocol and the ``ParquetWriter`` implementation.
+Defines the ``OutputWriter`` protocol and two implementations:
+
+* ``ParquetWriter`` -- writes native per-table Parquet (original behaviour).
+* ``UnifiedParquetWriter`` -- writes a Lakeflow-Connect-style bronze
+  envelope schema (JSON ``data`` column, ``table_id`` struct, ``cursor``
+  struct, ``operation``, ``schemaVersion``).
 
 Both follow a **write-then-rename** strategy: each file is written to a
 ``.tmp`` suffix first and only renamed to its final name after the full
@@ -14,18 +19,63 @@ reading partial files and makes cleanup of crash leftovers trivial.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
 import os
+import time
+import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
+from ._constants import (
+    DEFAULT_PARQUET_COMPRESSION,
+    DEFAULT_ROW_GROUP_SIZE,
+    VALID_PARQUET_COMPRESSION,
+)
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROW_GROUP_SIZE = 500_000
+
+def _default(obj: Any) -> str:
+    """JSON serialization fallback: base64 for binary, str() for everything else."""
+    if isinstance(obj, (bytes, bytearray)):
+        return base64.b64encode(obj).decode()
+    return str(obj)
+
+
+try:
+    import orjson
+    def _json_dumps(obj: dict) -> str:
+        return orjson.dumps(obj, default=_default).decode()
+except ImportError:
+    def _json_dumps(obj: dict) -> str:
+        return json.dumps(obj, default=_default)
+
 _PARTITION_BUFFER_CAP = 10_000
 _TEMP_SUFFIX = ".tmp"
 
 WriteResult = Tuple[List[str], int]
+
+
+def _validate_compression(compression: str) -> str:
+    """Normalize and validate a Parquet compression codec name."""
+    comp = (compression or "").lower()
+    if comp and comp not in VALID_PARQUET_COMPRESSION:
+        raise ValueError(
+            f"Invalid compression {compression!r}; must be one of "
+            f"{sorted(VALID_PARQUET_COMPRESSION)}"
+        )
+    return comp or DEFAULT_PARQUET_COMPRESSION
+
+
+def _parquet_writer_kwargs(compression: str, compression_level: Optional[int]) -> Dict[str, Any]:
+    """Build kwargs for pq.ParquetWriter (compression must be uppercase)."""
+    kw: Dict[str, Any] = {"compression": (compression or "zstd").upper()}
+    if compression_level is not None:
+        kw["compression_level"] = compression_level
+    return kw
 
 
 def _finalize_temp_files(temp_to_final: List[Tuple[str, str]]) -> List[str]:
@@ -46,8 +96,7 @@ def _value_to_partition_date(value: Any) -> str:
     if value is None:
         return "_unknown"
     if isinstance(value, datetime):
-        d = value.date() if hasattr(value, "date") else value
-        return d.isoformat()
+        return value.date().isoformat()
     if isinstance(value, date) and not isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, str):
@@ -74,10 +123,14 @@ class OutputWriter(Protocol):
         description: Sequence[Tuple[str, ...]],
         dir_path: str,
         prefix: str,
+        **kwargs: Any,
     ) -> WriteResult:
         """Write *rows* (with column metadata in *description*) to *dir_path*.
 
         Returns ``(file_paths, row_count)``.
+
+        Implementations may accept extra keyword arguments (e.g.
+        ``table_metadata``) and should ignore any they do not recognise.
         """
         ...  # pragma: no cover
 
@@ -106,10 +159,14 @@ class ParquetWriter:
         max_rows_per_file: int = 1_000_000,
         row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
         partition_column: Optional[str] = None,
+        compression: str = DEFAULT_PARQUET_COMPRESSION,
+        compression_level: Optional[int] = None,
     ) -> None:
         self.max_rows_per_file = max_rows_per_file
         self.row_group_size = row_group_size
         self.partition_column = partition_column
+        self.compression = _validate_compression(compression)
+        self.compression_level = compression_level
 
     @property
     def file_type(self) -> str:
@@ -145,9 +202,10 @@ class ParquetWriter:
         """
         import pyarrow as pa
 
+        transposed = list(zip(*rows))
         columns = {
-            name: ParquetWriter._coerce_column([row[i] for row in rows])
-            for i, name in enumerate(col_names)
+            name: ParquetWriter._coerce_column(list(col))
+            for name, col in zip(col_names, transposed)
         }
 
         if schema is None:
@@ -169,6 +227,7 @@ class ParquetWriter:
         description: Sequence[Tuple[str, ...]],
         dir_path: str,
         prefix: str,
+        **kwargs: Any,
     ) -> WriteResult:
         import pyarrow.parquet as pq
 
@@ -199,7 +258,11 @@ class ParquetWriter:
             if pq_writer is None:
                 final = os.path.join(dir_path, f"{prefix}_{ts}_part{part}.parquet")
                 tmp = final + _TEMP_SUFFIX
-                pq_writer = pq.ParquetWriter(tmp, schema)
+                pq_writer = pq.ParquetWriter(
+                    tmp, schema, **_parquet_writer_kwargs(
+                        self.compression, self.compression_level,
+                    )
+                )
                 pending.append((tmp, final))
             pq_writer.write_batch(batch)
             buf.clear()
@@ -279,7 +342,10 @@ class ParquetWriter:
                     part_dir, f"{prefix}_{ts}_part{ps['part_num']}.parquet",
                 )
                 tmp = final + _TEMP_SUFFIX
-                ps["writer"] = pq.ParquetWriter(tmp, ps["schema"])
+                ps["writer"] = pq.ParquetWriter(
+                    tmp, ps["schema"],
+                    **_parquet_writer_kwargs(self.compression, self.compression_level),
+                )
                 pending.append((tmp, final))
             ps["writer"].write_batch(batch)
             ps["buf"].clear()
@@ -316,6 +382,242 @@ class ParquetWriter:
         files = _finalize_temp_files(pending)
         logger.debug(
             "Wrote %d file(s) (%d rows) to %s (partitioned by day)",
+            len(files), row_count, dir_path,
+        )
+        return files, row_count
+
+
+# ---------------------------------------------------------------------------
+# Unified (bronze envelope) writer
+# ---------------------------------------------------------------------------
+
+_CT_COLUMNS = frozenset({
+    "SYS_CHANGE_VERSION",
+    "SYS_CHANGE_CREATION_VERSION",
+    "SYS_CHANGE_OPERATION",
+})
+
+OP_MAP: Dict[str, str] = {
+    "I": "INSERT",
+    "U": "UPDATE",
+    "D": "DELETE",
+    "L": "LOAD",
+}
+
+
+def _make_uoid(database: str, schema: str, table: str) -> str:
+    """Deterministic UUID5 from the (database, schema, table) triple.
+
+    Uses a null-byte separator so that dotted identifiers like
+    ``("a.b", "c", "d")`` and ``("a", "b.c", "d")`` never collide.
+    """
+    key = f"{database}\x00{schema}\x00{table}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
+
+
+def _compute_schema_version(description: Sequence[Tuple[str, ...]]) -> int:
+    """Stable int64 hash from column names and type info in *description*.
+
+    Only data columns are considered (CT metadata columns are excluded).
+    """
+    parts = []
+    for col in description:
+        name = col[0]
+        if name in _CT_COLUMNS:
+            continue
+        type_code = col[1] if len(col) > 1 else ""
+        parts.append(f"{name}:{type_code}")
+    sig = "|".join(parts)
+    digest = hashlib.sha256(sig.encode()).hexdigest()
+    return int(digest[:15], 16)
+
+
+def _bronze_schema() -> Any:
+    """Return the PyArrow schema for the unified bronze envelope."""
+    import pyarrow as pa
+
+    return pa.schema([
+        ("data", pa.string()),
+        ("table_id", pa.struct([
+            ("catalog", pa.string()),
+            ("schema", pa.string()),
+            ("name", pa.string()),
+            ("uoid", pa.string()),
+        ])),
+        ("cursor", pa.struct([
+            ("lsn", pa.string()),
+            ("seqNum", pa.string()),
+            ("sequence", pa.string()),
+            ("timestamp", pa.int64()),
+        ])),
+        ("extractionTimestamp", pa.int64()),
+        ("operation", pa.string()),
+        ("schemaVersion", pa.int64()),
+    ])
+
+
+class UnifiedParquetWriter:
+    """Write query results as a Lakeflow-Connect-style bronze envelope.
+
+    Every row is transformed into the unified bronze schema:
+
+    * ``data`` -- JSON string of all non-CT data columns.
+    * ``table_id`` -- struct identifying the source table.
+    * ``cursor`` -- struct with change-tracking position info.
+    * ``extractionTimestamp`` -- epoch milliseconds of the sync.
+    * ``operation`` -- INSERT / UPDATE / DELETE / LOAD.
+    * ``schemaVersion`` -- deterministic hash of the source column set.
+
+    Requires ``table_metadata`` kwarg to be passed to :meth:`write`.
+
+    Streaming and file-splitting behaviour mirrors :class:`ParquetWriter`.
+    """
+
+    def __init__(
+        self,
+        max_rows_per_file: int = 1_000_000,
+        row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+        compression: str = DEFAULT_PARQUET_COMPRESSION,
+        compression_level: Optional[int] = None,
+    ) -> None:
+        self.max_rows_per_file = max_rows_per_file
+        self.row_group_size = row_group_size
+        self.compression = _validate_compression(compression)
+        self.compression_level = compression_level
+
+    @property
+    def file_type(self) -> str:
+        return "parquet"
+
+    def write(
+        self,
+        rows: Iterable,
+        description: Sequence[Tuple[str, ...]],
+        dir_path: str,
+        prefix: str,
+        **kwargs: Any,
+    ) -> WriteResult:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        meta: Dict[str, Any] = kwargs.get("table_metadata", {})
+        database = meta.get("database", "")
+        schema_name = meta.get("schema", "")
+        table_name = meta.get("table", "")
+        catalog = meta.get("catalog") or database
+        uoid = meta.get("uoid") or _make_uoid(database, schema_name, table_name)
+        extraction_ts = meta.get("extraction_timestamp") or int(time.time() * 1000)
+        schema_version = meta.get("schema_version") or _compute_schema_version(description)
+
+        col_names = [col[0] for col in description]
+        ct_map: Dict[str, int] = {}
+        data_indices: List[int] = []
+        data_col_names: List[str] = []
+        for i, name in enumerate(col_names):
+            if name in _CT_COLUMNS:
+                ct_map[name] = i
+            else:
+                data_indices.append(i)
+                data_col_names.append(name)
+
+        table_id_val = {
+            "catalog": catalog,
+            "schema": schema_name,
+            "name": table_name,
+            "uoid": uoid,
+        }
+
+        arrow_schema = _bronze_schema()
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        pending: List[Tuple[str, str]] = []
+        row_count = 0
+        pq_writer: Optional[pq.ParquetWriter] = None
+        rows_in_file = 0
+        part = 1
+
+        ver_idx = ct_map.get("SYS_CHANGE_VERSION")
+        op_idx = ct_map.get("SYS_CHANGE_OPERATION")
+
+        raw_buf: List[tuple] = []
+
+        def _serialize_batch(buf: List[tuple]) -> Dict[str, list]:
+            """Convert buffered raw tuples into column lists for the arrow batch."""
+            data_strs: List[str] = []
+            cursors: List[dict] = []
+            operations: List[str] = []
+            for t in buf:
+                data_dict = {
+                    data_col_names[j]: (t[idx] if idx < len(t) else None)
+                    for j, idx in enumerate(data_indices)
+                }
+                data_strs.append(_json_dumps(data_dict))
+
+                change_ver = t[ver_idx] if ver_idx is not None else None
+                ver_str = str(change_ver) if change_ver is not None else None
+                cursors.append({
+                    "lsn": None, "seqNum": ver_str,
+                    "sequence": ver_str, "timestamp": None,
+                })
+
+                raw_op = t[op_idx] if op_idx is not None else None
+                operations.append(
+                    OP_MAP.get(str(raw_op).strip() if raw_op else "",
+                               str(raw_op) if raw_op else "UNKNOWN")
+                )
+            n = len(buf)
+            return {
+                "data": data_strs,
+                "table_id": [table_id_val] * n,
+                "cursor": cursors,
+                "extractionTimestamp": [extraction_ts] * n,
+                "operation": operations,
+                "schemaVersion": [schema_version] * n,
+            }
+
+        def _flush() -> None:
+            nonlocal pq_writer
+            if not raw_buf:
+                return
+            cols = _serialize_batch(raw_buf)
+            batch = pa.RecordBatch.from_pydict(cols, schema=arrow_schema)
+            if pq_writer is None:
+                final = os.path.join(dir_path, f"{prefix}_{ts_str}_part{part}.parquet")
+                tmp = final + _TEMP_SUFFIX
+                pq_writer = pq.ParquetWriter(
+                    tmp, arrow_schema,
+                    **_parquet_writer_kwargs(self.compression, self.compression_level),
+                )
+                pending.append((tmp, final))
+            pq_writer.write_batch(batch)
+            raw_buf.clear()
+
+        def _close_file() -> None:
+            nonlocal pq_writer, rows_in_file, part
+            if pq_writer is not None:
+                pq_writer.close()
+                pq_writer = None
+            rows_in_file = 0
+            part += 1
+
+        for row in rows:
+            raw_buf.append(tuple(row))
+            row_count += 1
+            rows_in_file += 1
+
+            if len(raw_buf) >= self.row_group_size:
+                _flush()
+
+            if rows_in_file >= self.max_rows_per_file:
+                _flush()
+                _close_file()
+
+        _flush()
+        if pq_writer is not None:
+            pq_writer.close()
+
+        files = _finalize_temp_files(pending)
+        logger.debug(
+            "Wrote %d unified file(s) (%d rows) to %s",
             len(files), row_count, dir_path,
         )
         return files, row_count

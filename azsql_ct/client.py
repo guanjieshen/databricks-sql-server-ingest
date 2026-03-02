@@ -15,8 +15,7 @@
         "database_1": {
             "dbo": {
                 "table_1": "full_incremental",
-                "table_2": "full",
-                "table_3": "incremental",
+                "table_2": "incremental",
             }
         }
     }
@@ -36,10 +35,9 @@
     # Parallel sync (4 tables at a time):
     ct = ChangeTracker("server", "user", "pw", max_workers=4)
     ct.tables = {"db1": {"dbo": [f"table_{i}" for i in range(1, 101)]}}
-    ct.full_load()
+    ct.sync()
 
 Modes:
-    ``full``               Always reload the entire table.
     ``incremental``        Strict incremental via change tracking; raises if
                            no watermark exists yet.
     ``full_incremental``   Full load when no watermark exists, incremental
@@ -48,155 +46,75 @@ Modes:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Empty, Queue
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
-from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES, VALID_SCD_TYPES
+from . import queries
+from ._constants import (
+    DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PARQUET_COMPRESSION,
+    DEFAULT_ROW_GROUP_SIZE,
+)
+from .config import (
+    expand_env, _load_config_file, _normalize_table_map,
+    _extract_uc_metadata, _flat_config_to_table_map,
+    TableMap, FlatEntry,
+    _flatten_table_map, _validate_table_map,
+)
 from .connection import AzureSQLConnection, load_dotenv
+from .incremental_output import write as incremental_output_write
 from .output_manifest import load as manifest_load, merge_add as manifest_merge_add, save as manifest_save
 from .sync import sync_table
-from .writer import OutputWriter, ParquetWriter
+from . import watermark
+from .writer import OutputWriter, ParquetWriter, UnifiedParquetWriter
 
 logger = logging.getLogger(__name__)
 
 
-def expand_env(value: str) -> str:
-    """Expand ``${VAR}`` references in *value* with environment variables."""
+def set_databricks_task_values(results: List[dict]) -> int:
+    """Set Databricks task values from sync results for downstream workflow tasks.
 
-    def _repl(m):
-        name = m.group(1)
-        if name not in os.environ:
-            raise KeyError(
-                f"Environment variable {name!r} is not set "
-                f"(referenced in config as ${{{name}}})"
-            )
-        return os.environ[name]
+    When running in a Databricks job, sets:
 
-    return re.sub(r"\$\{(\w+)}", _repl, str(value))
+    - ``total_rows_changed`` (int): Sum of ``rows_written`` across all non-error
+      results. Reference via ``{{tasks.<task_name>.values.total_rows_changed}}``.
+    - ``schema_changes_detected`` (bool): ``True`` if any synced table had a
+      schema change (columns added, removed, or type changed). Reference via
+      ``{{tasks.<task_name>.values.schema_changes_detected}}`` for notifications
+      or conditional branching.
 
+    When run locally (no ``dbutils``), this is a no-op.
 
-def _load_config_file(path: Union[str, Path]) -> dict:
-    """Load a YAML or JSON config file, chosen by extension."""
-    p = Path(path)
-    text = p.read_text()
-    if p.suffix in (".yaml", ".yml"):
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError(
-                "PyYAML is required for YAML config files. "
-                "Install it with: pip install azsql_ct[yaml]"
-            )
-        return yaml.safe_load(text)
-    return json.loads(text)
-
-
-# Keys at the database level that are metadata, not schema names.
-_DB_META_KEYS = frozenset({"uc_catalog", "schemas"})
-# Keys at the schema level that are metadata, not table names.
-_SCHEMA_META_KEYS = frozenset({"uc_schema", "tables"})
-
-
-def _normalize_table_map(raw: dict) -> dict:
-    """Normalise a ``databases`` dict into the internal table-map format.
-
-    Accepts both the **structured** layout (with ``schemas``/``tables`` keys
-    and optional ``uc_catalog``/``uc_schema`` metadata) and the **legacy**
-    flat layout where database keys map directly to schema dicts.
-
-    Returns ``{db: {schema: {table: mode}}}`` (or list variant) with all
-    metadata keys stripped.
+    Returns:
+        Total rows written across all non-error results.
     """
-    result: dict = {}
-    for db_name, db_value in raw.items():
-        if not isinstance(db_value, dict):
-            result[db_name] = db_value
-            continue
-
-        if "schemas" in db_value:
-            schemas_section = db_value["schemas"]
-            if not isinstance(schemas_section, dict):
-                raise TypeError(
-                    f"'schemas' for database '{db_name}' must be a dict, "
-                    f"got {type(schemas_section).__name__}"
-                )
-            normalised_schemas: dict = {}
-            for schema_name, schema_value in schemas_section.items():
-                if not isinstance(schema_value, dict):
-                    raise TypeError(
-                        f"schema '{schema_name}' in database '{db_name}' "
-                        f"must be a dict, got {type(schema_value).__name__}"
-                    )
-                if "tables" in schema_value:
-                    normalised_schemas[schema_name] = schema_value["tables"]
-                else:
-                    normalised_schemas[schema_name] = {
-                        k: v
-                        for k, v in schema_value.items()
-                        if k not in _SCHEMA_META_KEYS
-                    }
-            result[db_name] = normalised_schemas
-        else:
-            result[db_name] = db_value
-    return result
-
-
-def _extract_uc_metadata(raw: dict) -> Dict[str, Dict[str, Any]]:
-    """Extract Unity Catalog metadata from a raw ``databases`` config dict.
-
-    Returns ``{db: {"uc_catalog": value, "schemas": {schema: uc_schema_value}}}``
-    for databases that use the structured format.  Returns an empty dict for
-    legacy-format configs or databases without UC fields.
-    """
-    result: Dict[str, Dict[str, Any]] = {}
-    for db_name, db_value in raw.items():
-        if not isinstance(db_value, dict):
-            continue
-        uc_catalog = db_value.get("uc_catalog")
-        schemas_section = db_value.get("schemas")
-        if uc_catalog is None and schemas_section is None:
-            continue
-        schema_map: Dict[str, Any] = {}
-        if isinstance(schemas_section, dict):
-            for schema_name, schema_value in schemas_section.items():
-                if isinstance(schema_value, dict):
-                    uc_schema = schema_value.get("uc_schema")
-                    if uc_schema is not None:
-                        schema_map[schema_name] = uc_schema
-        entry: Dict[str, Any] = {"schemas": schema_map}
-        if uc_catalog is not None:
-            entry["uc_catalog"] = uc_catalog
-        result[db_name] = entry
-    return result
-
-
-def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[str, str]]]:
-    """Convert a flat ``[{"database": ..., "table": ..., "mode": ...}]`` list
-    into the nested ``{db: {schema: {table: mode}}}`` format."""
-    result: Dict[str, Dict[str, Dict[str, str]]] = {}
-    for entry in tables:
-        db = entry["database"]
-        full_name = entry["table"]
-        mode = entry.get("mode", "full_incremental")
-        if "." in full_name:
-            schema, table = full_name.split(".", 1)
-        else:
-            schema, table = "dbo", full_name
-        result.setdefault(db, {}).setdefault(schema, {})[table] = mode
-    return result
-
-
-TableSpec = Union[List[str], Dict[str, Any]]
-TableMap = Dict[str, Dict[str, TableSpec]]
-FlatEntry = Tuple[str, str, Optional[str], int]
+    total_rows = sum(
+        r.get("rows_written", 0)
+        for r in results
+        if r.get("status") != "error"
+    )
+    has_schema_changes = any(
+        r.get("schema_changed")
+        for r in results
+        if r.get("status") != "error"
+    )
+    try:
+        import sys
+        main = sys.modules.get("__main__")
+        dbutils = getattr(main, "dbutils", None) if main else None
+        if dbutils is not None:
+            dbutils.jobs.taskValues.set(key="total_rows_changed", value=total_rows)
+            dbutils.jobs.taskValues.set(
+                key="schema_changes_detected", value=has_schema_changes
+            )
+    except Exception:
+        pass
+    return total_rows
 
 
 class _ConnectionPool:
@@ -226,17 +144,28 @@ class _ConnectionPool:
 
     def acquire(self, database: str) -> Tuple[AzureSQLConnection, Any]:
         """Return an ``(AzureSQLConnection, conn)`` pair, reusing an idle one
-        if available or creating a new one otherwise."""
+        if available or creating a new one otherwise.
+
+        Reused connections are health-checked with ``SELECT 1``; stale
+        connections are discarded and a fresh one is created.
+        """
         q = self._queue_for(database)
         try:
             az = q.get_nowait()
-            return az, az.connect()
+            conn = az.connect()
+            try:
+                conn.cursor().execute("SELECT 1")
+                return az, conn
+            except Exception:
+                logger.debug("Stale connection for %s, reconnecting", database)
+                az.close()
         except Empty:
-            az = AzureSQLConnection(
-                server=self._server, user=self._user,
-                password=self._password, database=database,
-            )
-            return az, az.connect()
+            pass
+        az = AzureSQLConnection(
+            server=self._server, user=self._user,
+            password=self._password, database=database,
+        )
+        return az, az.connect()
 
     def release(self, database: str, az: AzureSQLConnection) -> None:
         """Return a healthy connection to the pool for reuse."""
@@ -253,93 +182,113 @@ class _ConnectionPool:
                     break
 
 
-def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
-    """Convert a table map to ``[(db, "schema.table", mode_or_none, scd_type), ...]``.
+def _load_watermarks_for_tables(
+    watermark_dir: str, database: str, tables: List[str],
+) -> Dict[str, int]:
+    """Load watermark version for each table. Returns {full_table_name: version} for tables with watermarks."""
+    result: Dict[str, int] = {}
+    for full_table_name in tables:
+        schema, table = full_table_name.split(".", 1)
+        wm_dir = os.path.join(watermark_dir, database, schema, table)
+        since = watermark.get(wm_dir, full_table_name)
+        if since is not None:
+            result[full_table_name] = since
+    return result
 
-    *mode_or_none* is ``None`` for list-format entries (no per-table mode).
-    *scd_type* defaults to ``DEFAULT_SCD_TYPE`` (1) when not specified.
+
+def _fetch_db_metadata(conn: Any) -> Dict[str, Any]:
+    """Fetch all CT metadata and primary keys for a database in two queries.
+
+    Returns a dict with ``db_version``, ``tables`` (name -> min_version),
+    ``tracked_lookup`` (lowercase -> original), and ``pk_map`` (name -> [cols]).
     """
-    entries: List[FlatEntry] = []
-    for database, schemas in table_map.items():
-        for schema, tables in schemas.items():
-            if isinstance(tables, dict):
-                for table, tbl_cfg in tables.items():
-                    if isinstance(tbl_cfg, dict):
-                        mode = tbl_cfg.get("mode")
-                        scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
-                        entries.append((database, f"{schema}.{table}", mode, scd_type))
-                    else:
-                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE))
-            else:
-                for table in tables:
-                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE))
-    return entries
+    cur = conn.cursor()
+    ct_meta = queries.fetch_all_ct_metadata(cur)
+    pk_map = queries.fetch_all_primary_keys(cur)
+    tracked_lookup = queries.build_tracked_lookup(list(ct_meta["tables"].keys()))
+    return {
+        "db_version": ct_meta["db_version"],
+        "tables": ct_meta["tables"],
+        "tracked_lookup": tracked_lookup,
+        "pk_map": pk_map,
+    }
 
 
-def _validate_table_map(value: object) -> TableMap:
-    """Raise ``TypeError`` / ``ValueError`` if *value* is not a valid table map."""
-    if not isinstance(value, dict):
-        raise TypeError(f"tables must be a dict, got {type(value).__name__}")
-    for db, schemas in value.items():
-        if not isinstance(db, str):
-            raise TypeError(f"database key must be str, got {type(db).__name__}")
-        if not isinstance(schemas, dict):
-            raise TypeError(
-                f"schemas for database '{db}' must be a dict, "
-                f"got {type(schemas).__name__}"
-            )
-        for schema, tables in schemas.items():
-            if not isinstance(schema, str):
-                raise TypeError(
-                    f"schema key must be str, got {type(schema).__name__}"
-                )
-            if isinstance(tables, dict):
-                if not tables:
-                    raise ValueError(
-                        f"table dict for '{db}'.'{schema}' must not be empty"
-                    )
-                for tbl, tbl_cfg in tables.items():
-                    if not isinstance(tbl, str):
-                        raise TypeError(
-                            f"table name must be str, got {type(tbl).__name__}"
-                        )
-                    if isinstance(tbl_cfg, str):
-                        if tbl_cfg not in VALID_MODES:
-                            raise ValueError(
-                                f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
-                                f"of {sorted(VALID_MODES)}, got {tbl_cfg!r}"
-                            )
-                    elif isinstance(tbl_cfg, dict):
-                        mode = tbl_cfg.get("mode")
-                        if mode not in VALID_MODES:
-                            raise ValueError(
-                                f"mode for '{db}'.'{schema}'.'{tbl}' must be one "
-                                f"of {sorted(VALID_MODES)}, got {mode!r}"
-                            )
-                        scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
-                        if scd_type not in VALID_SCD_TYPES:
-                            raise ValueError(
-                                f"scd_type for '{db}'.'{schema}'.'{tbl}' must be one "
-                                f"of {sorted(VALID_SCD_TYPES)}, got {scd_type!r}"
-                            )
-                    else:
-                        raise TypeError(
-                            f"table config for '{db}'.'{schema}'.'{tbl}' must be "
-                            f"a mode string or a dict, got {type(tbl_cfg).__name__}"
-                        )
-            elif isinstance(tables, list):
-                if not tables:
-                    raise ValueError(
-                        f"table list for '{db}'.'{schema}' must not be empty"
-                    )
-            else:
-                raise TypeError(
-                    f"tables for '{db}'.'{schema}' must be a list or dict, "
-                    f"got {type(tables).__name__}"
-                )
-    if not value:
-        raise ValueError("tables dict must not be empty")
-    return value  # type: ignore[return-value]
+def _compute_tables_to_skip(
+    database: str,
+    conn: Any,
+    flat_entries: List[FlatEntry],
+    watermark_dir: str,
+    mode_override: Optional[str],
+    db_metadata: Optional[Dict[str, Any]] = None,
+) -> Set[str]:
+    """Return set of full_table_name (config names) to skip (incremental tables with no changes).
+
+    When *db_metadata* is provided (from :func:`_fetch_db_metadata`), reuses
+    the pre-fetched tracked-table list and min valid versions instead of
+    querying them again.
+    """
+    try:
+        if db_metadata is not None:
+            tracked_lookup = db_metadata["tracked_lookup"]
+            ct_tables = db_metadata["tables"]
+        else:
+            cur = conn.cursor()
+            ct_meta = queries.fetch_all_ct_metadata(cur)
+            tracked_lookup = queries.build_tracked_lookup(list(ct_meta["tables"].keys()))
+            ct_tables = ct_meta["tables"]
+
+        resolved_to_config: Dict[str, str] = {}
+        for _db, full_table_name, table_mode, _scd, _soft in flat_entries:
+            if _db != database:
+                continue
+            mode = mode_override or table_mode or "full_incremental"
+            if mode not in ("incremental", "full_incremental"):
+                continue
+            resolved = queries.resolve_table(full_table_name, tracked_lookup)
+            if resolved is None:
+                continue
+            resolved_to_config[resolved] = full_table_name
+
+        if not resolved_to_config:
+            return set()
+
+        watermarks = _load_watermarks_for_tables(
+            watermark_dir, database, list(resolved_to_config.keys()),
+        )
+        resolved_with_wm = [r for r in resolved_to_config if r in watermarks]
+        if not resolved_with_wm:
+            return set()
+
+        table_watermarks: Dict[str, int] = {}
+        for resolved in resolved_with_wm:
+            since = watermarks[resolved]
+            min_ver = ct_tables.get(resolved, 0)
+            if since >= min_ver:
+                table_watermarks[resolved] = since
+
+        if not table_watermarks:
+            return set()
+
+        cur = conn.cursor()
+        changed = queries.fetch_tables_with_changes(cur, table_watermarks)
+        to_skip_resolved = {t for t in table_watermarks if t not in changed}
+        return {resolved_to_config[r] for r in to_skip_resolved}
+    except Exception as exc:
+        logger.warning(
+            "Change check failed for %s, syncing all tables: %s", database, exc,
+        )
+        return set()
+
+
+def _skipped_result(database: str, table: str) -> dict:
+    """Result dict for a table skipped due to no changes."""
+    return {
+        "database": database,
+        "table": table,
+        "status": "skipped",
+        "reason": "no changes",
+    }
 
 
 class ChangeTracker:
@@ -377,13 +326,31 @@ class ChangeTracker:
         batch_size: int = DEFAULT_BATCH_SIZE,
         snapshot_isolation: bool = False,
         output_manifest: Optional[str] = None,
+        output_format: str = DEFAULT_OUTPUT_FORMAT,
+        parquet_compression: str = DEFAULT_PARQUET_COMPRESSION,
+        parquet_compression_level: Optional[int] = None,
+        row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
     ) -> None:
         self.server = server
         self.user = user
         self._password = password
         self.output_dir = output_dir
         self.watermark_dir = watermark_dir
-        self.writer: OutputWriter = writer or ParquetWriter()
+        self.output_format = output_format
+        if writer is not None:
+            self.writer: OutputWriter = writer
+        elif output_format == "unified":
+            self.writer = UnifiedParquetWriter(
+                compression=parquet_compression,
+                compression_level=parquet_compression_level,
+                row_group_size=row_group_size,
+            )
+        else:
+            self.writer = ParquetWriter(
+                compression=parquet_compression,
+                compression_level=parquet_compression_level,
+                row_group_size=row_group_size,
+            )
         self.max_workers = max(1, max_workers)
         self.batch_size = batch_size
         self.snapshot_isolation = snapshot_isolation
@@ -454,7 +421,7 @@ class ChangeTracker:
               "user": "sqladmin",
               "password": "secret",
               "tables": [
-                {"database": "db1", "table": "dbo.orders", "mode": "full"}
+                {"database": "db1", "table": "dbo.orders", "mode": "full_incremental"}
               ]
             }
         """
@@ -465,6 +432,9 @@ class ChangeTracker:
 
         is_flat = "tables" in config and isinstance(config.get("tables"), list)
         base: Optional[str] = None
+        cfg_parquet_compression: Optional[str] = None
+        cfg_parquet_compression_level: Optional[int] = None
+        cfg_row_group_size: Optional[int] = None
 
         if is_flat:
             server = expand_env(config.get("server", ""))
@@ -476,6 +446,7 @@ class ChangeTracker:
             cfg_manifest = config.get("output_manifest")
             cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
+            cfg_output_format = None
         else:
             conn_cfg = config.get("connection", {})
             server = expand_env(conn_cfg.get("server", ""))
@@ -498,6 +469,10 @@ class ChangeTracker:
                 cfg_manifest = storage.get("output_manifest")
             cfg_workers = config.get("max_workers") or config.get("parallelism")
             cfg_snapshot = config.get("snapshot_isolation")
+            cfg_output_format = storage.get("output_format")
+            cfg_parquet_compression = storage.get("parquet_compression")
+            cfg_parquet_compression_level = storage.get("parquet_compression_level")
+            cfg_row_group_size = storage.get("row_group_size")
 
         ct = cls(
             server=server,
@@ -512,6 +487,10 @@ class ChangeTracker:
                 else bool(cfg_snapshot)
             ),
             output_manifest=output_manifest or cfg_manifest,
+            output_format=cfg_output_format or DEFAULT_OUTPUT_FORMAT,
+            parquet_compression=cfg_parquet_compression or DEFAULT_PARQUET_COMPRESSION,
+            parquet_compression_level=cfg_parquet_compression_level,
+            row_group_size=cfg_row_group_size if cfg_row_group_size is not None else DEFAULT_ROW_GROUP_SIZE,
         )
         if not is_flat and base:
             ct.ingest_pipeline = base
@@ -528,8 +507,7 @@ class ChangeTracker:
         """The current ``{database: {schema: tables}}`` mapping.
 
         *tables* can be a list of names (no per-table mode) or a dict
-        mapping each name to ``"full"``, ``"incremental"``, or
-        ``"full_incremental"``.
+        mapping each name to ``"full_incremental"`` or ``"incremental"``.
         """
         return self._table_map
 
@@ -570,13 +548,6 @@ class ChangeTracker:
         """
         return self._run_sync(mode_override=None)
 
-    def full_load(self) -> List[dict]:
-        """Full-sync every table (ignores per-table modes).
-
-        Returns a list of per-table result dicts.
-        """
-        return self._run_sync(mode_override="full")
-
     def incremental_load(self) -> List[dict]:
         """Incremental-sync every table (ignores per-table modes).
 
@@ -611,6 +582,20 @@ class ChangeTracker:
                 manifest["ingest_pipeline"] = self.ingest_pipeline
             manifest_save(self.output_manifest, manifest)
             logger.debug("Updated output manifest %s", self.output_manifest)
+
+            if self.ingest_pipeline is not None:
+                inc_path = os.path.join(self.ingest_pipeline, "incremental_output.yaml")
+                try:
+                    incremental_output_write(
+                        results,
+                        self.output_dir,
+                        getattr(self.writer, "file_type", "parquet"),
+                        inc_path,
+                        uc_metadata=self._uc_metadata,
+                        ingest_pipeline=self.ingest_pipeline,
+                    )
+                except Exception as inc_exc:
+                    logger.warning("Failed to write incremental output %s: %s", inc_path, inc_exc)
         except Exception as exc:
             logger.warning("Failed to update output manifest %s: %s", self.output_manifest, exc)
 
@@ -629,10 +614,12 @@ class ChangeTracker:
 
     def _run_sync_sequential(self, mode_override: Optional[str]) -> List[dict]:
         conns: Dict[str, Any] = {}
+        skip_cache: Dict[str, Set[str]] = {}
+        metadata_cache: Dict[str, Dict[str, Any]] = {}
         results: List[dict] = []
 
         try:
-            for database, full_table_name, table_mode, scd_type in self._flat_tables:
+            for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
                 if database not in conns:
                     try:
                         az = AzureSQLConnection(
@@ -646,8 +633,41 @@ class ChangeTracker:
                         )
                         results.append(self._error_result(database, full_table_name, exc))
                         continue
+                    try:
+                        metadata_cache[database] = _fetch_db_metadata(conns[database])
+                    except Exception as exc:
+                        logger.warning(
+                            "Batch metadata fetch failed for %s, "
+                            "falling back to per-table queries: %s",
+                            database, exc,
+                        )
+                        metadata_cache[database] = {}
+                    db_entries = [
+                        e for e in self._flat_tables
+                        if e[0] == database
+                    ]
+                    db_meta = metadata_cache.get(database) or None
+                    skip_cache[database] = _compute_tables_to_skip(
+                        database,
+                        conns[database],
+                        db_entries,
+                        self.watermark_dir,
+                        mode_override,
+                        db_metadata=db_meta,
+                    )
 
                 mode = mode_override or table_mode or "full_incremental"
+                if full_table_name in skip_cache.get(database, set()):
+                    results.append(_skipped_result(database, full_table_name))
+                    continue
+
+                uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
+                db_meta = metadata_cache.get(database, {})
+                tracked_lookup = db_meta.get("tracked_lookup")
+                resolved_name = (
+                    queries.resolve_table(full_table_name, tracked_lookup)
+                    if tracked_lookup else None
+                )
                 try:
                     results.append(
                         sync_table(
@@ -661,11 +681,25 @@ class ChangeTracker:
                             batch_size=self.batch_size,
                             snapshot_isolation=self.snapshot_isolation,
                             scd_type=scd_type,
+                            uc_catalog=uc_catalog,
+                            soft_delete=soft_delete,
+                            tracked_lookup=tracked_lookup,
+                            db_version=db_meta.get("db_version"),
+                            min_ver=(
+                                db_meta["tables"].get(resolved_name, 0)
+                                if db_meta.get("tables") and resolved_name
+                                else None
+                            ),
+                            pk_cols=(
+                                db_meta["pk_map"].get(resolved_name)
+                                if db_meta.get("pk_map") and resolved_name
+                                else None
+                            ),
                         )
                     )
                 except Exception as exc:
-                    logger.error(
-                        "Failed to sync %s.%s: %s", database, full_table_name, exc,
+                    logger.exception(
+                        "Failed to sync %s.%s", database, full_table_name,
                     )
                     results.append(self._error_result(database, full_table_name, exc, mode))
         finally:
@@ -683,6 +717,8 @@ class ChangeTracker:
         full_table_name: str,
         mode: str,
         scd_type: int,
+        soft_delete: bool = False,
+        db_metadata: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Sync a single table using a connection from *pool*. Thread-safe."""
         try:
@@ -691,6 +727,13 @@ class ChangeTracker:
             logger.error("Failed to connect to %s: %s", database, exc)
             return self._error_result(database, full_table_name, exc)
 
+        uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
+        db_meta = db_metadata or {}
+        tracked_lookup = db_meta.get("tracked_lookup")
+        resolved_name = (
+            queries.resolve_table(full_table_name, tracked_lookup)
+            if tracked_lookup else None
+        )
         try:
             result = sync_table(
                 conn,
@@ -703,34 +746,103 @@ class ChangeTracker:
                 batch_size=self.batch_size,
                 snapshot_isolation=self.snapshot_isolation,
                 scd_type=scd_type,
+                uc_catalog=uc_catalog,
+                soft_delete=soft_delete,
+                tracked_lookup=tracked_lookup,
+                db_version=db_meta.get("db_version"),
+                min_ver=(
+                    db_meta["tables"].get(resolved_name, 0)
+                    if db_meta.get("tables") and resolved_name
+                    else None
+                ),
+                pk_cols=(
+                    db_meta["pk_map"].get(resolved_name)
+                    if db_meta.get("pk_map") and resolved_name
+                    else None
+                ),
             )
             pool.release(database, az)
             return result
         except Exception as exc:
-            logger.error("Failed to sync %s.%s: %s", database, full_table_name, exc)
+            logger.exception("Failed to sync %s.%s", database, full_table_name)
             az.close()
             return self._error_result(database, full_table_name, exc, mode)
 
     def _run_sync_parallel(self, mode_override: Optional[str]) -> List[dict]:
         logger.info("Parallel sync with max_workers=%d", self.max_workers)
 
-        work: List[Tuple[int, str, str, str, int]] = []
-        for idx, (database, full_table_name, table_mode, scd_type) in enumerate(
+        work: List[Tuple[int, str, str, str, int, bool]] = []
+        for idx, (database, full_table_name, table_mode, scd_type, soft_delete) in enumerate(
             self._flat_tables
         ):
             mode = mode_override or table_mode or "full_incremental"
-            work.append((idx, database, full_table_name, mode, scd_type))
+            work.append((idx, database, full_table_name, mode, scd_type, soft_delete))
 
         results: List[Optional[dict]] = [None] * len(work)
         conn_pool = _ConnectionPool(self.server, self.user, self._password)
+
+        skip_set: Set[Tuple[str, str]] = set()
+        db_entries: Dict[str, List[FlatEntry]] = {}
+        for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
+            db_entries.setdefault(database, []).append(
+                (database, full_table_name, table_mode, scd_type, soft_delete),
+            )
+
+        metadata_cache: Dict[str, Dict[str, Any]] = {}
+        metadata_lock = threading.Lock()
+
+        def _check_db(database: str, entries: List[FlatEntry]) -> Set[str]:
+            try:
+                az, conn = conn_pool.acquire(database)
+                try:
+                    db_meta = _fetch_db_metadata(conn)
+                except Exception as exc:
+                    logger.warning(
+                        "Batch metadata fetch failed for %s, "
+                        "falling back to per-table queries: %s",
+                        database, exc,
+                    )
+                    db_meta = {}
+                with metadata_lock:
+                    metadata_cache[database] = db_meta
+                to_skip = _compute_tables_to_skip(
+                    database, conn, entries,
+                    self.watermark_dir, mode_override,
+                    db_metadata=db_meta or None,
+                )
+                conn_pool.release(database, az)
+                return to_skip
+            except Exception as exc:
+                logger.warning(
+                    "Change check failed for %s, syncing all tables: %s",
+                    database, exc,
+                )
+                return set()
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as check_executor:
+            check_futures = {
+                check_executor.submit(_check_db, db, entries): db
+                for db, entries in db_entries.items()
+            }
+            for future in as_completed(check_futures):
+                db = check_futures[future]
+                for tbl in future.result():
+                    skip_set.add((db, tbl))
+
+        for idx, db, tbl, mode, scd, sd in work:
+            if (db, tbl) in skip_set:
+                results[idx] = _skipped_result(db, tbl)
+
+        work_to_run = [(idx, db, tbl, mode, scd, sd) for idx, db, tbl, mode, scd, sd in work if (db, tbl) not in skip_set]
 
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_idx = {
                     executor.submit(
-                        self._sync_one_table, conn_pool, db, tbl, mode, scd,
+                        self._sync_one_table, conn_pool, db, tbl, mode, scd, sd,
+                        db_metadata=metadata_cache.get(db),
                     ): idx
-                    for idx, db, tbl, mode, scd in work
+                    for idx, db, tbl, mode, scd, sd in work_to_run
                 }
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
