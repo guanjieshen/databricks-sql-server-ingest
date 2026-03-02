@@ -130,6 +130,10 @@ def _make_cursor(tracked, cur_ver, min_ver, pk_cols, rows, desc, table_cols=None
 
     cursor.description = desc
 
+    _fake_conn = MagicMock()
+    _fake_conn.cursor.return_value = cursor
+    cursor.connection = _fake_conn
+
     return cursor
 
 

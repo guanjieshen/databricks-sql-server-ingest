@@ -324,67 +324,7 @@ def _sync_table_locked(
         duration_seconds=elapsed,
     )
 
-    try:
-        columns = queries.column_metadata(cur, full_name)
-    except Exception:
-        logger.debug(
-            "INFORMATION_SCHEMA lookup failed for %s.%s; "
-            "falling back to cursor.description",
-            database, full_name,
-        )
-        columns = columns_from_description(description)
-
-    existing_schema = schema.load(wm_dir)
-    schema_changed = False
-    if existing_schema:
-        existing_by_name = {
-            c["name"]: c for c in existing_schema.get("columns", [])
-        }
-        incoming_names = {c["name"] for c in columns}
-        existing_names = set(existing_by_name)
-
-        added = incoming_names - existing_names
-        removed = existing_names - incoming_names
-        type_changed = [
-            (c["name"], existing_by_name[c["name"]]["type"], c["type"])
-            for c in columns
-            if c["name"] in existing_by_name
-            and c.get("type") != existing_by_name[c["name"]].get("type")
-        ]
-
-        if added or removed or type_changed:
-            schema_changed = True
-            logger.warning(
-                "Schema change detected for %s.%s (version %d -> %d)",
-                database, full_name,
-                existing_schema.get("schema_version", 0), schema_ver,
-            )
-            if added:
-                logger.warning("  Columns added: %s", sorted(added))
-            if removed:
-                logger.warning(
-                    "  Columns removed (retained as null): %s", sorted(removed),
-                )
-            for col_name, old_type, new_type in type_changed:
-                logger.warning(
-                    "  Column %r type changed: %s -> %s",
-                    col_name, old_type, new_type,
-                )
-        elif schema_ver != existing_schema.get("schema_version"):
-            logger.info(
-                "Schema version changed for %s.%s (%d -> %d) "
-                "but columns unchanged",
-                database, full_name,
-                existing_schema.get("schema_version", 0), schema_ver,
-            )
-
-    schema.save(wm_dir, columns, schema_ver)
-
-    logger.info(
-        "%s.%s: %d rows written, watermark -> %d (%.1fs)",
-        database, full_name, row_count, cur_ver, elapsed,
-    )
-    return {
+    result = {
         "database": database,
         "table": full_name,
         "mode": actual_mode,
@@ -396,7 +336,80 @@ def _sync_table_locked(
         "files": output_files,
         "duration_seconds": round(elapsed, 2),
         "primary_key": pk_cols,
-        "columns": columns,
+        "columns": [],
         "schema_version": schema_ver,
-        "schema_changed": schema_changed,
+        "schema_changed": False,
     }
+
+    try:
+        try:
+            meta_cur = cur.connection.cursor()
+            columns = queries.column_metadata(meta_cur, full_name)
+        except Exception:
+            logger.debug(
+                "INFORMATION_SCHEMA lookup failed for %s.%s; "
+                "falling back to cursor.description",
+                database, full_name,
+            )
+            columns = columns_from_description(description)
+
+        existing_schema = schema.load(wm_dir)
+        schema_changed = False
+        if existing_schema:
+            existing_by_name = {
+                c["name"]: c for c in existing_schema.get("columns", [])
+            }
+            incoming_names = {c["name"] for c in columns}
+            existing_names = set(existing_by_name)
+
+            added = incoming_names - existing_names
+            removed = existing_names - incoming_names
+            type_changed = [
+                (c["name"], existing_by_name[c["name"]]["type"], c["type"])
+                for c in columns
+                if c["name"] in existing_by_name
+                and c.get("type") != existing_by_name[c["name"]].get("type")
+            ]
+
+            if added or removed or type_changed:
+                schema_changed = True
+                logger.warning(
+                    "Schema change detected for %s.%s (version %d -> %d)",
+                    database, full_name,
+                    existing_schema.get("schema_version", 0), schema_ver,
+                )
+                if added:
+                    logger.warning("  Columns added: %s", sorted(added))
+                if removed:
+                    logger.warning(
+                        "  Columns removed (retained as null): %s", sorted(removed),
+                    )
+                for col_name, old_type, new_type in type_changed:
+                    logger.warning(
+                        "  Column %r type changed: %s -> %s",
+                        col_name, old_type, new_type,
+                    )
+            elif schema_ver != existing_schema.get("schema_version"):
+                logger.info(
+                    "Schema version changed for %s.%s (%d -> %d) "
+                    "but columns unchanged",
+                    database, full_name,
+                    existing_schema.get("schema_version", 0), schema_ver,
+                )
+
+        schema.save(wm_dir, columns, schema_ver)
+        result["columns"] = columns
+        result["schema_changed"] = schema_changed
+    except Exception as exc:
+        logger.warning(
+            "Post-sync metadata update failed for %s.%s: %s "
+            "(data was written successfully)",
+            database, full_name, exc,
+        )
+        result["columns"] = columns_from_description(description) if description else []
+
+    logger.info(
+        "%s.%s: %d rows written, watermark -> %d (%.1fs)",
+        database, full_name, row_count, cur_ver, elapsed,
+    )
+    return result
