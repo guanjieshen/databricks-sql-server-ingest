@@ -1,4 +1,3 @@
-# Databricks notebook source
 """Materialized landing pipeline for the unified bronze schema.
 
 Materializes landing_raw as a temporary Delta table instead of a view.
