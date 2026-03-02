@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -12,6 +13,14 @@ from ._constants import (
     DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE,
     VALID_MODES, VALID_SCD_TYPES,
 )
+
+_SECRETS_RE = re.compile(r"\{\{secrets/([^/]+)/([^}]+)\}\}")
+
+
+def _get_dbutils() -> Any:
+    """Return the Databricks ``dbutils`` object, or ``None`` outside a runtime."""
+    main = sys.modules.get("__main__")
+    return getattr(main, "dbutils", None) if main else None
 
 
 def expand_env(value: str) -> str:
@@ -27,6 +36,36 @@ def expand_env(value: str) -> str:
         return os.environ[name]
 
     return re.sub(r"\$\{(\w+)}", _repl, str(value))
+
+
+def resolve_secrets(value: str) -> str:
+    """Resolve ``{{secrets/<scope>/<key>}}`` references via ``dbutils``.
+
+    Raises :class:`RuntimeError` if a secret reference is found but
+    ``dbutils`` is not available (i.e. running outside a Databricks runtime).
+    """
+    value = str(value)
+    if not _SECRETS_RE.search(value):
+        return value
+
+    dbutils = _get_dbutils()
+    if dbutils is None:
+        raise RuntimeError(
+            "{{secrets/…}} references require a Databricks runtime "
+            "(dbutils is not available). Use ${ENV_VAR} syntax for "
+            "local development, or run this job on Databricks."
+        )
+
+    def _repl(m: re.Match) -> str:
+        scope, key = m.group(1), m.group(2)
+        return dbutils.secrets.get(scope=scope, key=key)
+
+    return _SECRETS_RE.sub(_repl, value)
+
+
+def resolve_value(value: str) -> str:
+    """Resolve both ``{{secrets/…}}`` and ``${VAR}`` references in *value*."""
+    return expand_env(resolve_secrets(value))
 
 
 def _load_config_file(path: Union[str, Path]) -> dict:

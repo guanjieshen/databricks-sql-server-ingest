@@ -324,3 +324,26 @@ class TestFromConfig:
         by_table = {t[1]: t for t in ct._flat_tables}
         assert by_table["dbo.t1"][4] is True
         assert by_table["dbo.t2"][4] is False
+
+    def test_from_config_resolves_databricks_secrets(self):
+        mock_main = MagicMock()
+        mock_main.dbutils.secrets.get.return_value = "resolved_pw"
+        with patch.dict(sys.modules, {"__main__": mock_main}):
+            ct = ChangeTracker.from_config({
+                "connection": {
+                    "server": "srv",
+                    "sql_login": "u",
+                    "password": "{{secrets/my-scope/my-key}}",
+                },
+                "databases": {
+                    "db1": {
+                        "schemas": {
+                            "dbo": {"tables": {"t1": "full_incremental"}},
+                        },
+                    },
+                },
+            })
+        assert ct._password == "resolved_pw"
+        mock_main.dbutils.secrets.get.assert_called_once_with(
+            scope="my-scope", key="my-key",
+        )

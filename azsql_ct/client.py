@@ -61,7 +61,7 @@ from ._constants import (
     DEFAULT_ROW_GROUP_SIZE,
 )
 from .config import (
-    expand_env, _load_config_file, _normalize_table_map,
+    expand_env, resolve_value, _load_config_file, _normalize_table_map,
     _extract_uc_metadata, _flat_config_to_table_map,
     TableMap, FlatEntry,
     _flatten_table_map, _validate_table_map,
@@ -437,9 +437,9 @@ class ChangeTracker:
         cfg_row_group_size: Optional[int] = None
 
         if is_flat:
-            server = expand_env(config.get("server", ""))
-            user = expand_env(config.get("user", ""))
-            password = expand_env(config.get("password", ""))
+            server = resolve_value(config.get("server", ""))
+            user = resolve_value(config.get("user", ""))
+            password = resolve_value(config.get("password", ""))
             table_map = _flat_config_to_table_map(config["tables"])
             cfg_output = config.get("output_dir")
             cfg_watermark = config.get("watermark_dir")
@@ -449,11 +449,11 @@ class ChangeTracker:
             cfg_output_format = None
         else:
             conn_cfg = config.get("connection", {})
-            server = expand_env(conn_cfg.get("server", ""))
-            user = expand_env(
+            server = resolve_value(conn_cfg.get("server", ""))
+            user = resolve_value(
                 conn_cfg.get("sql_login", conn_cfg.get("user", ""))
             )
-            password = expand_env(conn_cfg.get("password", ""))
+            password = resolve_value(conn_cfg.get("password", ""))
             raw_databases = config.get("databases", {})
             uc_metadata = _extract_uc_metadata(raw_databases)
             table_map = _normalize_table_map(raw_databases)

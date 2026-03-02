@@ -54,7 +54,7 @@ databases:
 |-------|----------|-------------|
 | `connection.server` | Yes | SQL Server hostname |
 | `connection.sql_login` | Yes | Login name |
-| `connection.password` | Yes | Password (supports `${VAR}` env expansion) |
+| `connection.password` | Yes | Password (supports `${VAR}` env expansion and `{{secrets/scope/key}}` Databricks secrets) |
 | `parallelism` | No | Tables synced in parallel (default: 1) |
 | `storage.ingest_pipeline` | Yes | Root directory for data, watermarks, and output manifest |
 | `storage.output_format` | No | `per_table` (default) or `unified` |
@@ -63,6 +63,29 @@ databases:
 | `tables.<t>.mode` | No | `full`, `incremental`, or `full_incremental` (default) |
 | `tables.<t>.scd_type` | No | `1` (default, overwrite) or `2` (historical tracking) |
 | `tables.<t>.soft_delete` | No | `true` to keep deleted rows with `_is_deleted` flag |
+
+#### Databricks secrets
+
+Connection fields (`server`, `sql_login`, `password`) support `{{secrets/<scope>/<key>}}` references that are resolved at runtime via `dbutils.secrets.get()`. This keeps credentials out of config files and environment variables entirely.
+
+```yaml
+connection:
+  server: my-server.database.windows.net
+  sql_login: sync_user
+  password: "{{secrets/my-scope/sql-password}}"
+```
+
+**Setup:**
+
+1. Create a secret scope and store the password using the Databricks CLI:
+   ```bash
+   databricks secrets create-scope my-scope
+   databricks secrets put-secret --json '{"scope": "my-scope", "key": "sql-password", "string_value": "<password>"}'
+   ```
+2. Reference the secret in your pipeline YAML as shown above.
+3. Run the sync job on Databricks — `dbutils` is available automatically.
+
+> The `{{secrets/…}}` syntax requires a Databricks runtime. If used outside Databricks (e.g. local development), the config loader raises a `RuntimeError`. Use `${ENV_VAR}` expansion for local runs instead.
 
 ### Step 2 — Generate DAB resources
 
