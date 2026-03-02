@@ -89,7 +89,7 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                     },
                     "libraries": [
                         {"notebook": {"path": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized"}},
-                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/metadata_helper.py"}},
+                        {"notebook": {"path": f"{ws}/lakeflow_pipeline/metadata_helper"}},
                     ],
                     "schema": "default",
                     "photon": True,
