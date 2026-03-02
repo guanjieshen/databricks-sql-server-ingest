@@ -2,9 +2,6 @@ bundle:
   name: sql-server-ct
 
 variables:
-  workspace_root:
-    description: Workspace path where the repo lives (e.g. Repos path or bundle sync destination). Used by jobs and pipeline for scripts and config paths.
-    default: ""
   catalog:
     description: Unity Catalog name for DLT pipelines.
     default: guanjiemar1
@@ -15,12 +12,8 @@ variables:
 targets:
   dev:
     mode: development
-    variables:
-      workspace_root: ""
   prod:
     mode: production
-    variables:
-      workspace_root: ""
 
 include:
   - resources/pipelines/*.yml

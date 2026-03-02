@@ -16,6 +16,11 @@ import argparse
 import sys
 from pathlib import Path
 
+try:
+    _SCRIPT_PATH: Path | None = Path(__file__)
+except NameError:
+    _SCRIPT_PATH = None
+
 
 def _repo_root(start: Path | None = None) -> Path:
     """Infer repo root.
@@ -67,7 +72,7 @@ def _pipeline_key(base: str) -> str:
 def _pipeline_resource(base_name: str, config_filename: str) -> dict:
     """Build the DLT pipeline resource dict wrapped in resources.pipelines."""
     pk = _pipeline_key(base_name)
-    ws = "${var.workspace_root}"
+    ws = "${workspace.root_path}"
     return {
         "resources": {
             "pipelines": {
@@ -96,7 +101,7 @@ def _job_resource(base_name: str, config_filename: str) -> dict:
     """Build the job resource dict wrapped in resources.jobs."""
     jk = _job_key(base_name)
     pk = _pipeline_key(base_name)
-    config_path = f"${{var.workspace_root}}/pipelines/{config_filename}"
+    config_path = f"${{workspace.root_path}}/pipelines/{config_filename}"
     pipeline_ref = f"${{resources.pipelines.{pk}.id}}"
     return {
         "resources": {
@@ -107,7 +112,7 @@ def _job_resource(base_name: str, config_filename: str) -> dict:
                         {
                             "task_key": "gateway",
                             "spark_python_task": {
-                                "python_file": "${var.workspace_root}/scripts/sync.py",
+                                "python_file": "${workspace.root_path}/scripts/sync.py",
                                 "parameters": [config_path],
                             },
                             "environment_key": "Task_environment",
@@ -201,12 +206,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate DAB pipeline + job resources from pipelines/ (1:1)."
     )
-    _in_notebook = False
-    try:
-        repo = _repo_root(Path(__file__))
-    except NameError:
-        _in_notebook = True
-        repo = _repo_root()
+    repo = _repo_root(_SCRIPT_PATH)
     parser.add_argument(
         "--pipelines-dir",
         type=Path,
@@ -229,7 +229,7 @@ def main() -> int:
         action="store_true",
         help="Print what would be written/removed without making changes",
     )
-    args = parser.parse_args([] if _in_notebook else None)
+    args = parser.parse_args([] if _SCRIPT_PATH is None else None)
 
     pipelines_dir = args.pipelines_dir.resolve()
     resources_dir = args.resources_dir.resolve()
@@ -281,4 +281,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _rc = main()
+    if _SCRIPT_PATH is not None:
+        raise SystemExit(_rc)

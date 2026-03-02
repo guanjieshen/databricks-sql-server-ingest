@@ -4,20 +4,7 @@ This directory defines a Databricks Asset Bundle with **1:1 mapping**: one DLT p
 
 ## Workspace path
 
-Set **`workspace_root`** to the workspace path where this repo lives so job tasks and the pipeline resolve scripts and configs:
-
-- Job gateway task: `scripts/sync.py`, `pipelines/pipeline_1.yaml`
-- Pipeline: `lakeflow_pipeline/` code and `root_path`
-
-Examples:
-
-- **Repos**: `/Workspace/Repos/<folder>/<repo_name>` (or your Repos path)
-- **Synced workspace**: whatever path you use with bundle `sync` or manual upload
-
-Override options:
-
-- **Per target** in `databricks.yml`: under `targets.<name>.variables.workspace_root`
-- **CLI**: `databricks bundle deploy -t dev --var workspace_root=/Workspace/Repos/...`
+Workspace paths in generated resources use the DAB built-in `${workspace.root_path}`, which resolves automatically to the bundle's sync destination at deploy time. No manual configuration is needed.
 
 ## Validate and deploy
 
@@ -27,12 +14,6 @@ From the **repo root** (parent of `dab/`):
 cd dab
 databricks bundle validate -t dev
 databricks bundle deploy -t dev
-```
-
-Or with workspace_root set inline:
-
-```bash
-databricks bundle deploy -t dev --var workspace_root=/Workspace/Repos/my-org/sql_server_permissions
 ```
 
 ## Generating job resources from pipelines
@@ -54,7 +35,7 @@ You can run the generator in CI before `databricks bundle deploy` so the bundle 
 
 ## Layout
 
-- `databricks.yml` – bundle name, targets, `workspace_root` variable, `include` for resources
+- `databricks.yml` – bundle name, targets, variables, `include` for resources
 - `resources/pipelines/sdp_*.yml` – generated DLT pipeline resources; do not edit by hand
 - `resources/jobs/job_*.yml` – generated job resources; do not edit by hand
 
