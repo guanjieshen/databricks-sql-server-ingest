@@ -72,7 +72,7 @@ def _pipeline_key(base: str) -> str:
 def _pipeline_resource(base_name: str, config_filename: str) -> dict:
     """Build the DLT pipeline resource dict wrapped in resources.pipelines."""
     pk = _pipeline_key(base_name)
-    ws = "${workspace.root_path}"
+    ws = "${var.workspace_root}"
     return {
         "resources": {
             "pipelines": {
@@ -101,7 +101,7 @@ def _job_resource(base_name: str, config_filename: str) -> dict:
     """Build the job resource dict wrapped in resources.jobs."""
     jk = _job_key(base_name)
     pk = _pipeline_key(base_name)
-    config_path = f"${{workspace.root_path}}/pipelines/{config_filename}"
+    config_path = f"${{var.workspace_root}}/pipelines/{config_filename}"
     pipeline_ref = f"${{resources.pipelines.{pk}.id}}"
     return {
         "resources": {
@@ -112,7 +112,7 @@ def _job_resource(base_name: str, config_filename: str) -> dict:
                         {
                             "task_key": "gateway",
                             "spark_python_task": {
-                                "python_file": "${workspace.root_path}/scripts/sync.py",
+                                "python_file": "${var.workspace_root}/scripts/sync.py",
                                 "parameters": [config_path],
                             },
                             "environment_key": "Task_environment",

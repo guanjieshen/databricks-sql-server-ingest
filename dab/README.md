@@ -4,7 +4,15 @@ This directory defines a Databricks Asset Bundle with **1:1 mapping**: one DLT p
 
 ## Workspace path
 
-Workspace paths in generated resources use the DAB built-in `${workspace.root_path}`, which resolves automatically to the bundle's sync destination at deploy time. No manual configuration is needed.
+Set **`workspace_root`** to the workspace path where the **full repo** lives so jobs and pipelines can resolve scripts, configs, and pipeline code that live outside the `dab/` bundle root:
+
+- Job gateway task: `scripts/sync.py`, `pipelines/pipeline_1.yaml`
+- Pipeline: `lakeflow_pipeline/` code and `root_path`
+
+Override options:
+
+- **Per target** in `databricks.yml`: under `targets.<name>.variables.workspace_root`
+- **CLI**: `databricks bundle deploy -t dev --var workspace_root=/Workspace/Repos/...`
 
 ## Validate and deploy
 
@@ -13,7 +21,7 @@ From the **repo root** (parent of `dab/`):
 ```bash
 cd dab
 databricks bundle validate -t dev
-databricks bundle deploy -t dev
+databricks bundle deploy -t dev --var workspace_root=/Workspace/Repos/my-org/databricks-sql-server-ingest
 ```
 
 ## Generating job resources from pipelines

@@ -7,9 +7,9 @@ resources:
       tasks:
       - task_key: gateway
         spark_python_task:
-          python_file: ${workspace.root_path}/scripts/sync.py
+          python_file: ${var.workspace_root}/scripts/sync.py
           parameters:
-          - ${workspace.root_path}/pipelines/pipeline_1.yaml
+          - ${var.workspace_root}/pipelines/pipeline_1.yaml
         environment_key: Task_environment
       - task_key: check_record_changed
         depends_on:
