@@ -204,7 +204,7 @@ def sync_table(
 
     with _TableLock(wm_dir):
         return _sync_table_locked(
-            cur, full_name, database, data_dir, wm_dir,
+            conn, cur, full_name, database, data_dir, wm_dir,
             mode=mode, writer=writer, batch_size=batch_size,
             snapshot_isolation=snapshot_isolation,
             scd_type=scd_type,
@@ -214,6 +214,7 @@ def sync_table(
 
 
 def _sync_table_locked(
+    conn: Any,
     cur: Any,
     full_name: str,
     database: str,
@@ -256,13 +257,15 @@ def _sync_table_locked(
 
     do_full = mode == "full" or (mode == "full_incremental" and is_initial)
 
+    data_cur = conn.cursor()
+
     if snapshot_isolation:
-        cur.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
+        data_cur.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
 
     if do_full:
         logger.info("Full sync for %s.%s (version %d)", database, full_name, cur_ver)
         sql = queries.build_full_query(full_name)
-        cur.execute(sql)
+        data_cur.execute(sql)
         actual_mode = "full"
     else:
         if not pk_cols:
@@ -276,7 +279,7 @@ def _sync_table_locked(
             "Incremental sync for %s.%s (since version %d)",
             database, full_name, since,
         )
-        cur.execute(sql, (since,))
+        data_cur.execute(sql, (since,))
         actual_mode = "incremental"
 
     day_dir = os.path.join(data_dir, date.today().isoformat())
@@ -284,9 +287,9 @@ def _sync_table_locked(
 
     _clean_temp_files(day_dir)
 
-    description = cur.description
+    description = data_cur.description
     safe_name = full_name.replace(".", "_")
-    row_iter = _iter_cursor(cur, batch_size)
+    row_iter = _iter_cursor(data_cur, batch_size)
 
     schema_name, table_only = full_name.split(".", 1)
     schema_ver = _compute_schema_version(description) if description else 0
@@ -343,7 +346,7 @@ def _sync_table_locked(
 
     try:
         try:
-            meta_cur = cur.connection.cursor()
+            meta_cur = conn.cursor()
             columns = queries.column_metadata(meta_cur, full_name)
         except Exception:
             logger.debug(
