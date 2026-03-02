@@ -677,3 +677,63 @@ class TestColumnMetadataIntegration:
         type_map = {c["name"]: c["type"] for c in result["columns"]}
         assert type_map["id"] == "int"
         assert type_map["name"] == "nvarchar"
+
+
+class TestPostSyncMetadataFailure:
+    """When post-write schema operations fail, rows_written must be preserved."""
+
+    def test_rows_written_preserved_when_schema_save_fails(self, tmp_path):
+        """Even if schema.save raises, the result dict has the correct row count."""
+        desc = [
+            ("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+            ("SYS_CHANGE_OPERATION",), ("id",), ("name",),
+        ]
+        rows = [(100, None, "L", 1, "Alice"), (100, None, "L", 2, "Bob")]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with patch("azsql_ct.sync.schema.save", side_effect=OSError(29, "Illegal seek")):
+            result = sync_table(
+                conn, "dbo.Foo", database="db1",
+                output_dir=str(tmp_path / "data"),
+                watermark_dir=str(tmp_path / "wm"),
+                mode="full_incremental", writer=StubWriter(),
+            )
+
+        assert result["rows_written"] == 2
+        assert result["mode"] == "full"
+        assert result["current_version"] == 100
+        assert "status" not in result  # not an error result
+        assert isinstance(result["columns"], list)
+
+    def test_rows_written_preserved_when_column_metadata_and_schema_fail(self, tmp_path):
+        """Both column_metadata and schema.save fail; row count still correct."""
+        desc = [
+            ("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+            ("SYS_CHANGE_OPERATION",), ("id",),
+        ]
+        rows = [(50, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.T"], cur_ver=50, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with patch("azsql_ct.sync.queries.column_metadata", side_effect=RuntimeError("fail")), \
+             patch("azsql_ct.sync.schema.save", side_effect=OSError(29, "Illegal seek")):
+            result = sync_table(
+                conn, "dbo.T", database="db1",
+                output_dir=str(tmp_path / "data"),
+                watermark_dir=str(tmp_path / "wm"),
+                mode="full_incremental", writer=StubWriter(),
+            )
+
+        assert result["rows_written"] == 1
+        assert "status" not in result
+        col_names = [c["name"] for c in result["columns"]]
+        assert "id" in col_names
