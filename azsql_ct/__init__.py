@@ -4,6 +4,7 @@ from .client import ChangeTracker
 from .config import expand_env, resolve_secrets, resolve_value
 from .connection import AzureSQLConnection, get_connection
 from .sync import sync_table
+from .sync_log import write_sync_log
 from .writer import OutputWriter, ParquetWriter, UnifiedParquetWriter, WriteResult
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "AzureSQLConnection",
     "get_connection",
     "sync_table",
+    "write_sync_log",
     "ParquetWriter",
     "UnifiedParquetWriter",
     "OutputWriter",

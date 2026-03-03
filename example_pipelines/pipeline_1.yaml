@@ -5,11 +5,20 @@ connection:
 
 
 # Number of tables to sync in parallel (default: 1 = sequential).
-parallelism: 4
+parallelism: 12
+
+# Identifies this pipeline instance in the shared sync log.
+# Defaults to the config filename without extension (pipeline_1.yaml -> pipeline_1).
+# pipeline_id: pipeline_1
 
 # Single directory for this pipeline: data, watermarks, and output manifest are written under it.
 storage:
   ingest_pipeline: INSERT_UC_VOLUME_PATH_HERE
+
+# Shared sync log — multiple pipelines can safely write here concurrently.
+# Each run appends one Parquet file; no locking or coordination required.
+logging:
+  sync_log_dir: INSERT_UC_VOLUME_PATH_HERE/logs/sync_log
   # output_format: per_table              # (default) native Parquet per table
   # output_format: unified                # Lakeflow-Connect-style bronze envelope schema
   # parquet_compression: zstd             # (default) or snappy, gzip, brotli, lz4, none
