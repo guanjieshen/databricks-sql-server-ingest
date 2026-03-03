@@ -1,0 +1,42 @@
+connection:
+  server: guanjiesqldb.database.windows.net
+  sql_login: sqladmin
+  password: "{{secrets/sql-ingestion/guanjiesqldb}}"
+
+
+# Number of tables to sync in parallel (default: 1 = sequential).
+parallelism: 12
+
+# Single directory for this pipeline: data, watermarks, and output manifest are written under it.
+storage:
+  ingest_pipeline: /Volumes/gshen_sqlserver_ct/default/ct/test_pipeline
+  output_format: unified
+
+logging:
+  sync_log_dir: /Volumes/gshen_sqlserver_ct/default/ct/logs
+
+
+databases:
+  database_2:
+    uc_catalog: gshen_sqlserver_ct
+    schemas:
+      dbo:
+        uc_schema: database_dbo_test_pipeline
+        tables:
+          table_1:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: true
+          table_2:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: true
+          table_3:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: true
+          table_4:
+            mode: full_incremental
+            scd_type: 1
+            soft_delete: true
+
