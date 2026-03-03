@@ -49,7 +49,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from types import TracebackType
@@ -330,6 +332,8 @@ class ChangeTracker:
         parquet_compression: str = DEFAULT_PARQUET_COMPRESSION,
         parquet_compression_level: Optional[int] = None,
         row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+        sync_log_dir: Optional[str] = None,
+        pipeline_id: str = "unknown",
     ) -> None:
         self.server = server
         self.user = user
@@ -356,6 +360,9 @@ class ChangeTracker:
         self.snapshot_isolation = snapshot_isolation
         self.output_manifest = output_manifest
         self.ingest_pipeline: Optional[str] = None
+        self.sync_log_dir: Optional[str] = sync_log_dir
+        self.pipeline_id: str = pipeline_id
+        self._config_path: Optional[str] = None
         self._uc_metadata: Dict[str, Dict[str, Any]] = {}
 
         self._table_map: TableMap = {}
@@ -427,7 +434,9 @@ class ChangeTracker:
         """
         load_dotenv()
 
+        config_path: Optional[str] = None
         if isinstance(config, (str, Path)):
+            config_path = str(config)
             config = _load_config_file(config)
 
         is_flat = "tables" in config and isinstance(config.get("tables"), list)
@@ -474,6 +483,12 @@ class ChangeTracker:
             cfg_parquet_compression_level = storage.get("parquet_compression_level")
             cfg_row_group_size = storage.get("row_group_size")
 
+        logging_cfg = config.get("logging", {})
+        cfg_sync_log_dir = logging_cfg.get("sync_log_dir") if isinstance(logging_cfg, dict) else None
+        cfg_pipeline_id = config.get("pipeline_id")
+        if not cfg_pipeline_id and config_path:
+            cfg_pipeline_id = Path(config_path).stem
+
         ct = cls(
             server=server,
             user=user,
@@ -491,7 +506,10 @@ class ChangeTracker:
             parquet_compression=cfg_parquet_compression or DEFAULT_PARQUET_COMPRESSION,
             parquet_compression_level=cfg_parquet_compression_level,
             row_group_size=cfg_row_group_size if cfg_row_group_size is not None else DEFAULT_ROW_GROUP_SIZE,
+            sync_log_dir=cfg_sync_log_dir,
+            pipeline_id=cfg_pipeline_id or "unknown",
         )
+        ct._config_path = config_path
         if not is_flat and base:
             ct.ingest_pipeline = base
         if not is_flat:
@@ -561,13 +579,20 @@ class ChangeTracker:
                 "No tables configured. Set .tables before calling sync."
             )
 
+        run_id = str(uuid.uuid4())
+        run_started_at = datetime.now(timezone.utc)
+
         if self.max_workers > 1:
             results = self._run_sync_parallel(mode_override)
         else:
             results = self._run_sync_sequential(mode_override)
 
+        run_completed_at = datetime.now(timezone.utc)
+
         if self.output_manifest:
             self._update_output_manifest(results)
+        if self.sync_log_dir:
+            self._write_sync_log(results, run_id, run_started_at, run_completed_at)
         return results
 
     def _update_output_manifest(self, results: List[dict]) -> None:
@@ -598,6 +623,34 @@ class ChangeTracker:
                     logger.warning("Failed to write incremental output %s: %s", inc_path, inc_exc)
         except Exception as exc:
             logger.warning("Failed to update output manifest %s: %s", self.output_manifest, exc)
+
+    def _write_sync_log(
+        self,
+        results: List[dict],
+        run_id: str,
+        run_started_at: datetime,
+        run_completed_at: datetime,
+    ) -> None:
+        """Write a Parquet sync log file.  Never raises."""
+        if not self.sync_log_dir:
+            return
+        try:
+            from .sync_log import write_sync_log
+            write_sync_log(
+                self.sync_log_dir,
+                results,
+                run_id=run_id,
+                pipeline_id=self.pipeline_id,
+                run_started_at=run_started_at,
+                run_completed_at=run_completed_at,
+                server=self.server,
+                pipeline_config=self._config_path,
+                uc_metadata=self._uc_metadata,
+                ingest_pipeline=self.ingest_pipeline,
+                flat_tables=self._flat_tables,
+            )
+        except Exception as exc:
+            logger.warning("Failed to write sync log to %s: %s", self.sync_log_dir, exc)
 
     # -- helpers ------------------------------------------------------------
 
