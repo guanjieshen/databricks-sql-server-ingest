@@ -157,6 +157,10 @@ for tc in table_configs:
         name=silver_table_name,
         comment=f"Silver: SCD Type {scd_type} from {table_name}",
         table_properties={
+            "delta.columnMapping.mode": "name",
+            "delta.enableRowTracking": "true",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.universalFormat.enabledFormats": "iceberg",
             "delta.feature.timestampNtz": "supported",
             "delta.enableChangeDataFeed": "true",
         },
