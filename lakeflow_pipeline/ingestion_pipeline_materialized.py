@@ -6,6 +6,8 @@ skipping. For large table counts (50+) this avoids re-reading all
 Parquet N times.
 """
 
+from functools import lru_cache
+
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -68,20 +70,26 @@ MSSQL_TO_SPARK = {
 }
 
 
-def _build_spark_schema(columns):
+@lru_cache(maxsize=128)
+def _build_spark_schema_cached(cols_key: tuple) -> StructType:
+    fields = []
+    for name, type_name, precision, scale in cols_key:
+        spark_type = MSSQL_TO_SPARK.get(type_name, StringType())
+        if type_name in _DECIMAL_TYPES and precision is not None:
+            spark_type = DecimalType(precision, scale if scale is not None else 0)
+        fields.append(StructField(name, spark_type, nullable=True))
+    return StructType(fields)
+
+
+def _build_spark_schema(columns) -> StructType:
     """Build a StructType from schema.json columns list.
 
     Uses ``precision`` and ``scale`` from schema.json when available
     for decimal/numeric/money types; otherwise falls back to the
-    default in ``MSSQL_TO_SPARK``.
+    default in ``MSSQL_TO_SPARK``. Results are cached by column signature.
     """
-    fields = []
-    for c in columns:
-        spark_type = MSSQL_TO_SPARK.get(c["type"], StringType())
-        if c["type"] in _DECIMAL_TYPES and "precision" in c:
-            spark_type = DecimalType(c["precision"], c.get("scale", 0))
-        fields.append(StructField(c["name"], spark_type, nullable=True))
-    return StructType(fields)
+    key = tuple((c["name"], c["type"], c.get("precision"), c.get("scale")) for c in columns)
+    return _build_spark_schema_cached(key)
 
 
 # Load pipeline config and table metadata (including schema.json columns)

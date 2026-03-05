@@ -1,21 +1,12 @@
 import json
 import logging
 import os
-import uuid
 
 import yaml
 
+from _uoid import _make_uoid  # noqa: F401 — re-exported for callers
+
 logger = logging.getLogger(__name__)
-
-
-def _make_uoid(database: str, schema: str, table: str) -> str:
-    """Deterministic UUID5 matching azsql_ct.writer._make_uoid.
-
-    Uses null-byte separator so dotted identifiers like ("a.b", "c", "d")
-    and ("a", "b.c", "d") never collide. Must match writer._make_uoid.
-    """
-    key = f"{database}\x00{schema}\x00{table}"
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
 def _parse_manifest_to_configs(
@@ -123,23 +114,19 @@ def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
                 "incremental_output.yaml not found at %s, falling back to output.yaml",
                 primary_path,
             )
-            primary_path = fallback_path
         else:
             with open(primary_path, "r") as f:
                 output_config = yaml.safe_load(f) or {}
             result = _parse_manifest_to_configs(output_config, watermarks_path)
-            if not result:
-                logger.warning(
-                    "incremental_output.yaml contains no tables, falling back to output.yaml",
-                )
-                primary_path = fallback_path
-            else:
+            if result:
                 return result, data_path
+            logger.warning(
+                "incremental_output.yaml contains no tables, falling back to output.yaml",
+            )
 
-    if not os.path.exists(primary_path):
-        raise FileNotFoundError(f"{os.path.basename(primary_path)} not found at: {primary_path}")
+    if not os.path.exists(fallback_path):
+        raise FileNotFoundError(f"output.yaml not found at: {fallback_path}")
 
-    with open(primary_path, "r") as f:
+    with open(fallback_path, "r") as f:
         output_config = yaml.safe_load(f) or {}
-    result = _parse_manifest_to_configs(output_config, watermarks_path)
-    return result, data_path
+    return _parse_manifest_to_configs(output_config, watermarks_path), data_path

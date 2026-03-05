@@ -90,6 +90,7 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                     "libraries": [
                         {"glob": {"include": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
                         {"glob": {"include": f"{ws}/lakeflow_pipeline/metadata_helper.py"}},
+                        {"glob": {"include": f"{ws}/lakeflow_pipeline/_uoid.py"}},
                     ],
                     "schema": "default",
                     "photon": True,
