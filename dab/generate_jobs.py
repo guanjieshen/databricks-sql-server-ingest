@@ -97,6 +97,11 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                     "serverless": True,
                     "channel": "${var.pipeline_channel}",
                     "root_path": f"{ws}/lakeflow_pipeline",
+                    "event_log": {
+                        "name": f"event_log_{base_name}",
+                        "schema": "${var.event_log_schema}",
+                        "catalog": "${var.event_log_catalog}",
+                    },
                 }
             }
         }
