@@ -1,0 +1,87 @@
+flowchart TB
+    %% ── Source ─────────────────────────────────────────────────────────────
+    subgraph SRC["  Azure SQL Server  "]
+        direction TB
+        CT["Change Tracking enabled"]
+        TBL["Tables: orders · customers · …"]
+        CT --- TBL
+    end
+
+    %% ── Databricks Job ──────────────────────────────────────────────────────
+    subgraph JOB["  Databricks Job  —  scheduled  "]
+        direction TB
+        T1["Task 1 — gateway
+runs sync.py
+azsql_ct Python engine
+reads CHANGETABLE deltas"]
+        CHK{"Condition Check
+rows changed?"}
+        T3["Task 3 — ingestion
+triggers DLT pipeline"]
+        SKIP[" skip "]
+        T1 --> CHK
+        CHK -->|"Yes — proceed"| T3
+        CHK -->|"No — stop"| SKIP
+    end
+
+    %% ── Databricks Volume ───────────────────────────────────────────────────
+    subgraph VOL["  Databricks Volume  —  intermediate storage  "]
+        direction LR
+        PQ["/data/
+Parquet files
+bronze envelope format"]
+        WM["/watermarks/
+sync state · schema.json"]
+        YML["output.yaml
+table manifest"]
+    end
+
+    %% ── DLT Pipeline ────────────────────────────────────────────────────────
+    subgraph DLT["  Lakeflow DLT Pipeline  "]
+        direction TB
+        RAW["landing_raw
+Bronze Delta table
+Auto Loader ← Parquet"]
+        VIEWS["Per-table Views
+filter by uoid · parse JSON data column"]
+        SILVER["Silver Streaming Delta Tables
+auto CDC · SCD Type 1 or 2"]
+        RAW --> VIEWS --> SILVER
+    end
+
+    %% ── Unity Catalog ───────────────────────────────────────────────────────
+    subgraph UC["  Unity Catalog  "]
+        direction TB
+        DEST["{catalog}.{schema}.{table}
+Final Silver Tables"]
+    end
+
+    %% ── Data-flow edges ─────────────────────────────────────────────────────
+    TBL -->|"CHANGETABLE / CHANGE_TRACKING_VERSION"| T1
+    T1  -->|"write Parquet + watermarks"| VOL
+    T3  -->|"trigger"| DLT
+    VOL -->|"Auto Loader reads Parquet"| RAW
+    SILVER --> DEST
+
+    %% ── Styles ──────────────────────────────────────────────────────────────
+    classDef sourceStyle  fill:#1e6091,stroke:#154360,color:#ffffff
+    classDef jobStyle     fill:#d35400,stroke:#a04000,color:#ffffff
+    classDef condStyle    fill:#f39c12,stroke:#b7770d,color:#1a1a1a
+    classDef skipStyle    fill:#f5cba7,stroke:#e59866,color:#7b4e2a
+    classDef storageStyle fill:#1e8449,stroke:#145a32,color:#ffffff
+    classDef dltStyle     fill:#6c3483,stroke:#512e5f,color:#ffffff
+    classDef ucStyle      fill:#4a235a,stroke:#311740,color:#ffffff
+
+    class CT,TBL sourceStyle
+    class T1,T3 jobStyle
+    class CHK condStyle
+    class SKIP skipStyle
+    class PQ,WM,YML storageStyle
+    class RAW,VIEWS,SILVER dltStyle
+    class DEST ucStyle
+
+    style SRC fill:#d6eaf8,stroke:#1e6091,stroke-width:2px,color:#1a1a1a
+    style JOB fill:#fdebd0,stroke:#d35400,stroke-width:2px,color:#1a1a1a
+    style VOL fill:#d5f5e3,stroke:#1e8449,stroke-width:2px,color:#1a1a1a
+    style DLT fill:#e8daef,stroke:#6c3483,stroke-width:2px,color:#1a1a1a
+    style UC  fill:#d2b4de,stroke:#4a235a,stroke-width:2px,color:#1a1a1a
