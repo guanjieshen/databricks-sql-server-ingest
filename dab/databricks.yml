@@ -11,6 +11,9 @@ variables:
   manifest_file:
     description: "Manifest filename for SDP pipeline: 'output.yaml' (all synced tables) or 'incremental_output.yaml' (only tables changed in last sync; falls back to output.yaml if missing or empty)."
     default: incremental_output.yaml
+  pipeline_channel:
+    description: "Databricks pipeline channel: 'CURRENT' for stable or 'PREVIEW' for early access features."
+    default: PREVIEW
 
 targets:
   dev:

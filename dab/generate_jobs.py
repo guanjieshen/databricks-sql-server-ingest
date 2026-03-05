@@ -95,6 +95,7 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                     "photon": True,
                     "catalog": "${var.catalog}",
                     "serverless": True,
+                    "channel": "${var.pipeline_channel}",
                     "root_path": f"{ws}/lakeflow_pipeline",
                 }
             }
