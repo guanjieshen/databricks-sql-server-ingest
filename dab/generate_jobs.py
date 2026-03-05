@@ -88,6 +88,7 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                         "manifest_file": "${var.manifest_file}",
                         "spark.databricks.delta.uniform.iceberg.v3.enabled": "true",
                         "spark.databricks.delta.dbiManagedIcebergTable.v3.enabled": "true",
+                        "pipelines.enableTypeWidening": "true",
                     },
                     "libraries": [
                         {"glob": {"include": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
