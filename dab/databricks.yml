@@ -11,6 +11,15 @@ variables:
   manifest_file:
     description: "Manifest filename for SDP pipeline: 'output.yaml' (all synced tables) or 'incremental_output.yaml' (only tables changed in last sync; falls back to output.yaml if missing or empty)."
     default: incremental_output.yaml
+  pipeline_channel:
+    description: "Databricks pipeline channel: 'CURRENT' for stable or 'PREVIEW' for early access features."
+    default: PREVIEW
+  event_log_catalog:
+    description: Unity Catalog catalog for pipeline event logs.
+    default: gshen_sqlserver_ct
+  event_log_schema:
+    description: Unity Catalog schema for pipeline event logs.
+    default: default
 
 targets:
   dev:
@@ -19,12 +28,16 @@ targets:
       workspace_root: /Workspace/Users/guanjie.shen@databricks.com/databricks-sql-server-ingest
       catalog: guanjiemar1
       manifest_file: output.yaml
+      event_log_catalog: gshen_sqlserver_ct
+      event_log_schema: default
   prod:
     mode: production
     variables:
       workspace_root: /Workspace/Repos/prod/databricks-sql-server-ingest
       catalog: prod_catalog
       manifest_file: incremental_output.yaml
+      event_log_catalog: prod_event_log_catalog
+      event_log_schema: default
 
 include:
   - resources/pipelines/*.yml

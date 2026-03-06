@@ -69,23 +69,46 @@ def _pipeline_key(base: str) -> str:
     return f"sdp_{safe}"
 
 
-def _pipeline_resource(base_name: str, config_filename: str) -> dict:
+def _load_pipeline_tags(pipelines_dir: Path, config_filename: str) -> dict[str, str]:
+    """Load user-defined tags from a pipeline config YAML file."""
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    config_path = pipelines_dir / config_filename
+    if not config_path.exists():
+        return {}
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f) or {}
+    raw_tags = config.get("tags") or {}
+    return {str(k): str(v) for k, v in raw_tags.items()}
+
+
+def _pipeline_resource(
+    base_name: str, config_filename: str, user_tags: dict[str, str] | None = None
+) -> dict:
     """Build the DLT pipeline resource dict wrapped in resources.pipelines."""
     pk = _pipeline_key(base_name)
     ws = "${var.workspace_root}"
+    tags = {
+        "project": "sql-server-ct",
+        "pipeline_config": config_filename,
+        "generated_by": "dab/generate_jobs.py",
+    }
+    if user_tags:
+        tags.update(user_tags)
     return {
         "resources": {
             "pipelines": {
                 pk: {
                     "name": f"SQL Server CT – SDP – {base_name}",
-                    "tags": {
-                        "project": "sql-server-ct",
-                        "pipeline_config": config_filename,
-                        "generated_by": "dab/generate_jobs.py",
-                    },
+                    "tags": tags,
                     "configuration": {
                         "input_yaml": f"{ws}/pipelines/{config_filename}",
                         "manifest_file": "${var.manifest_file}",
+                        "spark.databricks.delta.uniform.iceberg.v3.enabled": "true",
+                        "spark.databricks.delta.dbiManagedIcebergTable.v3.enabled": "true",
+                        "pipelines.enableTypeWidening": "true",
                     },
                     "libraries": [
                         {"glob": {"include": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
@@ -95,29 +118,40 @@ def _pipeline_resource(base_name: str, config_filename: str) -> dict:
                     "photon": True,
                     "catalog": "${var.catalog}",
                     "serverless": True,
+                    "channel": "${var.pipeline_channel}",
                     "root_path": f"{ws}/lakeflow_pipeline",
+                    "event_log": {
+                        "name": f"event_log_{base_name}",
+                        "schema": "${var.event_log_schema}",
+                        "catalog": "${var.event_log_catalog}",
+                    },
                 }
             }
         }
     }
 
 
-def _job_resource(base_name: str, config_filename: str) -> dict:
+def _job_resource(
+    base_name: str, config_filename: str, user_tags: dict[str, str] | None = None
+) -> dict:
     """Build the job resource dict wrapped in resources.jobs."""
     jk = _job_key(base_name)
     pk = _pipeline_key(base_name)
     config_path = f"${{var.workspace_root}}/pipelines/{config_filename}"
     pipeline_ref = f"${{resources.pipelines.{pk}.id}}"
+    tags = {
+        "project": "sql-server-ct",
+        "pipeline_config": config_filename,
+        "generated_by": "dab/generate_jobs.py",
+    }
+    if user_tags:
+        tags.update(user_tags)
     return {
         "resources": {
             "jobs": {
                 jk: {
                     "name": f"SQL Server CT – Job – {base_name}",
-                    "tags": {
-                        "project": "sql-server-ct",
-                        "pipeline_config": config_filename,
-                        "generated_by": "dab/generate_jobs.py",
-                    },
+                    "tags": tags,
                     "tasks": [
                         {
                             "task_key": "gateway",
@@ -257,7 +291,8 @@ def main() -> int:
     for base_name, config_filename in configs:
         valid_bases.add(base_name)
 
-        pl_data = _pipeline_resource(base_name, config_filename)
+        user_tags = _load_pipeline_tags(pipelines_dir, config_filename)
+        pl_data = _pipeline_resource(base_name, config_filename, user_tags)
         _write_file(
             pipelines_out / f"sdp_{base_name}.yml",
             _emit_yaml(pl_data),
@@ -265,7 +300,7 @@ def main() -> int:
             args.dry_run,
         )
 
-        job_data = _job_resource(base_name, config_filename)
+        job_data = _job_resource(base_name, config_filename, user_tags)
         _write_file(
             jobs_out / f"job_{base_name}.yml",
             _emit_yaml(job_data),

@@ -3,6 +3,14 @@ connection:
   sql_login: INSERT_LOGIN_HERE
   password: INSERT_PASSWORD_HERE          # or: {{secrets/my-scope/sql-password}}
 
+# Tags are carried over to the generated DAB pipeline and job resources.
+tags:
+  team: data-engineering
+  # cost-center: "12345"
+  # environment: production
+
+# Enable UniForm Iceberg V3 on silver streaming tables (default: false).
+external_access: false
 
 # Number of tables to sync in parallel (default: 1 = sequential).
 parallelism: 12
