@@ -87,7 +87,7 @@ def _build_spark_schema(columns):
 # Load pipeline config and table metadata (including schema.json columns)
 input_yaml = spark.conf.get("input_yaml")
 manifest_file = spark.conf.get("manifest_file", "output.yaml")
-table_configs, data_path = parse_output_yaml(input_yaml, manifest_file=manifest_file)
+table_configs, data_path, external_access = parse_output_yaml(input_yaml, manifest_file=manifest_file)
 
 # BRONZE: Materialized landing (temporary Delta, not published to UC).
 # Parquet read once; downstream views get Delta data skipping.
@@ -153,17 +153,22 @@ for tc in table_configs:
 
     create_view(view_name, uoid, spark_schema, soft_delete)
 
-    dp.create_streaming_table(
-        name=silver_table_name,
-        comment=f"Silver: SCD Type {scd_type} from {table_name}",
-        table_properties={
+    silver_table_props = {
+        "delta.feature.timestampNtz": "supported",
+        "delta.enableChangeDataFeed": "true",
+    }
+    if external_access:
+        silver_table_props.update({
             "delta.columnMapping.mode": "name",
             "delta.enableRowTracking": "true",
             "delta.enableIcebergCompatV3": "true",
             "delta.universalFormat.enabledFormats": "iceberg",
-            "delta.feature.timestampNtz": "supported",
-            "delta.enableChangeDataFeed": "true",
-        },
+        })
+
+    dp.create_streaming_table(
+        name=silver_table_name,
+        comment=f"Silver: SCD Type {scd_type} from {table_name}",
+        table_properties=silver_table_props,
     )
 
     if primary_key:

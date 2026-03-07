@@ -13,6 +13,7 @@ from dab.generate_jobs import (
     _emit_yaml,
     _job_key,
     _job_resource,
+    _load_pipeline_config,
     _pipeline_key,
     _pipeline_resource,
     _repo_root,
@@ -120,6 +121,45 @@ class TestKeyHelpers:
 
 
 # ---------------------------------------------------------------------------
+# _load_pipeline_config
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPipelineConfig:
+    def test_returns_tags_and_external_access(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text(
+            "tags:\n  team: eng\nexternal_access: true\n"
+        )
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["tags"] == {"team": "eng"}
+        assert cfg["external_access"] is True
+
+    def test_external_access_false(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text("external_access: false\n")
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["external_access"] is False
+
+    def test_external_access_defaults_to_false(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text("tags:\n  team: eng\n")
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["external_access"] is False
+
+    def test_missing_file_returns_defaults(self, tmp_path: Path):
+        cfg = _load_pipeline_config(tmp_path, "nonexistent.yaml")
+        assert cfg == {"tags": {}, "external_access": False}
+
+    def test_empty_yaml_returns_defaults(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text("")
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg == {"tags": {}, "external_access": False}
+
+    def test_tags_values_coerced_to_str(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text("tags:\n  count: 42\n")
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["tags"] == {"count": "42"}
+
+
+# ---------------------------------------------------------------------------
 # _pipeline_resource / _job_resource
 # ---------------------------------------------------------------------------
 
@@ -158,6 +198,30 @@ class TestPipelineResource:
         paths = [lib["glob"]["include"] for lib in libs]
         assert any("ingestion_pipeline_materialized.py" in p for p in paths)
         assert any("metadata_helper.py" in p for p in paths)
+
+    def test_iceberg_configs_omitted_by_default(self):
+        data = _pipeline_resource("p1", "p1.yaml")
+        cfg = data["resources"]["pipelines"]["sdp_p1"]["configuration"]
+        assert "spark.databricks.delta.uniform.iceberg.v3.enabled" not in cfg
+        assert "spark.databricks.delta.dbiManagedIcebergTable.v3.enabled" not in cfg
+
+    def test_iceberg_configs_omitted_when_external_access_false(self):
+        data = _pipeline_resource("p1", "p1.yaml", external_access=False)
+        cfg = data["resources"]["pipelines"]["sdp_p1"]["configuration"]
+        assert "spark.databricks.delta.uniform.iceberg.v3.enabled" not in cfg
+        assert "spark.databricks.delta.dbiManagedIcebergTable.v3.enabled" not in cfg
+
+    def test_iceberg_configs_present_when_external_access_true(self):
+        data = _pipeline_resource("p1", "p1.yaml", external_access=True)
+        cfg = data["resources"]["pipelines"]["sdp_p1"]["configuration"]
+        assert cfg["spark.databricks.delta.uniform.iceberg.v3.enabled"] == "true"
+        assert cfg["spark.databricks.delta.dbiManagedIcebergTable.v3.enabled"] == "true"
+
+    def test_type_widening_always_present(self):
+        for ea in (True, False):
+            data = _pipeline_resource("p1", "p1.yaml", external_access=ea)
+            cfg = data["resources"]["pipelines"]["sdp_p1"]["configuration"]
+            assert cfg["pipelines.enableTypeWidening"] == "true"
 
 
 class TestJobResource:

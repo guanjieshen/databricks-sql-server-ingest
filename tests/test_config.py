@@ -9,9 +9,12 @@ import pytest
 
 from azsql_ct.config import (
     _extract_uc_metadata,
+    _flat_config_to_table_map,
     _flatten_table_map,
+    _load_config_file,
     _normalize_table_map,
     _validate_table_map,
+    expand_env,
     resolve_secrets,
     resolve_value,
 )
@@ -341,3 +344,86 @@ class TestResolveValue:
 
     def test_plain_passthrough(self):
         assert resolve_value("literal_password") == "literal_password"
+
+
+class TestExpandEnv:
+    """Tests for expand_env -- ${VAR} expansion from os.environ."""
+
+    def test_single_var(self):
+        with patch.dict("os.environ", {"DB_HOST": "myhost"}):
+            assert expand_env("${DB_HOST}") == "myhost"
+
+    def test_multiple_vars(self):
+        with patch.dict("os.environ", {"USER": "admin", "PORT": "5432"}):
+            assert expand_env("${USER}:${PORT}") == "admin:5432"
+
+    def test_missing_var_raises_key_error(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(KeyError, match="MISSING_VAR"):
+                expand_env("${MISSING_VAR}")
+
+    def test_no_pattern_passthrough(self):
+        assert expand_env("plain_string") == "plain_string"
+
+    def test_non_string_coerced(self):
+        assert expand_env(42) == "42"
+
+
+class TestLoadConfigFile:
+    """Tests for _load_config_file -- YAML and JSON loading by extension."""
+
+    def test_loads_yaml(self, tmp_path):
+        p = tmp_path / "cfg.yaml"
+        p.write_text("server: myhost\nport: 5432\n")
+        result = _load_config_file(p)
+        assert result == {"server": "myhost", "port": 5432}
+
+    def test_loads_yml(self, tmp_path):
+        p = tmp_path / "cfg.yml"
+        p.write_text("key: value\n")
+        assert _load_config_file(p) == {"key": "value"}
+
+    def test_loads_json(self, tmp_path):
+        p = tmp_path / "cfg.json"
+        p.write_text('{"server": "myhost", "port": 5432}')
+        result = _load_config_file(p)
+        assert result == {"server": "myhost", "port": 5432}
+
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            _load_config_file(tmp_path / "nonexistent.yaml")
+
+    def test_invalid_json_raises(self, tmp_path):
+        p = tmp_path / "bad.json"
+        p.write_text("not valid json{{{")
+        with pytest.raises(Exception):
+            _load_config_file(p)
+
+
+class TestFlatConfigToTableMap:
+    """Tests for _flat_config_to_table_map -- flat list to nested dict."""
+
+    def test_schema_dot_table(self):
+        tables = [{"database": "db1", "table": "sales.orders", "mode": "incremental"}]
+        result = _flat_config_to_table_map(tables)
+        assert result == {"db1": {"sales": {"orders": "incremental"}}}
+
+    def test_no_dot_defaults_to_dbo(self):
+        tables = [{"database": "db1", "table": "orders"}]
+        result = _flat_config_to_table_map(tables)
+        assert result == {"db1": {"dbo": {"orders": "full_incremental"}}}
+
+    def test_mode_defaults_to_full_incremental(self):
+        tables = [{"database": "db1", "table": "dbo.t1"}]
+        result = _flat_config_to_table_map(tables)
+        assert result["db1"]["dbo"]["t1"] == "full_incremental"
+
+    def test_multiple_databases(self):
+        tables = [
+            {"database": "db1", "table": "dbo.t1", "mode": "full_incremental"},
+            {"database": "db2", "table": "sales.t2", "mode": "incremental"},
+        ]
+        result = _flat_config_to_table_map(tables)
+        assert "db1" in result and "db2" in result
+        assert result["db1"]["dbo"]["t1"] == "full_incremental"
+        assert result["db2"]["sales"]["t2"] == "incremental"

@@ -91,9 +91,12 @@ def _parse_manifest_to_configs(
 def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
     """Parse pipeline config, manifest (output.yaml or incremental_output.yaml), and schema.json.
 
-    Returns ``(table_configs, data_path)`` where *table_configs* is a list
-    of dicts with UC names, primary key, scd_type, source table identifiers,
-    and the column list from schema.json for ``from_json`` parsing.
+    Returns ``(table_configs, data_path, external_access)`` where
+    *table_configs* is a list of dicts with UC names, primary key, scd_type,
+    source table identifiers, and the column list from schema.json for
+    ``from_json`` parsing.  *external_access* is a bool indicating whether
+    UniForm Iceberg V3 table properties should be applied (defaults to
+    ``False`` when the key is absent from the pipeline YAML).
 
     When ``manifest_file`` is ``"incremental_output.yaml"``, falls back to
     ``output.yaml`` if the incremental file is missing or contains no tables.
@@ -105,6 +108,8 @@ def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
     """
     with open(input_yaml_path, "r") as f:
         config = yaml.safe_load(f) or {}
+
+    external_access = bool(config.get("external_access", False))
 
     storage = config.get("storage") or {}
     ingest_pipeline_path = storage.get("ingest_pipeline")
@@ -134,7 +139,7 @@ def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
                 )
                 primary_path = fallback_path
             else:
-                return result, data_path
+                return result, data_path, external_access
 
     if not os.path.exists(primary_path):
         raise FileNotFoundError(f"{os.path.basename(primary_path)} not found at: {primary_path}")
@@ -142,4 +147,4 @@ def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
     with open(primary_path, "r") as f:
         output_config = yaml.safe_load(f) or {}
     result = _parse_manifest_to_configs(output_config, watermarks_path)
-    return result, data_path
+    return result, data_path, external_access

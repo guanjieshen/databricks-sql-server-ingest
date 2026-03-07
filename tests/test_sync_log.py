@@ -12,7 +12,14 @@ import pytest
 if "mssql_python" not in sys.modules:
     sys.modules["mssql_python"] = types.ModuleType("mssql_python")
 
-from azsql_ct.sync_log import build_log_rows, write_sync_log, SYNC_LOG_SCHEMA
+from azsql_ct.sync_log import (
+    _derive_run_status,
+    _split_table_name,
+    _table_status,
+    build_log_rows,
+    write_sync_log,
+    SYNC_LOG_SCHEMA,
+)
 
 _NOW = datetime(2026, 3, 3, 12, 0, 0, tzinfo=timezone.utc)
 _LATER = datetime(2026, 3, 3, 12, 5, 30, tzinfo=timezone.utc)
@@ -161,7 +168,7 @@ class TestWriteSyncLog:
             **_common_kwargs(),
         )
         assert os.path.isfile(path)
-        table = pq.read_table(path)
+        table = pq.ParquetFile(path).read()
         assert table.num_rows == 1
         assert table.schema.equals(SYNC_LOG_SCHEMA)
 
@@ -208,5 +215,47 @@ class TestWriteSyncLog:
 
         results = [_success_result(), _error_result(), _skipped_result()]
         path = write_sync_log(str(tmp_path), results, **_common_kwargs())
-        table = pq.read_table(path)
+        table = pq.ParquetFile(path).read()
         assert table.num_rows == 3
+
+
+class TestDeriveRunStatus:
+    """Tests for _derive_run_status -- aggregate run status from table results."""
+
+    def test_all_success(self):
+        assert _derive_run_status([_success_result()]) == "success"
+
+    def test_all_errors(self):
+        assert _derive_run_status([_error_result(), _error_result()]) == "failure"
+
+    def test_mixed(self):
+        assert _derive_run_status([_success_result(), _error_result()]) == "partial_failure"
+
+    def test_skipped_only(self):
+        assert _derive_run_status([_skipped_result()]) == "success"
+
+
+class TestTableStatus:
+    """Tests for _table_status -- per-table status string."""
+
+    def test_error(self):
+        assert _table_status({"status": "error"}) == "error"
+
+    def test_skipped(self):
+        assert _table_status({"status": "skipped"}) == "skipped"
+
+    def test_success_implicit(self):
+        assert _table_status({"rows_written": 10}) == "success"
+
+
+class TestSplitTableName:
+    """Tests for _split_table_name -- schema.table splitting."""
+
+    def test_schema_dot_table(self):
+        assert _split_table_name("dbo.orders") == ("dbo", "orders")
+
+    def test_no_dot_defaults_to_dbo(self):
+        assert _split_table_name("orders") == ("dbo", "orders")
+
+    def test_multiple_dots_splits_on_first(self):
+        assert _split_table_name("dbo.my.table") == ("dbo", "my.table")
