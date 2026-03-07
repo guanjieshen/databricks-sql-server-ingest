@@ -168,7 +168,7 @@ class TestWriteSyncLog:
             **_common_kwargs(),
         )
         assert os.path.isfile(path)
-        table = pq.read_table(path)
+        table = pq.ParquetFile(path).read()
         assert table.num_rows == 1
         assert table.schema.equals(SYNC_LOG_SCHEMA)
 
@@ -215,7 +215,7 @@ class TestWriteSyncLog:
 
         results = [_success_result(), _error_result(), _skipped_result()]
         path = write_sync_log(str(tmp_path), results, **_common_kwargs())
-        table = pq.read_table(path)
+        table = pq.ParquetFile(path).read()
         assert table.num_rows == 3
 
 
