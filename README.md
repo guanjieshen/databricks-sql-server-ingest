@@ -114,7 +114,22 @@ databricks secrets create-scope my-scope
 databricks secrets put-secret --json '{"scope": "my-scope", "key": "sql-password", "string_value": "<password>"}'
 ```
 
-### Step 3 — Generate the Databricks Asset Bundle resources
+### Step 3 — Configure the Databricks Asset Bundle
+
+Open `dab/databricks.yml` and set `workspace_root` to the full workspace path where this repo lives. Review the remaining variables and adjust for your environment:
+
+| Variable | Description |
+|----------|-------------|
+| `workspace_root` | Full workspace path to this repo (e.g. `/Workspace/Repos/my-org/databricks-sql-server-ingest`) |
+| `catalog` | Unity Catalog name for the DLT pipelines |
+| `manifest_file` | `incremental_output.yaml` (default, only processes changed tables) or `output.yaml` (all tables) |
+| `pipeline_channel` | `CURRENT` (stable) or `PREVIEW` (early access features) |
+| `event_log_catalog` | Unity Catalog catalog for pipeline event logs |
+| `event_log_schema` | Unity Catalog schema for pipeline event logs |
+
+The `dev` and `prod` targets override these defaults — update both to match your workspace.
+
+### Step 4 — Generate the Databricks Asset Bundle resources
 
 The `dab/` directory contains a [Databricks Asset Bundle](https://docs.databricks.com/dev-tools/bundles/index.html) that deploys one DLT pipeline + one job per pipeline config. After creating (or modifying) a config in `pipelines/`, regenerate the bundle resources:
 
@@ -137,15 +152,7 @@ gateway (runs sync.py)
   └── schema_change_detected                                [for alerting/branching]
 ```
 
-### Step 4 — Configure and deploy the bundle
-
-Open `dab/databricks.yml` and check the variables:
-
-| Variable | Description |
-|----------|-------------|
-| `workspace_root` | Full workspace path to this repo (e.g. `/Workspace/Repos/my-org/databricks-sql-server-ingest`) |
-| `catalog` | Unity Catalog name for the DLT pipelines |
-| `manifest_file` | `incremental_output.yaml` (default, only processes changed tables) or `output.yaml` (all tables) |
+### Step 5 — Deploy the bundle
 
 Deploy from inside the `dab/` directory:
 
@@ -165,6 +172,8 @@ databricks bundle deploy -t prod \
 ```
 
 Once deployed, run the job from the Databricks UI or CLI. On first run it does a full load; subsequent runs are incremental.
+
+> **Workspace deployment:** You can also deploy and manage bundles directly from the Databricks workspace UI — no local CLI required. Clone this repo into a Git folder and Databricks will recognise the `databricks.yml` at the root. See [Collaborate on bundles in the workspace](https://docs.databricks.com/aws/en/dev-tools/bundles/workspace).
 
 ---
 
