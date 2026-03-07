@@ -78,6 +78,7 @@ connection:
   sql_login: sync_user
   password: ${ADMIN_PASSWORD}          # from .env file or environment variable
 
+external_access: false                 # set true to generate Iceberg-compatible tables
 parallelism: 4                         # tables synced in parallel
 
 storage:
@@ -238,6 +239,23 @@ If a watermark is older than `CHANGE_TRACKING_MIN_VALID_VERSION()`, the engine a
 | SCD Type 1 *(default)* | Overwrite — latest value wins |
 | SCD Type 2 | Historical tracking — preserves prior versions of a row |
 
+### External access (Iceberg-compatible tables)
+
+Set `external_access: true` in your pipeline config to make the silver streaming tables readable by Iceberg clients (Snowflake, Trino, Spark OSS, etc.) via Delta UniForm V3.
+
+```yaml
+external_access: true
+```
+
+When enabled, two things happen:
+
+| Layer | Effect |
+|-------|--------|
+| DLT pipeline (Spark configs) | `spark.databricks.delta.uniform.iceberg.v3.enabled` and `spark.databricks.delta.dbiManagedIcebergTable.v3.enabled` are set to `true` |
+| Silver streaming tables (table properties) | `delta.columnMapping.mode=name`, `delta.enableRowTracking=true`, `delta.enableIcebergCompatV3=true`, `delta.universalFormat.enabledFormats=iceberg` |
+
+The flag defaults to `false` (standard Delta tables, no Iceberg metadata). Flipping it to `true` on an existing pipeline will apply the properties on the next DLT refresh — no data rewrite required.
+
 ### Full config reference
 
 | Field | Required | Description |
@@ -245,6 +263,7 @@ If a watermark is older than `CHANGE_TRACKING_MIN_VALID_VERSION()`, the engine a
 | `connection.server` | Yes | SQL Server hostname |
 | `connection.sql_login` | Yes | Login name |
 | `connection.password` | Yes | Password (`${VAR}` env expansion or `{{secrets/scope/key}}` Databricks secrets) |
+| `external_access` | No | `true` to enable UniForm Iceberg V3 on silver tables (default: `false`) |
 | `parallelism` | No | Tables synced in parallel (default: 1) |
 | `storage.ingest_pipeline` | Yes | Root path for data, watermarks, and output manifest |
 | `storage.output_format` | No | `per_table` (default) or `unified` |
