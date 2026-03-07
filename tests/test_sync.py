@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from azsql_ct import watermark
-from azsql_ct.sync import sync_table
+from azsql_ct.sync import _clear_data_files, _clean_temp_files, sync_table
 
 
 class StubWriter:
@@ -881,3 +881,73 @@ class TestPostSyncMetadataFailure:
         assert "status" not in result
         col_names = [c["name"] for c in result["columns"]]
         assert "id" in col_names
+
+
+class TestClearDataFiles:
+    """Tests for _clear_data_files — remove writer-produced files."""
+
+    def test_removes_all_files_and_returns_count(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "a.parquet").write_text("x")
+        (d / "b.parquet").write_text("y")
+        assert _clear_data_files(str(d)) == 2
+        assert list(d.iterdir()) == []
+
+    def test_respects_keep_set(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        keep_file = d / "keep.parquet"
+        keep_file.write_text("keep")
+        (d / "remove.parquet").write_text("bye")
+        removed = _clear_data_files(str(d), keep={str(keep_file)})
+        assert removed == 1
+        assert keep_file.exists()
+
+    def test_handles_nested_subdirs(self, tmp_path):
+        d = tmp_path / "data"
+        sub = d / "2026-01-01"
+        sub.mkdir(parents=True)
+        (sub / "part.parquet").write_text("data")
+        removed = _clear_data_files(str(d))
+        assert removed == 1
+        assert not sub.exists()
+
+    def test_empty_dir_returns_zero(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        assert _clear_data_files(str(d)) == 0
+
+    def test_does_not_remove_root_dir(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "f.parquet").write_text("x")
+        _clear_data_files(str(d))
+        assert d.is_dir()
+
+
+class TestCleanTempFiles:
+    """Tests for _clean_temp_files — remove orphaned .tmp files."""
+
+    def test_removes_tmp_files(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "part.parquet.tmp").write_text("orphan")
+        (d / "good.parquet").write_text("keep")
+        removed = _clean_temp_files(str(d))
+        assert removed == 1
+        assert not (d / "part.parquet.tmp").exists()
+        assert (d / "good.parquet").exists()
+
+    def test_handles_nested_tmp(self, tmp_path):
+        d = tmp_path / "data"
+        sub = d / "2026-03-03"
+        sub.mkdir(parents=True)
+        (sub / "orphan.tmp").write_text("x")
+        assert _clean_temp_files(str(d)) == 1
+
+    def test_no_tmp_returns_zero(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "good.parquet").write_text("keep")
+        assert _clean_temp_files(str(d)) == 0

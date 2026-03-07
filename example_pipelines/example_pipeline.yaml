@@ -4,6 +4,12 @@ connection:
   password: "{{secrets/sql-ingestion/guanjiesqldb}}"
 
 
+# Tags are carried over to the generated DAB pipeline and job resources.
+tags:
+  team: data-engineering
+  # cost-center: "12345"
+  # environment: production
+  
 # Number of tables to sync in parallel (default: 1 = sequential).
 parallelism: 12
 

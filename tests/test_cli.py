@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from azsql_ct.__main__ import main
+from azsql_ct.__main__ import _log_summary, main
 
 
 class TestCli:
@@ -92,3 +92,56 @@ class TestCli:
 
         call_kwargs = MockCT.from_config.call_args
         assert call_kwargs.kwargs.get("max_workers") == 4
+
+
+class TestLogSummary:
+    """Tests for _log_summary -- human-readable sync summary."""
+
+    def _success_result(self, **overrides):
+        base = {
+            "database": "db1",
+            "table": "dbo.T",
+            "mode": "full",
+            "rows_written": 10,
+            "current_version": 5,
+            "files": ["/data/f.parquet"],
+            "duration_seconds": 1.5,
+            "since_version": None,
+        }
+        base.update(overrides)
+        return base
+
+    def _error_result(self):
+        return {
+            "database": "db1",
+            "table": "dbo.Bad",
+            "status": "error",
+            "error": "Connection reset",
+        }
+
+    def test_success_results_logged(self, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, logger="azsql_ct.__main__"):
+            _log_summary([self._success_result()])
+        assert "db1.dbo.T" in caplog.text
+        assert "10 rows" in caplog.text
+
+    def test_error_results_logged(self, caplog):
+        import logging
+        with caplog.at_level(logging.ERROR, logger="azsql_ct.__main__"):
+            _log_summary([self._error_result()])
+        assert "ERROR" in caplog.text
+        assert "Connection reset" in caplog.text
+
+    def test_mixed_results(self, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, logger="azsql_ct.__main__"):
+            _log_summary([self._success_result(), self._error_result()])
+        assert "Completed: 1 table(s)" in caplog.text
+        assert "Failed: 1 table(s)" in caplog.text
+
+    def test_empty_results(self, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, logger="azsql_ct.__main__"):
+            _log_summary([])
+        assert "Completed: 0 table(s)" in caplog.text

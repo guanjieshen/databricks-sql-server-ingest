@@ -69,23 +69,29 @@ def _pipeline_key(base: str) -> str:
     return f"sdp_{safe}"
 
 
-def _load_pipeline_tags(pipelines_dir: Path, config_filename: str) -> dict[str, str]:
-    """Load user-defined tags from a pipeline config YAML file."""
+def _load_pipeline_config(pipelines_dir: Path, config_filename: str) -> dict:
+    """Load tags and feature flags from a pipeline config YAML file."""
     try:
         import yaml
     except ImportError:
-        return {}
+        return {"tags": {}, "external_access": False}
     config_path = pipelines_dir / config_filename
     if not config_path.exists():
-        return {}
+        return {"tags": {}, "external_access": False}
     with open(config_path, "r") as f:
         config = yaml.safe_load(f) or {}
     raw_tags = config.get("tags") or {}
-    return {str(k): str(v) for k, v in raw_tags.items()}
+    return {
+        "tags": {str(k): str(v) for k, v in raw_tags.items()},
+        "external_access": bool(config.get("external_access", False)),
+    }
 
 
 def _pipeline_resource(
-    base_name: str, config_filename: str, user_tags: dict[str, str] | None = None
+    base_name: str,
+    config_filename: str,
+    user_tags: dict[str, str] | None = None,
+    external_access: bool = False,
 ) -> dict:
     """Build the DLT pipeline resource dict wrapped in resources.pipelines."""
     pk = _pipeline_key(base_name)
@@ -97,19 +103,21 @@ def _pipeline_resource(
     }
     if user_tags:
         tags.update(user_tags)
+    configuration: dict[str, str] = {
+        "input_yaml": f"{ws}/pipelines/{config_filename}",
+        "manifest_file": "${var.manifest_file}",
+        "pipelines.enableTypeWidening": "true",
+    }
+    if external_access:
+        configuration["spark.databricks.delta.uniform.iceberg.v3.enabled"] = "true"
+        configuration["spark.databricks.delta.dbiManagedIcebergTable.v3.enabled"] = "true"
     return {
         "resources": {
             "pipelines": {
                 pk: {
                     "name": f"SQL Server CT – SDP – {base_name}",
                     "tags": tags,
-                    "configuration": {
-                        "input_yaml": f"{ws}/pipelines/{config_filename}",
-                        "manifest_file": "${var.manifest_file}",
-                        "spark.databricks.delta.uniform.iceberg.v3.enabled": "true",
-                        "spark.databricks.delta.dbiManagedIcebergTable.v3.enabled": "true",
-                        "pipelines.enableTypeWidening": "true",
-                    },
+                    "configuration": configuration,
                     "libraries": [
                         {"glob": {"include": f"{ws}/lakeflow_pipeline/ingestion_pipeline_materialized.py"}},
                         {"glob": {"include": f"{ws}/lakeflow_pipeline/metadata_helper.py"}},
@@ -291,8 +299,11 @@ def main() -> int:
     for base_name, config_filename in configs:
         valid_bases.add(base_name)
 
-        user_tags = _load_pipeline_tags(pipelines_dir, config_filename)
-        pl_data = _pipeline_resource(base_name, config_filename, user_tags)
+        pipeline_cfg = _load_pipeline_config(pipelines_dir, config_filename)
+        user_tags = pipeline_cfg["tags"]
+        pl_data = _pipeline_resource(
+            base_name, config_filename, user_tags, pipeline_cfg["external_access"]
+        )
         _write_file(
             pipelines_out / f"sdp_{base_name}.yml",
             _emit_yaml(pl_data),
