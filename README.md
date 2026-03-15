@@ -281,7 +281,8 @@ The flag defaults to `false` (standard Delta tables, no Iceberg metadata). Flipp
 | `databases.<db>.schemas.<s>.uc_schema` | No | Unity Catalog schema for downstream DLT silver tables |
 | `tables.<t>.mode` | No | `full`, `incremental`, or `full_incremental` (default) |
 | `tables.<t>.scd_type` | No | `1` (default, overwrite) or `2` (historical tracking) |
-| `tables.<t>.soft_delete` | No | `true` to keep deleted rows with an `_is_deleted` flag |
+| `tables.<t>.soft_delete` | No | `true` to keep deleted rows with a soft-delete flag column (default column name: `_is_deleted`) |
+| `soft_delete_column` | No | Pipeline-level default name for the soft-delete boolean column (default: `_is_deleted`). Can also be set per table under `tables.<t>.soft_delete_column` to override. |
 
 ### Output structure
 

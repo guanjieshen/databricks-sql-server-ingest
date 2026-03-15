@@ -203,6 +203,42 @@ class TestMergeAdd:
         assert tbl["scd_type"] == 2
         assert tbl["soft_delete"] is True
 
+    def test_soft_delete_column_stored_when_non_default(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5,
+              "soft_delete": True, "soft_delete_column": "is_removed"}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert tbl["soft_delete_column"] == "is_removed"
+
+    def test_soft_delete_column_omitted_when_default(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5,
+              "soft_delete": True, "soft_delete_column": "_is_deleted"}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "soft_delete_column" not in tbl
+
+    def test_soft_delete_column_omitted_when_soft_delete_false(self):
+        manifest = {"databases": {}}
+        merge_add(
+            manifest,
+            [{"database": "db1", "table": "dbo.orders", "rows_written": 5,
+              "soft_delete": False, "soft_delete_column": "is_removed"}],
+            "/data",
+            "parquet",
+        )
+        tbl = manifest["databases"]["db1"]["dbo"]["orders"]
+        assert "soft_delete_column" not in tbl
+
     def test_manifest_preserves_soft_delete_on_second_merge(self):
         """Adding a second table does not clobber an existing table's soft_delete flag."""
         manifest = {"databases": {}}

@@ -1,10 +1,12 @@
-"""Tests for metadata_helper.parse_output_yaml."""
+"""Tests for metadata_helper.parse_output_yaml and _parse_manifest_to_configs."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from lakeflow_pipeline.metadata_helper import parse_output_yaml
+from lakeflow_pipeline.metadata_helper import parse_output_yaml, _parse_manifest_to_configs
 
 # Minimal output manifest with one table
 OUTPUT_YAML_CONTENT = """databases:
@@ -253,3 +255,60 @@ databases: {{}}
         )
 
         assert external_access is True
+
+
+def _make_manifest(db="db1", schema="dbo", table="Orders"):
+    """Minimal manifest dict for one table."""
+    return {
+        "databases": {
+            db: {
+                "uc_catalog_name": "my_catalog",
+                schema: {
+                    "uc_schema_name": "my_schema",
+                    table: {
+                        "uc_table_name": table.lower(),
+                        "primary_key": ["id"],
+                    },
+                },
+            },
+        },
+    }
+
+
+class TestManifestSchemaEvolution:
+    """Verify schema.json columns flow correctly through _parse_manifest_to_configs."""
+
+    def test_evolved_schema_columns_flow_to_config(self, tmp_path):
+        wm = tmp_path / "db1" / "dbo" / "Orders"
+        wm.mkdir(parents=True)
+        (wm / "schema.json").write_text(json.dumps({
+            "columns": [
+                {"name": "id", "type": "int"},
+                {"name": "deleted_col", "type": "nvarchar"},
+                {"name": "new_col", "type": "bigint"},
+            ],
+            "schema_version": 200,
+        }))
+        configs = _parse_manifest_to_configs(_make_manifest(), str(tmp_path))
+        assert len(configs) == 1
+        col_names = [c["name"] for c in configs[0]["columns"]]
+        assert col_names == ["id", "deleted_col", "new_col"]
+
+    def test_missing_schema_json_returns_empty_columns(self, tmp_path):
+        configs = _parse_manifest_to_configs(_make_manifest(), str(tmp_path))
+        assert len(configs) == 1
+        assert configs[0]["columns"] == []
+
+    def test_type_changed_column_uses_latest_type(self, tmp_path):
+        wm = tmp_path / "db1" / "dbo" / "Orders"
+        wm.mkdir(parents=True)
+        (wm / "schema.json").write_text(json.dumps({
+            "columns": [
+                {"name": "id", "type": "bigint", "previous_type": "int"},
+            ],
+            "schema_version": 300,
+        }))
+        configs = _parse_manifest_to_configs(_make_manifest(), str(tmp_path))
+        col = configs[0]["columns"][0]
+        assert col["type"] == "bigint"
+        assert col["previous_type"] == "int"

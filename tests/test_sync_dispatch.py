@@ -93,6 +93,44 @@ class TestSync:
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
+    def test_passes_soft_delete_column_to_sync_table(self, MockAz, mock_sync):
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {"ok": True}
+
+        ct = ChangeTracker("srv", "usr", "pw")
+        ct.tables = {"db1": {"dbo": {
+            "t1": {"mode": "full_incremental", "soft_delete": True, "soft_delete_column": "is_removed"},
+            "t2": {"mode": "full_incremental", "soft_delete": True},
+        }}}
+        ct.sync()
+
+        assert mock_sync.call_count == 2
+        sd_cols = {
+            call.args[1]: call.kwargs["soft_delete_column"]
+            for call in mock_sync.call_args_list
+        }
+        assert sd_cols["dbo.t1"] == "is_removed"
+        assert sd_cols["dbo.t2"] == "_is_deleted"
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
+    def test_pipeline_level_soft_delete_column_used_as_fallback(self, MockAz, mock_sync):
+        mock_conn = MagicMock()
+        MockAz.return_value.connect.return_value = mock_conn
+        mock_sync.return_value = {"ok": True}
+
+        ct = ChangeTracker("srv", "usr", "pw", soft_delete_column="deleted_flag")
+        ct.tables = {"db1": {"dbo": {
+            "t1": {"mode": "full_incremental", "soft_delete": True},
+        }}}
+        ct.sync()
+
+        _, kwargs = mock_sync.call_args
+        assert kwargs["soft_delete_column"] == "deleted_flag"
+
+    @patch("azsql_ct.client.sync_table")
+    @patch("azsql_ct.client.AzureSQLConnection")
     def test_continues_after_table_error(self, MockAz, mock_sync):
         mock_conn = MagicMock()
         MockAz.return_value.connect.return_value = mock_conn

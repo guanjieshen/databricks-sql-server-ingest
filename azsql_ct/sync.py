@@ -26,7 +26,7 @@ from datetime import date
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from . import queries, schema, watermark
-from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, VALID_MODES
+from ._constants import DEFAULT_BATCH_SIZE, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE_COLUMN, VALID_MODES
 from .schema import columns_from_description
 from .writer import OutputWriter, ParquetWriter, _compute_schema_version, _make_uoid
 
@@ -155,6 +155,7 @@ def sync_table(
     scd_type: int = DEFAULT_SCD_TYPE,
     uc_catalog: Optional[str] = None,
     soft_delete: bool = False,
+    soft_delete_column: str = DEFAULT_SOFT_DELETE_COLUMN,
     tracked_lookup: Optional[Dict[str, str]] = None,
     db_version: Optional[int] = None,
     min_ver: Optional[int] = None,
@@ -182,9 +183,12 @@ def sync_table(
                             the result dict and output manifest.
         uc_catalog:         Optional Unity Catalog name; passed through to
                             the writer as ``table_metadata["catalog"]``.
-        soft_delete:        If ``True``, deletes are tracked via an
-                            ``_is_deleted`` flag rather than physical removal.
+        soft_delete:        If ``True``, deletes are tracked via a boolean
+                            flag column rather than physical removal.
                             Passed through to the result dict and output manifest.
+        soft_delete_column: Name of the soft-delete boolean column in the
+                            silver table (default ``"_is_deleted"``).  Only
+                            meaningful when *soft_delete* is ``True``.
         tracked_lookup:     Pre-fetched ``{lowercase: original}`` tracked-table
                             lookup from :func:`queries.fetch_all_ct_metadata`.
                             When provided, skips the per-table
@@ -232,6 +236,7 @@ def sync_table(
             scd_type=scd_type,
             uc_catalog=uc_catalog,
             soft_delete=soft_delete,
+            soft_delete_column=soft_delete_column,
             db_version=db_version,
             min_ver=min_ver,
             pk_cols=pk_cols,
@@ -253,6 +258,7 @@ def _sync_table_locked(
     scd_type: int = DEFAULT_SCD_TYPE,
     uc_catalog: Optional[str] = None,
     soft_delete: bool = False,
+    soft_delete_column: str = DEFAULT_SOFT_DELETE_COLUMN,
     db_version: Optional[int] = None,
     min_ver: Optional[int] = None,
     pk_cols: Optional[List[str]] = None,
@@ -374,6 +380,7 @@ def _sync_table_locked(
         "mode": actual_mode,
         "scd_type": scd_type,
         "soft_delete": soft_delete,
+        "soft_delete_column": soft_delete_column if soft_delete else DEFAULT_SOFT_DELETE_COLUMN,
         "since_version": since_ver,
         "current_version": cur_ver,
         "rows_written": row_count,

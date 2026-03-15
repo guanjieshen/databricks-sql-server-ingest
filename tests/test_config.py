@@ -24,15 +24,15 @@ class TestFlattenTableMap:
     def test_list_format(self):
         m = {"db1": {"dbo": ["t1", "t2"]}}
         assert _flatten_table_map(m) == [
-            ("db1", "dbo.t1", None, 1, False),
-            ("db1", "dbo.t2", None, 1, False),
+            ("db1", "dbo.t1", None, 1, False, None),
+            ("db1", "dbo.t2", None, 1, False, None),
         ]
 
     def test_dict_format(self):
         m = {"db1": {"dbo": {"t1": "full_incremental", "t2": "incremental"}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", "full_incremental", 1, False) in flat
-        assert ("db1", "dbo.t2", "incremental", 1, False) in flat
+        assert ("db1", "dbo.t1", "full_incremental", 1, False, None) in flat
+        assert ("db1", "dbo.t2", "incremental", 1, False, None) in flat
 
     def test_dict_format_with_scd_type(self):
         m = {"db1": {"dbo": {
@@ -40,20 +40,20 @@ class TestFlattenTableMap:
             "t2": "full_incremental",
         }}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", "full_incremental", 2, False) in flat
-        assert ("db1", "dbo.t2", "full_incremental", 1, False) in flat
+        assert ("db1", "dbo.t1", "full_incremental", 2, False, None) in flat
+        assert ("db1", "dbo.t2", "full_incremental", 1, False, None) in flat
 
     def test_dict_format_scd_type_defaults_to_1(self):
         m = {"db1": {"dbo": {"t1": {"mode": "full_incremental"}}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", "full_incremental", 1, False) in flat
+        assert ("db1", "dbo.t1", "full_incremental", 1, False, None) in flat
 
     def test_dict_format_with_soft_delete(self):
         m = {"db1": {"dbo": {
             "t1": {"mode": "full_incremental", "scd_type": 1, "soft_delete": True},
         }}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", "full_incremental", 1, True) in flat
+        assert ("db1", "dbo.t1", "full_incremental", 1, True, None) in flat
 
     @pytest.mark.parametrize("table_map", [
         {"db1": {"dbo": {"t1": {"mode": "full_incremental"}}}},
@@ -63,17 +63,29 @@ class TestFlattenTableMap:
         flat = _flatten_table_map(table_map)
         assert flat[0][4] is False
 
+    def test_dict_format_with_soft_delete_column(self):
+        m = {"db1": {"dbo": {
+            "t1": {"mode": "full_incremental", "soft_delete": True, "soft_delete_column": "is_removed"},
+        }}}
+        flat = _flatten_table_map(m)
+        assert ("db1", "dbo.t1", "full_incremental", 1, True, "is_removed") in flat
+
+    def test_soft_delete_column_defaults_to_none(self):
+        m = {"db1": {"dbo": {"t1": {"mode": "full_incremental", "soft_delete": True}}}}
+        flat = _flatten_table_map(m)
+        assert flat[0][5] is None
+
     def test_multiple_dbs(self):
         m = {"db1": {"dbo": ["a"]}, "db2": {"sales": {"b": "full_incremental"}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.a", None, 1, False) in flat
-        assert ("db2", "sales.b", "full_incremental", 1, False) in flat
+        assert ("db1", "dbo.a", None, 1, False, None) in flat
+        assert ("db2", "sales.b", "full_incremental", 1, False, None) in flat
 
     def test_multiple_schemas(self):
         m = {"db1": {"dbo": ["t1"], "staging": {"t2": "full_incremental"}}}
         flat = _flatten_table_map(m)
-        assert ("db1", "dbo.t1", None, 1, False) in flat
-        assert ("db1", "staging.t2", "full_incremental", 1, False) in flat
+        assert ("db1", "dbo.t1", None, 1, False, None) in flat
+        assert ("db1", "staging.t2", "full_incremental", 1, False, None) in flat
 
     def test_empty_map(self):
         assert _flatten_table_map({}) == []
@@ -151,6 +163,14 @@ class TestValidateTableMap:
     def test_rejects_dict_table_config_invalid_soft_delete(self):
         with pytest.raises(ValueError, match="soft_delete"):
             _validate_table_map({"db1": {"dbo": {"t1": {"mode": "full_incremental", "soft_delete": "yes"}}}})
+
+    def test_accepts_dict_table_config_with_soft_delete_column(self):
+        m = {"db1": {"dbo": {"t1": {"mode": "full_incremental", "soft_delete": True, "soft_delete_column": "is_removed"}}}}
+        assert _validate_table_map(m) == m
+
+    def test_rejects_dict_table_config_invalid_soft_delete_column(self):
+        with pytest.raises(ValueError, match="soft_delete_column"):
+            _validate_table_map({"db1": {"dbo": {"t1": {"mode": "full_incremental", "soft_delete": True, "soft_delete_column": 123}}}})
 
     def test_rejects_non_str_non_dict_table_config(self):
         with pytest.raises(TypeError, match="table config for"):
