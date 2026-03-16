@@ -17,24 +17,6 @@ class TestSync:
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
-    def test_uses_per_table_modes(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-        mock_sync.return_value = {"ok": True}
-
-        ct = ChangeTracker("srv", "usr", "pw")
-        ct.tables = {"db1": {"dbo": {"t1": "full_incremental", "t2": "incremental"}}}
-        ct.sync()
-
-        assert mock_sync.call_count == 2
-        modes = {
-            call.kwargs["mode"]
-            for call in mock_sync.call_args_list
-        }
-        assert modes == {"full_incremental", "incremental"}
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
     def test_list_format_defaults_to_full_incremental(self, MockAz, mock_sync):
         mock_conn = MagicMock()
         MockAz.return_value.connect.return_value = mock_conn
@@ -128,22 +110,6 @@ class TestSync:
 
         _, kwargs = mock_sync.call_args
         assert kwargs["soft_delete_column"] == "deleted_flag"
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
-    def test_continues_after_table_error(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-        mock_sync.side_effect = [RuntimeError("boom"), {"table": "dbo.t2", "ok": True}]
-
-        ct = ChangeTracker("srv", "usr", "pw")
-        ct.tables = {"db1": {"dbo": {"t1": "full_incremental", "t2": "full_incremental"}}}
-        results = ct.sync()
-
-        assert len(results) == 2
-        assert results[0]["status"] == "error"
-        assert "boom" in results[0]["error"]
-        assert results[1]["ok"] is True
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
@@ -252,9 +218,9 @@ class TestSkipUnchangedTables:
     @patch("azsql_ct.client._compute_tables_to_skip")
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
-    def test_change_check_failure_falls_back_to_sync_all(self, MockAz, mock_sync, mock_compute):
-        """_compute_tables_to_skip handles errors internally by returning an
-        empty set, so all tables are synced when the change check fails."""
+    def test_empty_skip_set_syncs_all_tables(self, MockAz, mock_sync, mock_compute):
+        """When _compute_tables_to_skip returns an empty set (which is its
+        internal fallback on error), all tables are synced normally."""
         mock_conn = MagicMock()
         MockAz.return_value.connect.return_value = mock_conn
         mock_sync.return_value = {"ok": True}
@@ -264,9 +230,12 @@ class TestSkipUnchangedTables:
         ct.tables = {"db1": {"dbo": {"t1": "incremental", "t2": "incremental"}}}
         results = ct.sync()
 
+        mock_compute.assert_called_once()
         assert mock_sync.call_count == 2
         assert len(results) == 2
         assert all(r.get("ok") for r in results)
+        synced_tables = {c.args[1] for c in mock_sync.call_args_list}
+        assert synced_tables == {"dbo.t1", "dbo.t2"}
 
 
 class TestRunSyncIntegration:

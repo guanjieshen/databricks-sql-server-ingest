@@ -118,33 +118,8 @@ class TestBatchSizeConfig:
         ct = ChangeTracker("s", "u", "p", batch_size=500)
         assert ct.batch_size == 500
 
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
-    def test_passes_batch_size_to_sync_table(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-        mock_sync.return_value = {"ok": True}
-
-        ct = ChangeTracker("srv", "usr", "pw", batch_size=2000)
-        ct.tables = {"db1": {"dbo": ["t1"]}}
-        ct.sync()
-
-        _, kwargs = mock_sync.call_args
-        assert kwargs["batch_size"] == 2000
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
-    def test_parallel_passes_batch_size(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-        mock_sync.return_value = {"ok": True}
-
-        ct = ChangeTracker("srv", "usr", "pw", max_workers=2, batch_size=3000)
-        ct.tables = {"db1": {"dbo": ["t1"]}}
-        ct.sync()
-
-        _, kwargs = mock_sync.call_args
-        assert kwargs["batch_size"] == 3000
+    # batch_size pass-through for both sequential and parallel is
+    # tested in test_dispatch_parameterized.py::TestDispatchCommon
 
 
 class TestContextManager:

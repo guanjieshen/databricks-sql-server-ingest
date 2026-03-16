@@ -414,9 +414,10 @@ class TestLoadConfigFile:
             _load_config_file(tmp_path / "nonexistent.yaml")
 
     def test_invalid_json_raises(self, tmp_path):
+        import json as _json
         p = tmp_path / "bad.json"
         p.write_text("not valid json{{{")
-        with pytest.raises(Exception):
+        with pytest.raises(_json.JSONDecodeError):
             _load_config_file(p)
 
 

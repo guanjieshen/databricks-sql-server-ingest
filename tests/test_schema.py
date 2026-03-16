@@ -185,14 +185,21 @@ class TestSchemaLastSeen:
 
     def test_last_seen_not_updated_for_removed_columns(self, tmp_path):
         """Columns no longer in source retain their old last_seen."""
-        save(str(tmp_path), [{"name": "id", "type": "int"}, {"name": "status", "type": "nvarchar"}], 100)
+        from unittest.mock import patch as _patch
+        from datetime import datetime as _dt, timezone as _tz
+
+        t1 = _dt(2026, 1, 1, 12, 0, 0, tzinfo=_tz.utc)
+        t2 = _dt(2026, 6, 15, 12, 0, 0, tzinfo=_tz.utc)
+
+        with _patch("azsql_ct.schema.datetime") as mock_dt:
+            mock_dt.now.return_value = t1
+            save(str(tmp_path), [{"name": "id", "type": "int"}, {"name": "status", "type": "nvarchar"}], 100)
         first_data = load(str(tmp_path))
         first_updated = first_data["updated_at"]
 
-        import time
-        time.sleep(1.1)
-
-        save(str(tmp_path), [{"name": "id", "type": "int"}], 200)
+        with _patch("azsql_ct.schema.datetime") as mock_dt:
+            mock_dt.now.return_value = t2
+            save(str(tmp_path), [{"name": "id", "type": "int"}], 200)
         data = load(str(tmp_path))
         id_col = next(c for c in data["columns"] if c["name"] == "id")
         status_col = next(c for c in data["columns"] if c["name"] == "status")

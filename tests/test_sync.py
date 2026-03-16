@@ -168,6 +168,12 @@ class TestSyncTable:
         assert result["current_version"] == 100
         assert result["scd_type"] == 1
         assert len(writer.calls) == 1
+        written_rows = writer.calls[0]["rows"]
+        assert len(written_rows) == 2
+        assert written_rows[0][3] == 1  # id column
+        assert written_rows[0][4] == "Alice"
+        assert written_rows[1][3] == 2
+        assert written_rows[1][4] == "Bob"
 
     def test_scd_type_passed_through_to_result(self, tmp_path):
         desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
@@ -288,6 +294,10 @@ class TestSyncTable:
         assert result["mode"] == "incremental"
         assert result["since_version"] == 20
         assert result["rows_written"] == 1
+        executed_sqls = [str(c) for c in cursor.execute.call_args_list]
+        assert any("CHANGETABLE" in s for s in executed_sqls), (
+            "Incremental sync should use a CHANGETABLE query"
+        )
 
     def test_incremental_no_pk_raises(self, tmp_path):
         wm_dir = tmp_path / "wm" / "db1" / "dbo" / "T"
@@ -723,7 +733,10 @@ class TestSyncTableUnifiedWriter:
         _result, writer = self._sync(tmp_path)
         assert len(writer.calls) == 1
         meta = writer.calls[0]["kwargs"]["table_metadata"]
-        assert isinstance(meta, dict)
+        assert meta["database"] == "db1"
+        assert meta["schema"] == "dbo"
+        assert meta["table"] == "Foo"
+        assert "uoid" in meta and len(meta["uoid"]) > 0
 
     def test_table_metadata_has_required_fields(self, tmp_path):
         _result, writer = self._sync(tmp_path)

@@ -221,3 +221,64 @@ def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
         output_config = yaml.safe_load(f) or {}
     result = _parse_manifest_to_configs(output_config, watermarks_path)
     return result, data_path, external_access
+
+
+def build_cdc_flow_kwargs(
+    target: str,
+    source: str,
+    keys: list,
+    scd_type: int,
+    soft_delete: bool,
+) -> dict:
+    """Build keyword arguments for ``dp.create_auto_cdc_flow``.
+
+    When *soft_delete* is True the flow keeps deleted rows with a flag
+    column and omits ``apply_as_deletes``.  Otherwise physical deletes
+    are applied via ``operation = 'DELETE'``.
+    """
+    kwargs = {
+        "target": target,
+        "source": source,
+        "keys": keys,
+        "sequence_by": "_seq_num",
+        "stored_as_scd_type": scd_type,
+        "ignore_null_updates": True,
+        "except_column_list": ["_seq_num", "operation"],
+    }
+    if not soft_delete:
+        kwargs["apply_as_deletes"] = "operation = 'DELETE'"
+    return kwargs
+
+
+def build_silver_table_properties(
+    scd_type: int,
+    table_name: str,
+    external_access: bool = False,
+) -> dict:
+    """Return the table-properties dict for a silver streaming table."""
+    props = {
+        "delta.feature.timestampNtz": "supported",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableTypeWidening": "true",
+    }
+    if external_access:
+        props.update({
+            "delta.columnMapping.mode": "name",
+            "delta.enableRowTracking": "true",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.universalFormat.enabledFormats": "iceberg",
+        })
+    return props
+
+
+def build_view_column_flags(soft_delete: bool, soft_delete_column: str) -> dict:
+    """Return configuration flags for view column selection.
+
+    Returns a dict with ``include_is_deleted`` (bool) and
+    ``deleted_col_name`` (str) that the pipeline uses to decide
+    whether to append a soft-delete flag column to the view.
+    """
+    return {
+        "include_is_deleted": soft_delete,
+        "deleted_col_name": soft_delete_column if soft_delete else None,
+    }

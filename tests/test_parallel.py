@@ -11,39 +11,6 @@ from azsql_ct.client import ChangeTracker
 class TestParallelSync:
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")
-    def test_parallel_syncs_all_tables(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-        mock_sync.return_value = {"ok": True}
-
-        ct = ChangeTracker("srv", "usr", "pw", max_workers=2)
-        ct.tables = {"db1": {"dbo": ["t1", "t2", "t3"]}}
-        results = ct.sync()
-
-        assert len(results) == 3
-        assert mock_sync.call_count == 3
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
-    def test_parallel_preserves_result_order(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-
-        def fake_sync(conn, table_name, **kw):
-            return {"table": table_name}
-
-        mock_sync.side_effect = fake_sync
-
-        ct = ChangeTracker("srv", "usr", "pw", max_workers=4)
-        ct.tables = {"db1": {"dbo": ["a", "b", "c", "d"]}}
-        results = ct.sync()
-
-        assert [r["table"] for r in results] == [
-            "dbo.a", "dbo.b", "dbo.c", "dbo.d",
-        ]
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
     def test_parallel_connections_bounded_by_workers(self, MockAz, mock_sync):
         mock_sync.return_value = {"ok": True}
 
@@ -51,30 +18,9 @@ class TestParallelSync:
         ct.tables = {"db1": {"dbo": ["t1", "t2", "t3"]}}
         ct.sync()
 
+        assert MockAz.call_count >= 1, "At least one connection should be created"
         assert MockAz.call_count <= 3
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
-    def test_parallel_continues_after_error(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-
-        def fake_sync(conn, table_name, **kw):
-            if "t2" in table_name:
-                raise RuntimeError("t2 failed")
-            return {"table": table_name, "ok": True}
-
-        mock_sync.side_effect = fake_sync
-
-        ct = ChangeTracker("srv", "usr", "pw", max_workers=2)
-        ct.tables = {"db1": {"dbo": ["t1", "t2", "t3"]}}
-        results = ct.sync()
-
-        assert len(results) == 3
-        assert results[0]["ok"] is True
-        assert results[1]["status"] == "error"
-        assert "t2 failed" in results[1]["error"]
-        assert results[2]["ok"] is True
+        assert mock_sync.call_count == 3, "All tables should have been synced"
 
     @patch("azsql_ct.client.AzureSQLConnection")
     def test_parallel_connection_failure(self, MockAz):
@@ -87,25 +33,6 @@ class TestParallelSync:
         assert len(results) == 1
         assert results[0]["status"] == "error"
         assert "refused" in results[0]["error"]
-
-    @patch("azsql_ct.client.sync_table")
-    @patch("azsql_ct.client.AzureSQLConnection")
-    def test_parallel_respects_per_table_modes(self, MockAz, mock_sync):
-        mock_conn = MagicMock()
-        MockAz.return_value.connect.return_value = mock_conn
-
-        def fake_sync(conn, table_name, **kw):
-            return {"table": table_name, "mode": kw["mode"]}
-
-        mock_sync.side_effect = fake_sync
-
-        ct = ChangeTracker("srv", "usr", "pw", max_workers=2)
-        ct.tables = {"db1": {"dbo": {"t1": "full_incremental", "t2": "incremental"}}}
-        results = ct.sync()
-
-        modes = {r["table"]: r["mode"] for r in results}
-        assert modes["dbo.t1"] == "full_incremental"
-        assert modes["dbo.t2"] == "incremental"
 
     @patch("azsql_ct.client.sync_table")
     @patch("azsql_ct.client.AzureSQLConnection")

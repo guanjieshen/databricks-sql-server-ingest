@@ -85,6 +85,7 @@ for tc in table_configs:
     silver_table_props = {
         "delta.feature.timestampNtz": "supported",
         "delta.enableChangeDataFeed": "true",
+        "delta.enableTypeWidening": "true"
     }
     if external_access:
         silver_table_props.update({

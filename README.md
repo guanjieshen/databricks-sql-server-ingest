@@ -265,6 +265,14 @@ When enabled, two things happen:
 
 The flag defaults to `false` (standard Delta tables, no Iceberg metadata). Flipping it to `true` on an existing pipeline will apply the properties on the next DLT refresh — no data rewrite required.
 
+> **Type widening limitation:** Silver tables are created with `delta.enableTypeWidening=true`, which allows column types to be widened without rewriting data. However, Apache Iceberg does not support all type changes that Delta type widening allows. When `external_access: true` is set, the following widening operations will fail:
+>
+> - `byte`, `short`, `int`, `long` to `decimal` or `double`
+> - Decimal scale increase
+> - `date` to `timestampNTZ`
+>
+> If you need to apply one of these type changes on an Iceberg-compatible table, either disable Iceberg compatibility first or regenerate the Iceberg metadata afterwards. See [Type widening — Apache Iceberg Compatibility](https://docs.databricks.com/aws/en/delta/type-widening#apache-iceberg-compatibility) for details.
+
 ### Full config reference
 
 | Field | Required | Description |
@@ -336,4 +344,4 @@ tests/                  Unit tests
 
 ## License
 
-Private.
+This project is licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) — see the [LICENSE](LICENSE) file for details.
