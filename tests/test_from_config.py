@@ -325,6 +325,58 @@ class TestFromConfig:
         assert by_table["dbo.t1"][4] is True
         assert by_table["dbo.t2"][4] is False
 
+    def test_structured_config_with_soft_delete_column(self):
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {
+                "db1": {
+                    "schemas": {
+                        "dbo": {
+                            "tables": {
+                                "t1": {"mode": "full_incremental", "soft_delete": True, "soft_delete_column": "is_removed"},
+                                "t2": {"mode": "full_incremental", "soft_delete": True},
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        assert len(ct._flat_tables) == 2
+        by_table = {t[1]: t for t in ct._flat_tables}
+        assert by_table["dbo.t1"][5] == "is_removed"
+        assert by_table["dbo.t2"][5] is None
+
+    def test_pipeline_level_soft_delete_column(self):
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "soft_delete_column": "deleted_flag",
+            "databases": {
+                "db1": {
+                    "schemas": {
+                        "dbo": {
+                            "tables": {"t1": {"mode": "full_incremental", "soft_delete": True}},
+                        },
+                    },
+                },
+            },
+        })
+        assert ct.soft_delete_column == "deleted_flag"
+
+    def test_default_soft_delete_column(self):
+        ct = ChangeTracker.from_config({
+            "connection": {"server": "s", "sql_login": "u", "password": "p"},
+            "databases": {
+                "db1": {
+                    "schemas": {
+                        "dbo": {
+                            "tables": {"t1": {"mode": "full_incremental", "soft_delete": True}},
+                        },
+                    },
+                },
+            },
+        })
+        assert ct.soft_delete_column == "_is_deleted"
+
     def test_from_config_resolves_databricks_secrets(self):
         mock_main = MagicMock()
         mock_main.dbutils.secrets.get.return_value = "resolved_pw"

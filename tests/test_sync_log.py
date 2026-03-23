@@ -144,7 +144,7 @@ class TestBuildLogRows:
         assert rows[0]["uc_catalog"] == "my_catalog"
 
     def test_configured_mode_from_flat_tables(self):
-        flat = [("db1", "dbo.orders", "full_incremental", 1, False)]
+        flat = [("db1", "dbo.orders", "full_incremental", 1, False, None)]
         rows = build_log_rows(
             [_success_result()], **_common_kwargs(), flat_tables=flat,
         )

@@ -118,7 +118,7 @@ def build_log_rows(
     configured_modes: Dict[str, str] = {}
     if flat_tables:
         for entry in flat_tables:
-            db, full_table, mode, _scd, _sd = entry
+            db, full_table, mode, _scd, _sd, *_rest = entry
             configured_modes[f"{db}.{full_table}"] = mode or "full_incremental"
 
     rows: List[dict] = []

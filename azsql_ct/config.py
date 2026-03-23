@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ._constants import (
-    DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE,
+    DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE, DEFAULT_SOFT_DELETE_COLUMN,
     VALID_MODES, VALID_SCD_TYPES,
 )
 
@@ -179,15 +179,17 @@ def _flat_config_to_table_map(tables: List[dict]) -> Dict[str, Dict[str, Dict[st
 
 TableSpec = Union[List[str], Dict[str, Any]]
 TableMap = Dict[str, Dict[str, TableSpec]]
-FlatEntry = Tuple[str, str, Optional[str], int, bool]
+FlatEntry = Tuple[str, str, Optional[str], int, bool, Optional[str]]
 
 
 def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
-    """Convert a table map to ``[(db, "schema.table", mode, scd_type, soft_delete), ...]``.
+    """Convert a table map to ``[(db, "schema.table", mode, scd_type, soft_delete, soft_delete_column), ...]``.
 
     *mode_or_none* is ``None`` for list-format entries (no per-table mode).
     *scd_type* defaults to ``DEFAULT_SCD_TYPE`` (1) when not specified.
     *soft_delete* defaults to ``DEFAULT_SOFT_DELETE`` (False) when not specified.
+    *soft_delete_column* is ``None`` when not specified (resolved later to
+    the pipeline-level default or ``DEFAULT_SOFT_DELETE_COLUMN``).
     """
     entries: List[FlatEntry] = []
     for database, schemas in table_map.items():
@@ -198,12 +200,13 @@ def _flatten_table_map(table_map: TableMap) -> List[FlatEntry]:
                         mode = tbl_cfg.get("mode")
                         scd_type = tbl_cfg.get("scd_type", DEFAULT_SCD_TYPE)
                         soft_delete = tbl_cfg.get("soft_delete", DEFAULT_SOFT_DELETE)
-                        entries.append((database, f"{schema}.{table}", mode, scd_type, soft_delete))
+                        soft_delete_column = tbl_cfg.get("soft_delete_column")
+                        entries.append((database, f"{schema}.{table}", mode, scd_type, soft_delete, soft_delete_column))
                     else:
-                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE))
+                        entries.append((database, f"{schema}.{table}", tbl_cfg, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE, None))
             else:
                 for table in tables:
-                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE))
+                    entries.append((database, f"{schema}.{table}", None, DEFAULT_SCD_TYPE, DEFAULT_SOFT_DELETE, None))
     return entries
 
 
@@ -258,6 +261,12 @@ def _validate_table_map(value: object) -> TableMap:
                             raise ValueError(
                                 f"soft_delete for '{db}'.'{schema}'.'{tbl}' must be "
                                 f"a bool, got {soft_delete!r}"
+                            )
+                        soft_delete_col = tbl_cfg.get("soft_delete_column")
+                        if soft_delete_col is not None and not isinstance(soft_delete_col, str):
+                            raise ValueError(
+                                f"soft_delete_column for '{db}'.'{schema}'.'{tbl}' must be "
+                                f"a string, got {soft_delete_col!r}"
                             )
                     else:
                         raise TypeError(

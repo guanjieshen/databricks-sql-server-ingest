@@ -168,6 +168,12 @@ class TestSyncTable:
         assert result["current_version"] == 100
         assert result["scd_type"] == 1
         assert len(writer.calls) == 1
+        written_rows = writer.calls[0]["rows"]
+        assert len(written_rows) == 2
+        assert written_rows[0][3] == 1  # id column
+        assert written_rows[0][4] == "Alice"
+        assert written_rows[1][3] == 2
+        assert written_rows[1][4] == "Bob"
 
     def test_scd_type_passed_through_to_result(self, tmp_path):
         desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
@@ -288,6 +294,10 @@ class TestSyncTable:
         assert result["mode"] == "incremental"
         assert result["since_version"] == 20
         assert result["rows_written"] == 1
+        executed_sqls = [str(c) for c in cursor.execute.call_args_list]
+        assert any("CHANGETABLE" in s for s in executed_sqls), (
+            "Incremental sync should use a CHANGETABLE query"
+        )
 
     def test_incremental_no_pk_raises(self, tmp_path):
         wm_dir = tmp_path / "wm" / "db1" / "dbo" / "T"
@@ -417,6 +427,43 @@ class TestSyncTable:
         )
         assert result["soft_delete"] is expected_soft_delete
         assert result["scd_type"] == expected_scd_type
+
+    def test_soft_delete_column_in_result(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"],
+            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=StubWriter(),
+            soft_delete=True, soft_delete_column="is_removed",
+        )
+        assert result["soft_delete_column"] == "is_removed"
+
+    def test_soft_delete_column_defaults_when_soft_delete_false(self, tmp_path):
+        desc = [("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",), ("SYS_CHANGE_OPERATION",), ("id",)]
+        rows = [(100, None, "L", 1)]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"],
+            cur_ver=100, min_ver=1, pk_cols=None, rows=rows, desc=desc,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        result = sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=StubWriter(),
+        )
+        assert result["soft_delete_column"] == "_is_deleted"
 
     def test_invalid_mode_raises(self, tmp_path):
         conn = MagicMock()
@@ -686,7 +733,10 @@ class TestSyncTableUnifiedWriter:
         _result, writer = self._sync(tmp_path)
         assert len(writer.calls) == 1
         meta = writer.calls[0]["kwargs"]["table_metadata"]
-        assert isinstance(meta, dict)
+        assert meta["database"] == "db1"
+        assert meta["schema"] == "dbo"
+        assert meta["table"] == "Foo"
+        assert "uoid" in meta and len(meta["uoid"]) > 0
 
     def test_table_metadata_has_required_fields(self, tmp_path):
         _result, writer = self._sync(tmp_path)
@@ -951,3 +1001,127 @@ class TestCleanTempFiles:
         d.mkdir()
         (d / "good.parquet").write_text("keep")
         assert _clean_temp_files(str(d)) == 0
+
+
+class TestSyncSchemaEvolution:
+    """Verify sync_table sets schema_changed correctly across consecutive syncs.
+
+    Deletes watermarks.json between syncs so each call enters full mode
+    (no version-skip), while schema.json accumulates across calls.
+    """
+
+    _WM_JSON = ("wm", "db1", "dbo", "Foo", "watermarks.json")
+
+    def _sync_with_columns(self, tmp_path, column_metadata_rows):
+        wm_json = tmp_path.joinpath(*self._WM_JSON)
+        if wm_json.exists():
+            wm_json.unlink()
+        desc = [
+            ("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+            ("SYS_CHANGE_OPERATION",), ("id",), ("name",),
+        ]
+        rows = [(100, None, "L", 1, "Alice")]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc, column_metadata_rows=column_metadata_rows,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        return sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=StubWriter(),
+        )
+
+    def test_schema_changed_false_on_first_sync(self, tmp_path):
+        cm = [("id", "int", 10, 0), ("name", "nvarchar", None, None)]
+        result = self._sync_with_columns(tmp_path, cm)
+        assert result["schema_changed"] is False
+
+    def test_schema_changed_true_when_column_added(self, tmp_path):
+        cm_v1 = [("id", "int", 10, 0), ("name", "nvarchar", None, None)]
+        self._sync_with_columns(tmp_path, cm_v1)
+        cm_v2 = [("id", "int", 10, 0), ("name", "nvarchar", None, None),
+                  ("email", "nvarchar", None, None)]
+        result = self._sync_with_columns(tmp_path, cm_v2)
+        assert result["schema_changed"] is True
+
+    def test_schema_changed_true_when_column_removed(self, tmp_path):
+        cm_v1 = [("id", "int", 10, 0), ("name", "nvarchar", None, None)]
+        self._sync_with_columns(tmp_path, cm_v1)
+        cm_v2 = [("id", "int", 10, 0)]
+        result = self._sync_with_columns(tmp_path, cm_v2)
+        assert result["schema_changed"] is True
+
+    def test_schema_changed_true_when_type_changes(self, tmp_path):
+        cm_v1 = [("id", "int", 10, 0)]
+        self._sync_with_columns(tmp_path, cm_v1)
+        cm_v2 = [("id", "bigint", 19, 0)]
+        result = self._sync_with_columns(tmp_path, cm_v2)
+        assert result["schema_changed"] is True
+
+    def test_schema_changed_false_when_columns_unchanged(self, tmp_path):
+        cm = [("id", "int", 10, 0), ("name", "nvarchar", None, None)]
+        self._sync_with_columns(tmp_path, cm)
+        result = self._sync_with_columns(tmp_path, cm)
+        assert result["schema_changed"] is False
+
+
+class TestEndToEndSchemaEvolution:
+    """Run multiple syncs and verify cumulative schema.json state.
+
+    Deletes watermarks.json between syncs so each call enters full mode
+    while schema.json accumulates across calls.
+    """
+
+    _SCHEMA_JSON_REL = ("wm", "db1", "dbo", "Foo", "schema.json")
+    _WM_JSON = ("wm", "db1", "dbo", "Foo", "watermarks.json")
+
+    def _sync_with_columns(self, tmp_path, column_metadata_rows):
+        wm_json = tmp_path.joinpath(*self._WM_JSON)
+        if wm_json.exists():
+            wm_json.unlink()
+        desc = [
+            ("SYS_CHANGE_VERSION",), ("SYS_CHANGE_CREATION_VERSION",),
+            ("SYS_CHANGE_OPERATION",), ("id",), ("name",),
+        ]
+        rows = [(100, None, "L", 1, "Alice")]
+        cursor = _make_cursor(
+            tracked=["dbo.Foo"], cur_ver=100, min_ver=1, pk_cols=None,
+            rows=rows, desc=desc, column_metadata_rows=column_metadata_rows,
+        )
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        return sync_table(
+            conn, "dbo.Foo", database="db1",
+            output_dir=str(tmp_path / "data"),
+            watermark_dir=str(tmp_path / "wm"),
+            mode="full_incremental", writer=StubWriter(),
+        )
+
+    def _load_schema(self, tmp_path):
+        return json.loads((tmp_path.joinpath(*self._SCHEMA_JSON_REL)).read_text())
+
+    def test_add_then_remove_produces_superset(self, tmp_path):
+        self._sync_with_columns(tmp_path, [("id", "int", 10, 0), ("name", "nvarchar", None, None)])
+        self._sync_with_columns(tmp_path, [("id", "int", 10, 0), ("name", "nvarchar", None, None), ("email", "nvarchar", None, None)])
+        self._sync_with_columns(tmp_path, [("id", "int", 10, 0), ("email", "nvarchar", None, None)])
+        data = self._load_schema(tmp_path)
+        col_names = [c["name"] for c in data["columns"]]
+        assert col_names == ["id", "name", "email"]
+
+    def test_type_change_records_previous_type(self, tmp_path):
+        self._sync_with_columns(tmp_path, [("id", "int", 10, 0)])
+        self._sync_with_columns(tmp_path, [("id", "bigint", 19, 0)])
+        data = self._load_schema(tmp_path)
+        col = data["columns"][0]
+        assert col["type"] == "bigint"
+        assert col["previous_type"] == "int"
+
+    def test_renamed_column_appears_as_new(self, tmp_path):
+        self._sync_with_columns(tmp_path, [("id", "int", 10, 0), ("name", "nvarchar", None, None)])
+        self._sync_with_columns(tmp_path, [("id", "int", 10, 0), ("full_name", "nvarchar", None, None)])
+        data = self._load_schema(tmp_path)
+        col_names = [c["name"] for c in data["columns"]]
+        assert col_names == ["id", "name", "full_name"]

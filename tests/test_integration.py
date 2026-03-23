@@ -50,5 +50,10 @@ def test_sys_databases_denied_or_limited(test_conn):
         assert names == ALLOWED_NAMES, (
             f"sys.databases should not expose extra databases; got {names}"
         )
-    except Exception:
-        pass
+    except PermissionError:
+        pass  # access denied is acceptable
+    except Exception as exc:
+        exc_msg = str(exc).lower()
+        assert "permission" in exc_msg or "denied" in exc_msg or "not have permission" in exc_msg, (
+            f"Expected a permission-related error from sys.databases, got: {exc!r}"
+        )

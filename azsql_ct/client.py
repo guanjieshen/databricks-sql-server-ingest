@@ -60,7 +60,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 from . import queries
 from ._constants import (
     DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PARQUET_COMPRESSION,
-    DEFAULT_ROW_GROUP_SIZE,
+    DEFAULT_ROW_GROUP_SIZE, DEFAULT_SOFT_DELETE_COLUMN,
 )
 from .config import (
     expand_env, resolve_value, _load_config_file, _normalize_table_map,
@@ -241,7 +241,7 @@ def _compute_tables_to_skip(
             ct_tables = ct_meta["tables"]
 
         resolved_to_config: Dict[str, str] = {}
-        for _db, full_table_name, table_mode, _scd, _soft in flat_entries:
+        for _db, full_table_name, table_mode, _scd, _soft, *_rest in flat_entries:
             if _db != database:
                 continue
             mode = mode_override or table_mode or "full_incremental"
@@ -334,6 +334,7 @@ class ChangeTracker:
         row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
         sync_log_dir: Optional[str] = None,
         pipeline_id: str = "unknown",
+        soft_delete_column: Optional[str] = None,
     ) -> None:
         self.server = server
         self.user = user
@@ -341,6 +342,7 @@ class ChangeTracker:
         self.output_dir = output_dir
         self.watermark_dir = watermark_dir
         self.output_format = output_format
+        self.soft_delete_column = soft_delete_column or DEFAULT_SOFT_DELETE_COLUMN
         if writer is not None:
             self.writer: OutputWriter = writer
         elif output_format == "unified":
@@ -488,6 +490,7 @@ class ChangeTracker:
         cfg_pipeline_id = config.get("pipeline_id")
         if not cfg_pipeline_id and config_path:
             cfg_pipeline_id = Path(config_path).stem
+        cfg_soft_delete_column = config.get("soft_delete_column")
 
         ct = cls(
             server=server,
@@ -508,6 +511,7 @@ class ChangeTracker:
             row_group_size=cfg_row_group_size if cfg_row_group_size is not None else DEFAULT_ROW_GROUP_SIZE,
             sync_log_dir=cfg_sync_log_dir,
             pipeline_id=cfg_pipeline_id or "unknown",
+            soft_delete_column=cfg_soft_delete_column,
         )
         ct._config_path = config_path
         if not is_flat and base:
@@ -672,7 +676,7 @@ class ChangeTracker:
         results: List[dict] = []
 
         try:
-            for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
+            for database, full_table_name, table_mode, scd_type, soft_delete, tbl_sd_col in self._flat_tables:
                 if database not in conns:
                     try:
                         az = AzureSQLConnection(
@@ -714,6 +718,7 @@ class ChangeTracker:
                     results.append(_skipped_result(database, full_table_name))
                     continue
 
+                sd_col = tbl_sd_col or self.soft_delete_column
                 uc_catalog = self._uc_metadata.get(database, {}).get("uc_catalog")
                 db_meta = metadata_cache.get(database, {})
                 tracked_lookup = db_meta.get("tracked_lookup")
@@ -736,6 +741,7 @@ class ChangeTracker:
                             scd_type=scd_type,
                             uc_catalog=uc_catalog,
                             soft_delete=soft_delete,
+                            soft_delete_column=sd_col,
                             tracked_lookup=tracked_lookup,
                             db_version=db_meta.get("db_version"),
                             min_ver=(
@@ -771,6 +777,7 @@ class ChangeTracker:
         mode: str,
         scd_type: int,
         soft_delete: bool = False,
+        soft_delete_column: Optional[str] = None,
         db_metadata: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Sync a single table using a connection from *pool*. Thread-safe."""
@@ -801,6 +808,7 @@ class ChangeTracker:
                 scd_type=scd_type,
                 uc_catalog=uc_catalog,
                 soft_delete=soft_delete,
+                soft_delete_column=soft_delete_column or self.soft_delete_column,
                 tracked_lookup=tracked_lookup,
                 db_version=db_meta.get("db_version"),
                 min_ver=(
@@ -824,21 +832,22 @@ class ChangeTracker:
     def _run_sync_parallel(self, mode_override: Optional[str]) -> List[dict]:
         logger.info("Parallel sync with max_workers=%d", self.max_workers)
 
-        work: List[Tuple[int, str, str, str, int, bool]] = []
-        for idx, (database, full_table_name, table_mode, scd_type, soft_delete) in enumerate(
+        work: List[Tuple[int, str, str, str, int, bool, Optional[str]]] = []
+        for idx, (database, full_table_name, table_mode, scd_type, soft_delete, tbl_sd_col) in enumerate(
             self._flat_tables
         ):
             mode = mode_override or table_mode or "full_incremental"
-            work.append((idx, database, full_table_name, mode, scd_type, soft_delete))
+            sd_col = tbl_sd_col or self.soft_delete_column
+            work.append((idx, database, full_table_name, mode, scd_type, soft_delete, sd_col))
 
         results: List[Optional[dict]] = [None] * len(work)
         conn_pool = _ConnectionPool(self.server, self.user, self._password)
 
         skip_set: Set[Tuple[str, str]] = set()
         db_entries: Dict[str, List[FlatEntry]] = {}
-        for database, full_table_name, table_mode, scd_type, soft_delete in self._flat_tables:
+        for database, full_table_name, table_mode, scd_type, soft_delete, tbl_sd_col in self._flat_tables:
             db_entries.setdefault(database, []).append(
-                (database, full_table_name, table_mode, scd_type, soft_delete),
+                (database, full_table_name, table_mode, scd_type, soft_delete, tbl_sd_col),
             )
 
         metadata_cache: Dict[str, Dict[str, Any]] = {}
@@ -882,20 +891,21 @@ class ChangeTracker:
                 for tbl in future.result():
                     skip_set.add((db, tbl))
 
-        for idx, db, tbl, mode, scd, sd in work:
+        for idx, db, tbl, mode, scd, sd, sd_col in work:
             if (db, tbl) in skip_set:
                 results[idx] = _skipped_result(db, tbl)
 
-        work_to_run = [(idx, db, tbl, mode, scd, sd) for idx, db, tbl, mode, scd, sd in work if (db, tbl) not in skip_set]
+        work_to_run = [(idx, db, tbl, mode, scd, sd, sd_col) for idx, db, tbl, mode, scd, sd, sd_col in work if (db, tbl) not in skip_set]
 
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_idx = {
                     executor.submit(
                         self._sync_one_table, conn_pool, db, tbl, mode, scd, sd,
+                        soft_delete_column=sd_col,
                         db_metadata=metadata_cache.get(db),
                     ): idx
-                    for idx, db, tbl, mode, scd, sd in work_to_run
+                    for idx, db, tbl, mode, scd, sd, sd_col in work_to_run
                 }
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]

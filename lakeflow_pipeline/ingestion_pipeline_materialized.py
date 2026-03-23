@@ -8,80 +8,8 @@ Parquet N times.
 
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    BinaryType,
-    BooleanType,
-    DateType,
-    DecimalType,
-    DoubleType,
-    FloatType,
-    IntegerType,
-    LongType,
-    ShortType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
-)
 
-from metadata_helper import parse_output_yaml
-
-# SQL Server type names (from schema.json) -> Spark types.
-# Reference: https://learn.microsoft.com/en-us/azure/databricks/ingestion/lakeflow-connect/sql-server-reference
-_DECIMAL_TYPES = frozenset({"decimal", "numeric", "money", "smallmoney"})
-
-MSSQL_TO_SPARK = {
-    "int": IntegerType(),
-    "bigint": LongType(),
-    "smallint": ShortType(),
-    "tinyint": ShortType(),
-    "bit": BooleanType(),
-    "float": DoubleType(),
-    "real": FloatType(),
-    "decimal": DecimalType(38, 10),
-    "numeric": DecimalType(38, 10),
-    "money": DecimalType(19, 4),
-    "smallmoney": DecimalType(10, 4),
-    "nvarchar": StringType(),
-    "varchar": StringType(),
-    "nchar": StringType(),
-    "char": StringType(),
-    "ntext": StringType(),
-    "text": StringType(),
-    "xml": StringType(),
-    "sql_variant": StringType(),
-    "hierarchyid": StringType(),
-    "uniqueidentifier": StringType(),
-    "datetime": TimestampType(),
-    "datetime2": TimestampType(),
-    "smalldatetime": TimestampType(),
-    "datetimeoffset": TimestampType(),
-    "date": DateType(),
-    "time": StringType(),
-    "varbinary": BinaryType(),
-    "binary": BinaryType(),
-    "image": BinaryType(),
-    "geography": BinaryType(),
-    "geometry": BinaryType(),
-    "rowversion": BinaryType(),
-    "unknown": StringType(),
-}
-
-
-def _build_spark_schema(columns):
-    """Build a StructType from schema.json columns list.
-
-    Uses ``precision`` and ``scale`` from schema.json when available
-    for decimal/numeric/money types; otherwise falls back to the
-    default in ``MSSQL_TO_SPARK``.
-    """
-    fields = []
-    for c in columns:
-        spark_type = MSSQL_TO_SPARK.get(c["type"], StringType())
-        if c["type"] in _DECIMAL_TYPES and "precision" in c:
-            spark_type = DecimalType(c["precision"], c.get("scale", 0))
-        fields.append(StructField(c["name"], spark_type, nullable=True))
-    return StructType(fields)
+from metadata_helper import build_spark_schema, parse_output_yaml
 
 
 # Load pipeline config and table metadata (including schema.json columns)
@@ -122,14 +50,15 @@ for tc in table_configs:
     primary_key = tc["primary_key"]
     scd_type = tc["scd_type"]
     soft_delete = tc.get("soft_delete", False)
+    soft_delete_col = tc.get("soft_delete_column", "_is_deleted")
     columns = tc["columns"]
 
     uoid = tc["uoid"]
     silver_table_name = f"{uc_catalog}.{uc_schema}.{uc_table}"
     view_name = f"_view_{uc_catalog}_{uc_schema}_{uc_table}"
-    spark_schema = _build_spark_schema(columns)
+    spark_schema = build_spark_schema(columns)
 
-    def create_view(v_name, uoid_val, schema, include_is_deleted):
+    def create_view(v_name, uoid_val, schema, include_is_deleted, deleted_col_name):
         @dp.view(name=v_name)
         def _view():
             df = (
@@ -145,17 +74,18 @@ for tc in table_configs:
                 select_cols.append(
                     F.when(F.col("operation") == "DELETE", F.lit(True))
                     .otherwise(F.lit(False))
-                    .alias("_is_deleted")
+                    .alias(deleted_col_name)
                 )
             select_cols.append("parsed.*")
             return df.select(*select_cols)
         return _view
 
-    create_view(view_name, uoid, spark_schema, soft_delete)
+    create_view(view_name, uoid, spark_schema, soft_delete, soft_delete_col)
 
     silver_table_props = {
         "delta.feature.timestampNtz": "supported",
         "delta.enableChangeDataFeed": "true",
+        "delta.enableTypeWidening": "true"
     }
     if external_access:
         silver_table_props.update({

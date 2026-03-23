@@ -4,8 +4,80 @@ import os
 import uuid
 
 import yaml
+from pyspark.sql.types import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    ShortType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 logger = logging.getLogger(__name__)
+
+# SQL Server type names (from schema.json) -> Spark types.
+# Reference: https://learn.microsoft.com/en-us/azure/databricks/ingestion/lakeflow-connect/sql-server-reference
+_DECIMAL_TYPES = frozenset({"decimal", "numeric", "money", "smallmoney"})
+
+MSSQL_TO_SPARK = {
+    "int": IntegerType(),
+    "bigint": LongType(),
+    "smallint": ShortType(),
+    "tinyint": ShortType(),
+    "bit": BooleanType(),
+    "float": DoubleType(),
+    "real": FloatType(),
+    "decimal": DecimalType(38, 10),
+    "numeric": DecimalType(38, 10),
+    "money": DecimalType(19, 4),
+    "smallmoney": DecimalType(10, 4),
+    "nvarchar": StringType(),
+    "varchar": StringType(),
+    "nchar": StringType(),
+    "char": StringType(),
+    "ntext": StringType(),
+    "text": StringType(),
+    "xml": StringType(),
+    "sql_variant": StringType(),
+    "hierarchyid": StringType(),
+    "uniqueidentifier": StringType(),
+    "datetime": TimestampType(),
+    "datetime2": TimestampType(),
+    "smalldatetime": TimestampType(),
+    "datetimeoffset": TimestampType(),
+    "date": DateType(),
+    "time": StringType(),
+    "varbinary": BinaryType(),
+    "binary": BinaryType(),
+    "image": BinaryType(),
+    "geography": BinaryType(),
+    "geometry": BinaryType(),
+    "rowversion": BinaryType(),
+    "unknown": StringType(),
+}
+
+
+def build_spark_schema(columns):
+    """Build a StructType from schema.json columns list.
+
+    Uses ``precision`` and ``scale`` from schema.json when available
+    for decimal/numeric/money types; otherwise falls back to the
+    default in ``MSSQL_TO_SPARK``.
+    """
+    fields = []
+    for c in columns:
+        spark_type = MSSQL_TO_SPARK.get(c["type"], StringType())
+        if c["type"] in _DECIMAL_TYPES and "precision" in c:
+            spark_type = DecimalType(c["precision"], c.get("scale", 0))
+        fields.append(StructField(c["name"], spark_type, nullable=True))
+    return StructType(fields)
 
 
 def _make_uoid(database: str, schema: str, table: str) -> str:
@@ -81,6 +153,7 @@ def _parse_manifest_to_configs(
                     "primary_key": table_config.get("primary_key") or [],
                     "scd_type": table_config.get("scd_type", 1),
                     "soft_delete": bool(table_config.get("soft_delete", False)),
+                    "soft_delete_column": table_config.get("soft_delete_column", "_is_deleted"),
                     "file_path": table_config.get("file_path"),
                     "columns": columns,
                 })
@@ -148,3 +221,64 @@ def parse_output_yaml(input_yaml_path: str, manifest_file: str = "output.yaml"):
         output_config = yaml.safe_load(f) or {}
     result = _parse_manifest_to_configs(output_config, watermarks_path)
     return result, data_path, external_access
+
+
+def build_cdc_flow_kwargs(
+    target: str,
+    source: str,
+    keys: list,
+    scd_type: int,
+    soft_delete: bool,
+) -> dict:
+    """Build keyword arguments for ``dp.create_auto_cdc_flow``.
+
+    When *soft_delete* is True the flow keeps deleted rows with a flag
+    column and omits ``apply_as_deletes``.  Otherwise physical deletes
+    are applied via ``operation = 'DELETE'``.
+    """
+    kwargs = {
+        "target": target,
+        "source": source,
+        "keys": keys,
+        "sequence_by": "_seq_num",
+        "stored_as_scd_type": scd_type,
+        "ignore_null_updates": True,
+        "except_column_list": ["_seq_num", "operation"],
+    }
+    if not soft_delete:
+        kwargs["apply_as_deletes"] = "operation = 'DELETE'"
+    return kwargs
+
+
+def build_silver_table_properties(
+    scd_type: int,
+    table_name: str,
+    external_access: bool = False,
+) -> dict:
+    """Return the table-properties dict for a silver streaming table."""
+    props = {
+        "delta.feature.timestampNtz": "supported",
+        "delta.enableChangeDataFeed": "true",
+        "delta.enableTypeWidening": "true",
+    }
+    if external_access:
+        props.update({
+            "delta.columnMapping.mode": "name",
+            "delta.enableRowTracking": "true",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.universalFormat.enabledFormats": "iceberg",
+        })
+    return props
+
+
+def build_view_column_flags(soft_delete: bool, soft_delete_column: str) -> dict:
+    """Return configuration flags for view column selection.
+
+    Returns a dict with ``include_is_deleted`` (bool) and
+    ``deleted_col_name`` (str) that the pipeline uses to decide
+    whether to append a soft-delete flag column to the view.
+    """
+    return {
+        "include_is_deleted": soft_delete,
+        "deleted_col_name": soft_delete_column if soft_delete else None,
+    }

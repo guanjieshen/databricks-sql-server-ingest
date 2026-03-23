@@ -4,6 +4,7 @@ VALID_MODES = frozenset({"incremental", "full_incremental"})
 VALID_SCD_TYPES = frozenset({1, 2})
 DEFAULT_SCD_TYPE = 1
 DEFAULT_SOFT_DELETE = False
+DEFAULT_SOFT_DELETE_COLUMN = "_is_deleted"
 
 DEFAULT_OUTPUT_DIR = "./data"
 DEFAULT_WATERMARK_DIR = "./watermarks"

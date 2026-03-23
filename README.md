@@ -265,6 +265,14 @@ When enabled, two things happen:
 
 The flag defaults to `false` (standard Delta tables, no Iceberg metadata). Flipping it to `true` on an existing pipeline will apply the properties on the next DLT refresh — no data rewrite required.
 
+> **Type widening limitation:** Silver tables are created with `delta.enableTypeWidening=true`, which allows column types to be widened without rewriting data. However, Apache Iceberg does not support all type changes that Delta type widening allows. When `external_access: true` is set, the following widening operations will fail:
+>
+> - `byte`, `short`, `int`, `long` to `decimal` or `double`
+> - Decimal scale increase
+> - `date` to `timestampNTZ`
+>
+> If you need to apply one of these type changes on an Iceberg-compatible table, either disable Iceberg compatibility first or regenerate the Iceberg metadata afterwards. See [Type widening — Apache Iceberg Compatibility](https://docs.databricks.com/aws/en/delta/type-widening#apache-iceberg-compatibility) for details.
+
 ### Full config reference
 
 | Field | Required | Description |
@@ -281,7 +289,8 @@ The flag defaults to `false` (standard Delta tables, no Iceberg metadata). Flipp
 | `databases.<db>.schemas.<s>.uc_schema` | No | Unity Catalog schema for downstream DLT silver tables |
 | `tables.<t>.mode` | No | `full`, `incremental`, or `full_incremental` (default) |
 | `tables.<t>.scd_type` | No | `1` (default, overwrite) or `2` (historical tracking) |
-| `tables.<t>.soft_delete` | No | `true` to keep deleted rows with an `_is_deleted` flag |
+| `tables.<t>.soft_delete` | No | `true` to keep deleted rows with a soft-delete flag column (default column name: `_is_deleted`) |
+| `soft_delete_column` | No | Pipeline-level default name for the soft-delete boolean column (default: `_is_deleted`). Can also be set per table under `tables.<t>.soft_delete_column` to override. |
 
 ### Output structure
 
@@ -335,4 +344,4 @@ tests/                  Unit tests
 
 ## License
 
-Private.
+This project is licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) — see the [LICENSE](LICENSE) file for details.
