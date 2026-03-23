@@ -70,20 +70,36 @@ def _pipeline_key(base: str) -> str:
 
 
 def _load_pipeline_config(pipelines_dir: Path, config_filename: str) -> dict:
-    """Load tags and feature flags from a pipeline config YAML file."""
+    """Load tags, feature flags, and schedule from a pipeline config YAML file."""
     try:
         import yaml
     except ImportError:
-        return {"tags": {}, "external_access": False}
+        return {"tags": {}, "external_access": False, "schedule": None}
     config_path = pipelines_dir / config_filename
     if not config_path.exists():
-        return {"tags": {}, "external_access": False}
+        return {"tags": {}, "external_access": False, "schedule": None}
     with open(config_path, "r") as f:
         config = yaml.safe_load(f) or {}
     raw_tags = config.get("tags") or {}
+
+    raw_schedule = config.get("schedule")
+    schedule: dict[str, str] | None = None
+    if isinstance(raw_schedule, dict):
+        cron = raw_schedule.get("quartz_cron_expression")
+        if not cron:
+            raise ValueError(
+                f"schedule in {config_path} requires 'quartz_cron_expression'"
+            )
+        schedule = {
+            "quartz_cron_expression": str(cron),
+            "timezone_id": str(raw_schedule.get("timezone_id", "UTC")),
+            "pause_status": str(raw_schedule.get("pause_status", "UNPAUSED")),
+        }
+
     return {
         "tags": {str(k): str(v) for k, v in raw_tags.items()},
         "external_access": bool(config.get("external_access", False)),
+        "schedule": schedule,
     }
 
 
@@ -140,7 +156,10 @@ def _pipeline_resource(
 
 
 def _job_resource(
-    base_name: str, config_filename: str, user_tags: dict[str, str] | None = None
+    base_name: str,
+    config_filename: str,
+    user_tags: dict[str, str] | None = None,
+    schedule: dict[str, str] | None = None,
 ) -> dict:
     """Build the job resource dict wrapped in resources.jobs."""
     jk = _job_key(base_name)
@@ -154,64 +173,61 @@ def _job_resource(
     }
     if user_tags:
         tags.update(user_tags)
-    return {
-        "resources": {
-            "jobs": {
-                jk: {
-                    "name": f"SQL Server CT – Job – {base_name}",
-                    "tags": tags,
-                    "tasks": [
-                        {
-                            "task_key": "gateway",
-                            "spark_python_task": {
-                                "python_file": "${var.workspace_root}/scripts/sync.py",
-                                "parameters": [config_path],
-                            },
-                            "environment_key": "Task_environment",
-                        },
-                        {
-                            "task_key": "check_record_changed",
-                            "depends_on": [{"task_key": "gateway"}],
-                            "condition_task": {
-                                "op": "GREATER_THAN",
-                                "left": "{{tasks.gateway.values.total_rows_changed}}",
-                                "right": "0",
-                            },
-                        },
-                        {
-                            "task_key": "schema_change_detected",
-                            "depends_on": [{"task_key": "gateway"}],
-                            "condition_task": {
-                                "op": "EQUAL_TO",
-                                "left": "{{tasks.gateway.values.schema_changes_detected}}",
-                                "right": "true",
-                            },
-                        },
-                        {
-                            "task_key": "ingestion",
-                            "depends_on": [
-                                {"task_key": "check_record_changed", "outcome": "true"}
-                            ],
-                            "pipeline_task": {
-                                "pipeline_id": pipeline_ref
-                            },
-                        },
-                    ],
-                    "queue": {"enabled": True},
-                    "environments": [
-                        {
-                            "environment_key": "Task_environment",
-                            "spec": {
-                                "dependencies": ["mssql-python"],
-                                "environment_version": "4",
-                            },
-                        }
-                    ],
-                    "performance_target": "PERFORMANCE_OPTIMIZED",
-                }
+    job_dict: dict = {
+        "name": f"SQL Server CT – Job – {base_name}",
+        "tags": tags,
+        "tasks": [
+            {
+                "task_key": "gateway",
+                "spark_python_task": {
+                    "python_file": "${var.workspace_root}/scripts/sync.py",
+                    "parameters": [config_path],
+                },
+                "environment_key": "Task_environment",
+            },
+            {
+                "task_key": "check_record_changed",
+                "depends_on": [{"task_key": "gateway"}],
+                "condition_task": {
+                    "op": "GREATER_THAN",
+                    "left": "{{tasks.gateway.values.total_rows_changed}}",
+                    "right": "0",
+                },
+            },
+            {
+                "task_key": "schema_change_detected",
+                "depends_on": [{"task_key": "gateway"}],
+                "condition_task": {
+                    "op": "EQUAL_TO",
+                    "left": "{{tasks.gateway.values.schema_changes_detected}}",
+                    "right": "true",
+                },
+            },
+            {
+                "task_key": "ingestion",
+                "depends_on": [
+                    {"task_key": "check_record_changed", "outcome": "true"}
+                ],
+                "pipeline_task": {
+                    "pipeline_id": pipeline_ref
+                },
+            },
+        ],
+        "queue": {"enabled": True},
+        "environments": [
+            {
+                "environment_key": "Task_environment",
+                "spec": {
+                    "dependencies": ["mssql-python"],
+                    "environment_version": "4",
+                },
             }
-        }
+        ],
+        "performance_target": "PERFORMANCE_OPTIMIZED",
     }
+    if schedule:
+        job_dict["schedule"] = schedule
+    return {"resources": {"jobs": {jk: job_dict}}}
 
 
 def _emit_yaml(data: dict) -> str:
@@ -311,7 +327,10 @@ def main() -> int:
             args.dry_run,
         )
 
-        job_data = _job_resource(base_name, config_filename, user_tags)
+        job_data = _job_resource(
+            base_name, config_filename, user_tags,
+            schedule=pipeline_cfg.get("schedule"),
+        )
         _write_file(
             jobs_out / f"job_{base_name}.yml",
             _emit_yaml(job_data),

@@ -146,17 +146,49 @@ class TestLoadPipelineConfig:
 
     def test_missing_file_returns_defaults(self, tmp_path: Path):
         cfg = _load_pipeline_config(tmp_path, "nonexistent.yaml")
-        assert cfg == {"tags": {}, "external_access": False}
+        assert cfg == {"tags": {}, "external_access": False, "schedule": None}
 
     def test_empty_yaml_returns_defaults(self, tmp_path: Path):
         (tmp_path / "p.yaml").write_text("")
         cfg = _load_pipeline_config(tmp_path, "p.yaml")
-        assert cfg == {"tags": {}, "external_access": False}
+        assert cfg == {"tags": {}, "external_access": False, "schedule": None}
 
     def test_tags_values_coerced_to_str(self, tmp_path: Path):
         (tmp_path / "p.yaml").write_text("tags:\n  count: 42\n")
         cfg = _load_pipeline_config(tmp_path, "p.yaml")
         assert cfg["tags"] == {"count": "42"}
+
+    def test_schedule_loaded(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text(
+            "schedule:\n"
+            "  quartz_cron_expression: '0 0 8 * * ?'\n"
+            "  timezone_id: America/New_York\n"
+            "  pause_status: PAUSED\n"
+        )
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["schedule"] == {
+            "quartz_cron_expression": "0 0 8 * * ?",
+            "timezone_id": "America/New_York",
+            "pause_status": "PAUSED",
+        }
+
+    def test_schedule_defaults_timezone_and_pause(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text(
+            "schedule:\n  quartz_cron_expression: '0 30 6 * * ?'\n"
+        )
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["schedule"]["timezone_id"] == "UTC"
+        assert cfg["schedule"]["pause_status"] == "UNPAUSED"
+
+    def test_schedule_missing_cron_raises(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text("schedule:\n  timezone_id: UTC\n")
+        with pytest.raises(ValueError, match="quartz_cron_expression"):
+            _load_pipeline_config(tmp_path, "p.yaml")
+
+    def test_schedule_absent_returns_none(self, tmp_path: Path):
+        (tmp_path / "p.yaml").write_text("tags:\n  team: eng\n")
+        cfg = _load_pipeline_config(tmp_path, "p.yaml")
+        assert cfg["schedule"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +292,21 @@ class TestJobResource:
         gateway = data["resources"]["jobs"]["sql_server_ct_p1"]["tasks"][0]
         params = gateway["spark_python_task"]["parameters"]
         assert params == ["${var.workspace_root}/pipelines/p1.yaml"]
+
+    def test_schedule_present(self):
+        sched = {
+            "quartz_cron_expression": "0 0 8 * * ?",
+            "timezone_id": "UTC",
+            "pause_status": "UNPAUSED",
+        }
+        data = _job_resource("p1", "p1.yaml", schedule=sched)
+        job = data["resources"]["jobs"]["sql_server_ct_p1"]
+        assert job["schedule"] == sched
+
+    def test_schedule_absent(self):
+        data = _job_resource("p1", "p1.yaml")
+        job = data["resources"]["jobs"]["sql_server_ct_p1"]
+        assert "schedule" not in job
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +490,51 @@ class TestMain:
         assert rc == 0
         assert (stale_pls / "sdp_old.yml").exists()
         assert (stale_jobs / "job_old.yml").exists()
+
+    def test_schedule_in_generated_job_yaml(self, tmp_path: Path, monkeypatch):
+        pipelines = tmp_path / "pipelines"
+        pipelines.mkdir()
+        (pipelines / "scheduled.yaml").write_text(
+            "schedule:\n"
+            "  quartz_cron_expression: '0 0 12 * * ?'\n"
+            "  timezone_id: America/Chicago\n"
+            "  pause_status: PAUSED\n"
+        )
+        resources = tmp_path / "dab" / "resources"
+        resources.mkdir(parents=True)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gen", "--pipelines-dir", str(pipelines), "--resources-dir", str(resources)],
+        )
+        import dab.generate_jobs as mod
+        monkeypatch.setattr(mod, "_SCRIPT_PATH", Path(__file__))
+
+        rc = main()
+        assert rc == 0
+        job_file = resources / "jobs" / "job_scheduled.yml"
+        assert job_file.exists()
+        data = yaml.safe_load(job_file.read_text())
+        job = data["resources"]["jobs"]["sql_server_ct_scheduled"]
+        assert job["schedule"] == {
+            "quartz_cron_expression": "0 0 12 * * ?",
+            "timezone_id": "America/Chicago",
+            "pause_status": "PAUSED",
+        }
+
+    def test_no_schedule_omits_key_in_generated_yaml(self, tmp_path: Path, monkeypatch):
+        pipelines, resources = self._setup_dirs(tmp_path)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["gen", "--pipelines-dir", str(pipelines), "--resources-dir", str(resources)],
+        )
+        import dab.generate_jobs as mod
+        monkeypatch.setattr(mod, "_SCRIPT_PATH", Path(__file__))
+
+        main()
+        job_file = resources / "jobs" / "job_pipeline_1.yml"
+        data = yaml.safe_load(job_file.read_text())
+        job = data["resources"]["jobs"]["sql_server_ct_pipeline_1"]
+        assert "schedule" not in job
 
     def test_no_configs_returns_zero(self, tmp_path: Path, monkeypatch):
         empty_pipelines = tmp_path / "empty"

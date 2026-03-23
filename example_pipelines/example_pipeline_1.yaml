@@ -12,6 +12,13 @@ tags:
 # Enable UniForm Iceberg V3 on silver streaming tables (default: false).
 external_access: false
 
+# Cron schedule for the generated DAB job (optional).
+# Uses Quartz cron format. Omit this section to leave the job unscheduled.
+# schedule:
+#   quartz_cron_expression: '0 0 8 * * ?'   # daily at 8 AM
+#   timezone_id: UTC                          # default: UTC
+#   pause_status: UNPAUSED                    # default: UNPAUSED
+
 # Number of tables to sync in parallel (default: 1 = sequential).
 parallelism: 12
 
